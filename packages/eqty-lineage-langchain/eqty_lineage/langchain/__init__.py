@@ -10,10 +10,16 @@ The handler listens to the runs LangGraph emits and turns them into EQTY lineage
 - every graph node run   -> input/output Dataset assets + a computation statement
 - every chat model call  -> Prompt + Model assets in, Reasoning asset out + computation
 - every tool call        -> Tool + input Dataset in, output Dataset out + computation
+
+``pathlib.Path`` values in graph state get special treatment: if the path exists
+on disk, the file or directory it points to is registered as its own Dataset
+asset via ``Dataset.from_path`` (CIDing the full directory contents), and that
+asset is linked into the computation that carried the path.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -27,26 +33,34 @@ from eqty_sdk.statements import add_computation_statement
 logger = logging.getLogger("eqty.langgraph")
 
 
-def _to_jsonable(obj: Any) -> Any:
-    """Convert LangChain/LangGraph values into plain JSON-serializable data."""
+def _to_jsonable(obj: Any, on_path: Optional[Callable[[Path], None]] = None) -> Any:
+    """Convert LangChain/LangGraph values into plain JSON-serializable data.
+
+    ``on_path`` is invoked for every existing ``pathlib.Path`` encountered, so
+    the caller can register the file/directory as its own EQTY asset.
+    """
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
+    if isinstance(obj, Path):
+        if on_path is not None and obj.exists():
+            on_path(obj)
+        return str(obj)
     if isinstance(obj, BaseMessage):
-        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content)}
+        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content, on_path)}
         tool_calls = getattr(obj, "tool_calls", None)
         if tool_calls:
-            data["tool_calls"] = _to_jsonable(tool_calls)
+            data["tool_calls"] = _to_jsonable(tool_calls, on_path)
         usage = getattr(obj, "usage_metadata", None)
         if usage:
-            data["usage"] = _to_jsonable(usage)
+            data["usage"] = _to_jsonable(usage, on_path)
         return data
     if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+        return {str(k): _to_jsonable(v, on_path) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(item) for item in obj]
+        return [_to_jsonable(item, on_path) for item in obj]
     if hasattr(obj, "model_dump"):
         try:
-            return _to_jsonable(obj.model_dump())
+            return _to_jsonable(obj.model_dump(), on_path)
         except Exception:  # noqa: BLE001 - best-effort serialization
             pass
     return str(obj)
@@ -66,6 +80,41 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._last_sibling_output: Dict[Optional[UUID], CID] = {}
         # tool name -> Tool asset CID, so each tool is registered once
         self._tool_cids: Dict[str, CID] = {}
+        # resolved path -> Dataset CID, so each file/directory is CID'd once
+        self._path_cids: Dict[str, CID] = {}
+
+    def _register_state(self, obj: Any, name: str, description: str) -> Tuple[Dataset, List[CID], List[CID]]:
+        """Register ``obj`` as a Dataset; existing Paths inside it become their own assets.
+
+        Returns ``(state_asset, carried_path_cids, created_path_cids)``. A path seen
+        for the first time in this run was *created* by the current computation; a
+        path already registered earlier is merely *carried* through the state and
+        must be linked as an input, never re-emitted as an output (which would
+        create a cycle in the lineage graph).
+        """
+        carried: List[CID] = []
+        created: List[CID] = []
+
+        def collect(path: Path) -> None:
+            key = str(path.resolve())
+            if key in self._path_cids:
+                cid = self._path_cids[key]
+                bucket = carried
+            else:
+                asset = Dataset.from_path(
+                    path,
+                    name=path.name,
+                    description=f"Filesystem asset referenced by LangGraph state: '{path}'.",
+                )
+                self._path_cids[key] = asset.cid
+                cid = asset.cid
+                bucket = created
+            if cid not in carried and cid not in created:
+                bucket.append(cid)
+
+        payload = _to_jsonable(obj, on_path=collect)
+        asset = Dataset.from_object(payload, name=name, description=description)
+        return asset, carried, created
 
     def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
         """Create the computation node w/ metadata."""
@@ -109,12 +158,13 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if not (is_node or is_graph):
             return
         label = node if is_node else (name or "graph")
-        state_in = Dataset.from_object(
-            _to_jsonable(inputs),
+        state_in, carried, created = self._register_state(
+            inputs,
             name=f"{label}: input state",
             description=f"LangGraph state entering '{label}'.",
         )
-        input_cids = [state_in.cid]
+        # every path in the input state is an input, whether first-seen or not
+        input_cids = [state_in.cid, *carried, *created]
         # chain this node to the previous node that ran under the same parent
         prev = self._last_sibling_output.get(parent_run_id)
         if prev is not None and prev != state_in.cid:
@@ -135,8 +185,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if run is None:
             return
         label = run["name"]
-        state_out = Dataset.from_object(
-            _to_jsonable(outputs),
+        state_out, carried, created = self._register_state(
+            outputs,
             name=f"{label}: output state",
             description=f"LangGraph state produced by '{label}'.",
         )
@@ -147,7 +197,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             last = run.get("last_child_output")
             if last is not None and last not in input_cids:
                 input_cids.append(last)
-        self._finalize(label, run["kind"], input_cids, [state_out.cid])
+        # a path first seen in this output state was created here -> output;
+        # a path registered earlier is only carried through -> input
+        input_cids += [c for c in carried if c not in input_cids]
+        output_cids = [state_out.cid, *created]
+        self._finalize(label, run["kind"], input_cids, output_cids)
         self._last_sibling_output[run["parent"]] = state_out.cid
         enclosing = self._enclosing_node(run["parent"])
         if enclosing is not None:
@@ -238,13 +292,13 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             )
             self._tool_cids[tool_name] = tool_asset.cid
 
-        tool_input = Dataset.from_object(
-            _to_jsonable(inputs) if inputs is not None else input_str,
+        tool_input, carried, created = self._register_state(
+            inputs if inputs is not None else input_str,
             name=f"{tool_name}: input",
             description=f"Arguments passed to tool '{tool_name}'.",
         )
 
-        input_cids = [self._tool_cids[tool_name], tool_input.cid]
+        input_cids = [self._tool_cids[tool_name], tool_input.cid, *carried, *created]
 
         node = self._enclosing_node(parent_run_id)
         if node is not None:
@@ -264,16 +318,18 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if run is None:
             return
 
-        tool_output = Dataset.from_object(
-            _to_jsonable(output),
+        tool_output, carried, created = self._register_state(
+            output,
             name=f"{run['name']}: output",
             description=f"Result returned by tool '{run['name']}'.",
         )
 
-        self._finalize(run["name"], run["kind"], run["inputs"], [tool_output.cid])
+        input_cids = run["inputs"] + [c for c in carried if c not in run["inputs"]]
+        output_cids = [tool_output.cid, *created]
+        self._finalize(run["name"], run["kind"], input_cids, output_cids)
 
         if run["node"] is not None:
-            run["node"]["child_outputs"].append(tool_output.cid)
+            run["node"]["child_outputs"].extend(output_cids)
 
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
