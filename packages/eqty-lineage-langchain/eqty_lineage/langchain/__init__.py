@@ -1,0 +1,283 @@
+"""LangChain/LangGraph callback handler that registers compute and data with the eqty_sdk.
+
+Instead of decorating every graph node with ``@eqty_sdk.compute``, attach a single
+``EqtyCallbackHandler`` to the graph invocation::
+
+    app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
+
+The handler listens to the runs LangGraph emits and turns them into EQTY lineage:
+
+- every graph node run   -> input/output Dataset assets + a computation statement
+- every chat model call  -> Prompt + Model assets in, Reasoning asset out + computation
+- every tool call        -> Tool + input Dataset in, output Dataset out + computation
+"""
+
+import logging
+from typing import Any, Dict, List, Optional
+from uuid import UUID
+
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import LLMResult
+
+from eqty_sdk import CID, Dataset, Model, Prompt, Reasoning, Tool
+from eqty_sdk.metadata import Metadata
+from eqty_sdk.statements import add_computation_statement
+
+logger = logging.getLogger("eqty.langgraph")
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """Convert LangChain/LangGraph values into plain JSON-serializable data."""
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, BaseMessage):
+        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content)}
+        tool_calls = getattr(obj, "tool_calls", None)
+        if tool_calls:
+            data["tool_calls"] = _to_jsonable(tool_calls)
+        usage = getattr(obj, "usage_metadata", None)
+        if usage:
+            data["usage"] = _to_jsonable(usage)
+        return data
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(item) for item in obj]
+    if hasattr(obj, "model_dump"):
+        try:
+            return _to_jsonable(obj.model_dump())
+        except Exception:  # noqa: BLE001 - best-effort serialization
+            pass
+    return str(obj)
+
+
+class EqtyCallbackHandler(BaseCallbackHandler):
+    """Registers LangGraph execution as EQTY data assets and computation statements."""
+
+    def __init__(self) -> None:
+        # run_id -> tracked run info for graph/node/llm/tool runs we register
+        self._runs: Dict[UUID, Dict[str, Any]] = {}
+        # run_id -> parent_run_id for every chain run, so nested LLM/tool runs
+        # can find their enclosing node even through untracked intermediate runs
+        self._parents: Dict[UUID, Optional[UUID]] = {}
+        # parent run id -> output-state CID of the most recent sibling node,
+        # used to chain consecutive nodes together
+        self._last_sibling_output: Dict[Optional[UUID], CID] = {}
+        # tool name -> Tool asset CID, so each tool is registered once
+        self._tool_cids: Dict[str, CID] = {}
+
+    def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
+        """Create the computation node w/ metadata."""
+        statement_ids = add_computation_statement(inputs=input_cids, outputs=output_cids)
+        Metadata(name=name, computation_type=kind, framework="langgraph").create_statement(
+            statement_ids[0], None, None
+        )
+
+    def _enclosing_node(self, parent_run_id: Optional[UUID]) -> Optional[Dict[str, Any]]:
+        """Walk up the run tree to the nearest tracked node (or graph) run."""
+        seen = set()
+        current = parent_run_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            run = self._runs.get(current)
+            if run is not None:
+                return run
+            current = self._parents.get(current)
+        return None
+
+    def on_chain_start(
+        self,
+        serialized: Dict[str, Any],
+        inputs: Dict[str, Any],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        logger.debug(run_id)
+        self._parents[run_id] = parent_run_id
+        # LangGraph emits many internal chain runs (channel reads/writes, task wrappers).
+        # A node-level run is the one whose run name equals the "langgraph_node" metadata entry;
+        # the root run is the graph itself.
+        node = (metadata or {}).get("langgraph_node")
+        name = kwargs.get("name") or (serialized or {}).get("name")
+        is_node = node is not None and name == node
+        is_graph = parent_run_id is None
+        if not (is_node or is_graph):
+            return
+        label = node if is_node else (name or "graph")
+        state_in = Dataset.from_object(
+            _to_jsonable(inputs),
+            name=f"{label}: input state",
+            description=f"LangGraph state entering '{label}'.",
+        )
+        input_cids = [state_in.cid]
+        # chain this node to the previous node that ran under the same parent
+        prev = self._last_sibling_output.get(parent_run_id)
+        if prev is not None and prev != state_in.cid:
+            input_cids.append(prev)
+        self._runs[run_id] = {
+            "name": label,
+            "kind": "graph" if is_graph else "graph_node",
+            "parent": parent_run_id,
+            "state_in": state_in.cid,
+            "inputs": input_cids,
+            "child_outputs": [],
+        }
+
+    def on_chain_end(self, outputs: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.debug(run_id)
+        self._parents.pop(run_id, None)
+        run = self._runs.pop(run_id, None)
+        if run is None:
+            return
+        label = run["name"]
+        state_out = Dataset.from_object(
+            _to_jsonable(outputs),
+            name=f"{label}: output state",
+            description=f"LangGraph state produced by '{label}'.",
+        )
+        # nested LLM/tool outputs are inputs to the node's final state
+        input_cids = run["inputs"] + run["child_outputs"]
+        if run["kind"] == "graph":
+            # the final state is derived from the last node that ran inside it
+            last = run.get("last_child_output")
+            if last is not None and last not in input_cids:
+                input_cids.append(last)
+        self._finalize(label, run["kind"], input_cids, [state_out.cid])
+        self._last_sibling_output[run["parent"]] = state_out.cid
+        enclosing = self._enclosing_node(run["parent"])
+        if enclosing is not None:
+            enclosing["last_child_output"] = state_out.cid
+
+    def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.warning(run_id)
+        self._parents.pop(run_id, None)
+        self._runs.pop(run_id, None)
+
+    def on_chat_model_start(
+        self,
+        serialized: Dict[str, Any],
+        messages: List[List[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        logger.debug(run_id)
+        params = kwargs.get("invocation_params") or {}
+        model_name = params.get("model") or params.get("model_name") or "unknown-model"
+        prompt = Prompt.from_object(
+            _to_jsonable(messages),
+            name=f"{model_name}: prompt",
+            description="Messages sent to the chat model.",
+        )
+        model = Model.from_object(
+            {"model": model_name, "provider": params.get("_type", "unknown")},
+            name=model_name,
+        )
+        input_cids = [prompt.cid, model.cid]
+        node = self._enclosing_node(parent_run_id)
+        if node is not None:
+            # the prompt is derived from the node's input state
+            input_cids.append(node["state_in"])
+        self._runs[run_id] = {
+            "name": model_name,
+            "kind": "chat_model",
+            "inputs": input_cids,
+            "node": node,
+        }
+
+    def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.debug(run_id)
+        run = self._runs.pop(run_id, None)
+        if run is None:
+            return
+        generations = [
+            _to_jsonable(getattr(gen, "message", None) or gen.text)
+            for batch in response.generations
+            for gen in batch
+        ]
+        output = Reasoning.from_object(
+            generations,
+            name=f"{run['name']}: response",
+            description="Chat model response, including any tool calls.",
+        )
+        self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
+        if run["node"] is not None:
+            run["node"]["child_outputs"].append(output.cid)
+
+    def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.warning(run_id)
+        self._runs.pop(run_id, None)
+
+    def on_tool_start(
+        self,
+        serialized: Dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        logger.debug(run_id)
+        tool_name = (serialized or {}).get("name", "tool")
+
+        if tool_name not in self._tool_cids:
+            tool_asset = Tool.from_object(
+                {"name": tool_name, "description": (serialized or {}).get("description", "")},
+                name=tool_name,
+            )
+            self._tool_cids[tool_name] = tool_asset.cid
+
+        tool_input = Dataset.from_object(
+            _to_jsonable(inputs) if inputs is not None else input_str,
+            name=f"{tool_name}: input",
+            description=f"Arguments passed to tool '{tool_name}'.",
+        )
+
+        input_cids = [self._tool_cids[tool_name], tool_input.cid]
+
+        node = self._enclosing_node(parent_run_id)
+        if node is not None:
+            # the tool call was requested by the state entering the node
+            input_cids.append(node["state_in"])
+
+        self._runs[run_id] = {
+            "name": tool_name,
+            "kind": "tool",
+            "inputs": input_cids,
+            "node": node,
+        }
+
+    def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.debug(run_id)
+        run = self._runs.pop(run_id, None)
+        if run is None:
+            return
+
+        tool_output = Dataset.from_object(
+            _to_jsonable(output),
+            name=f"{run['name']}: output",
+            description=f"Result returned by tool '{run['name']}'.",
+        )
+
+        self._finalize(run["name"], run["kind"], run["inputs"], [tool_output.cid])
+
+        if run["node"] is not None:
+            run["node"]["child_outputs"].append(tool_output.cid)
+
+    def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.warning(run_id)
+        self._runs.pop(run_id, None)
+
+
+__all__ = ["EqtyCallbackHandler"]
