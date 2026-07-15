@@ -121,9 +121,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
         Returns ``{}`` unless verbose mode is on, so call sites can unconditionally unpack the result. Values are
         run through ``_to_jsonable`` (stringifying UUIDs, Paths, messages, ...) and non-scalars are JSON-encoded.
-        Keys that collide with the SDK's own kwargs (``name``, ``description``, ...) are prefixed with ``lc_`` so
-        they can never raise "got multiple values for keyword argument". ``None`` values are kept and encoded as
-        the string ``"null"`` so a present-but-empty key is distinguishable from an absent one.
+        Keys that collide with the SDK's own kwargs (``name``, ``description``, ...) are prefixed with ``LC-`` so
+        they can never raise "got multiple values for keyword argument" (dash, not underscore: the graph explorer
+        camel-cases keys and turns ``_`` into a space). ``None`` values are kept and encoded as the string
+        ``"null"`` so a present-but-empty key is distinguishable from an absent one.
         """
         if not self.verbose:
             return {}
@@ -131,7 +132,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         for key, value in fields.items():
             safe_key = key
             while safe_key in self._RESERVED_SDK_KWARGS or safe_key in out:
-                safe_key = f"lc_{safe_key}"
+                safe_key = f"LC-{safe_key}"
             jsonable = _to_jsonable(value)
             out[safe_key] = jsonable if isinstance(jsonable, (str, int, float, bool)) else json.dumps(jsonable)
         return out
