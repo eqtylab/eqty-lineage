@@ -27,7 +27,7 @@ from langgraph.prebuilt import ToolNode
 
 from eqty_sdk import Context, Signer, init, set_active_signer
 
-from eqty_lineage.langchain import EqtyCallbackHandler
+from eqty_lineage.langchain import EqtyCallbackHandler, eqty_tool
 
 KNOWLEDGE_BASE = {
     "cid": (
@@ -67,6 +67,7 @@ def search_knowledge_base(query: str) -> str:
     return "\n\n".join(f"[{key}] {text}" for key, text in matches.items())
 
 
+@eqty_tool
 @tool
 def calculate(expression: str) -> str:
     """Evaluate a basic arithmetic expression, e.g. '3 * 32'."""
@@ -156,14 +157,14 @@ def main() -> None:
     app = build_graph()
     result = app.invoke(
         {"messages": [HumanMessage(args.question)], "question": args.question, "answer": ""},
-        config={"callbacks": [EqtyCallbackHandler()], "recursion_limit": 25},
+        config={"callbacks": [EqtyCallbackHandler(verbose=True)], "recursion_limit": 25},
     )
     print(result["answer"])
 
 
 
 if __name__ == "__main__":
-    # init_logger()
+    init_logger()
     cfg = init_sdk()
     main()
     ctx = cfg.get_default_context()
