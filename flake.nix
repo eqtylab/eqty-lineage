@@ -15,6 +15,7 @@
             uv
             python311
             just
+            ruff
           ];
 
           shellHook = ''

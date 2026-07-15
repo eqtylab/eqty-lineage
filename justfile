@@ -16,3 +16,7 @@ publish:
 # Delete build artifacts
 clean:
   rm -rf ./dist
+
+# Format all Python code in the repo
+fmt:
+  ruff format .

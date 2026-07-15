@@ -92,7 +92,6 @@ def eqty_tool(obj: Any) -> Any:
     return obj
 
 
-
 class EqtyCallbackHandler(BaseCallbackHandler):
     """Registers LangGraph execution as EQTY data assets and computation statements."""
 
@@ -113,7 +112,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         # resolved path -> Dataset CID, so each file/directory is CID'd once
         self._path_cids: Dict[str, CID] = {}
 
-##################################################   Helpers   #################################################
+    ##################################################   Helpers   #################################################
     # kwargs the SDK asset constructors claim for themselves; verbose metadata must not shadow them
     _RESERVED_SDK_KWARGS = frozenset({"obj", "path", "name", "description", "_store"})
 
@@ -179,9 +178,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
         statement_ids = add_computation_statement(inputs=input_cids, outputs=output_cids)
 
-        Metadata(name=name, computation_type=kind, framework="langgraph").create_statement(
-            statement_ids[0], None, None
-        )
+        Metadata(name=name, computation_type=kind, framework="langgraph").create_statement(statement_ids[0], None, None)
 
     def _enclosing_node(self, parent_run_id: Optional[UUID]) -> Optional[Dict[str, Any]]:
         """Walk up the run tree to the nearest tracked node (or graph) run to get a node so we can link the graph."""
@@ -199,10 +196,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             current = self._parents.get(current)
 
         return None
-##################################################   Helpers   #################################################
 
+    ##################################################   Helpers   #################################################
 
-################################################## Chain Calls #################################################
+    ################################################## Chain Calls #################################################
     def on_chain_start(
         self,
         serialized: Dict[str, Any],
@@ -304,10 +301,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         logger.warning(run_id)
         self._parents.pop(run_id, None)
         self._runs.pop(run_id, None)
-################################################## Chain Calls #################################################
 
+    ################################################## Chain Calls #################################################
 
-################################################## LLM Calls ###################################################
+    ################################################## LLM Calls ###################################################
     def on_chat_model_start(
         self,
         serialized: Dict[str, Any],
@@ -327,29 +324,33 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             _to_jsonable(messages),
             name=f"{model_name}: prompt",
             description="Messages sent to the chat model.",
-            **self._verbose_metadata({
-                "callback": "on_chat_model_start",
-                "serialized": serialized,
-                "run_id": run_id,
-                "parent_run_id": parent_run_id,
-                "tags": tags,
-                "metadata": metadata,
-                **kwargs,
-            }),
+            **self._verbose_metadata(
+                {
+                    "callback": "on_chat_model_start",
+                    "serialized": serialized,
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                    "tags": tags,
+                    "metadata": metadata,
+                    **kwargs,
+                }
+            ),
         )
 
         model = Model.from_object(
             {"model": model_name, "provider": params.get("_type", "unknown")},
             name=model_name,
-            **self._verbose_metadata({
-                "callback": "on_chat_model_start",
-                "serialized": serialized,
-                "run_id": run_id,
-                "parent_run_id": parent_run_id,
-                "tags": tags,
-                "metadata": metadata,
-                **kwargs,
-            }),
+            **self._verbose_metadata(
+                {
+                    "callback": "on_chat_model_start",
+                    "serialized": serialized,
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                    "tags": tags,
+                    "metadata": metadata,
+                    **kwargs,
+                }
+            ),
         )
 
         input_cids = [prompt.cid, model.cid]
@@ -373,9 +374,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             return
 
         generations = [
-            _to_jsonable(getattr(gen, "message", None) or gen.text)
-            for batch in response.generations
-            for gen in batch
+            _to_jsonable(getattr(gen, "message", None) or gen.text) for batch in response.generations for gen in batch
         ]
 
         output = Reasoning.from_object(
@@ -393,10 +392,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
         self._runs.pop(run_id, None)
-################################################## LLM Calls ###################################################
 
+    ################################################## LLM Calls ###################################################
 
-################################################## Tool Calls ##################################################
+    ################################################## Tool Calls ##################################################
     def on_tool_start(
         self,
         serialized: Dict[str, Any],
@@ -420,14 +419,16 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                 source if source is not None else {"name": tool_name},
                 name=tool_name,
                 description=(serialized or {}).get("description", ""),
-                **self._verbose_metadata({
-                    "callback": "on_tool_start",
-                    "run_id": run_id,
-                    "parent_run_id": parent_run_id,
-                    "tags": tags,
-                    "metadata": metadata,
-                    **kwargs,
-                }),
+                **self._verbose_metadata(
+                    {
+                        "callback": "on_tool_start",
+                        "run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                        "tags": tags,
+                        "metadata": metadata,
+                        **kwargs,
+                    }
+                ),
             )
             self._tool_cids[tool_name] = tool_asset.cid
 
@@ -483,6 +484,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
         self._runs.pop(run_id, None)
+
+
 ################################################## Tool Calls ##################################################
 
 __all__ = ["EqtyCallbackHandler", "eqty_tool"]

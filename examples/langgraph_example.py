@@ -122,8 +122,10 @@ def build_graph(model=None):
     graph.add_edge("summarize", END)
     return graph.compile()
 
+
 def init_logger() -> None:
     import logging
+
     logging.basicConfig(
         level=logging.WARNING,
         format="(%(asctime)s) %(levelname)s - %(name)s %(funcName)s: %(message)s",
@@ -140,6 +142,7 @@ def init_sdk():
     set_active_signer(signer)
     return cfg
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the EQTY-instrumented research agent.")
     parser.add_argument(
@@ -152,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
 def main() -> None:
     args = parse_args()
     app = build_graph()
@@ -162,11 +166,9 @@ def main() -> None:
     print(result["answer"])
 
 
-
 if __name__ == "__main__":
     init_logger()
     cfg = init_sdk()
     main()
     ctx = cfg.get_default_context()
     ctx.export(Path("./manifests/research-agent.json"))
-

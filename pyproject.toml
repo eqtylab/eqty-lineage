@@ -33,3 +33,6 @@ explicit = true
 
 [tool.mypy]
 python_executable = ".venv/bin/python"
+
+[tool.ruff]
+line-length = 120
