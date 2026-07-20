@@ -181,7 +181,7 @@ def main() -> None:
     app = build_graph()
     result = app.invoke(
         {"messages": [HumanMessage(args.question)], "question": args.question, "answer": ""},
-        config={"callbacks": [EqtyCallbackHandler(verbose=args.debug)], "recursion_limit": 25},
+        config={"callbacks": [EqtyCallbackHandler()], "recursion_limit": 25},
     )
     print(result["answer"])
 
