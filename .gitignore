@@ -6,3 +6,12 @@ dist/
 
 .eqty_sdk
 /manifests/*.json
+
+# Rust build artifacts for the optional native accelerator
+target/
+*.whl
+
+# pytest
+.pytest_cache/
+
+.venv/
