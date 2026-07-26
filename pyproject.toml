@@ -5,6 +5,11 @@ description = "EQTY lineage integrations workspace."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "eqty-lineage-agent-hooks",
+    "eqty-lineage-core",
+    "eqty-lineage-query",
+    "eqty-lineage-replicate",
+    "eqty-lineage-transcript",
     "eqty-lineage-langchain",
 ]
 
@@ -12,6 +17,7 @@ dependencies = [
 dev = [
     "langchain-openai>=0.3",
     "langgraph>=0.2",
+    "pytest>=8.0",
 ]
 
 [tool.uv]
@@ -20,9 +26,17 @@ default-groups = ["dev"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
+# The native accelerator is optional and needs a Rust toolchain to build. Excluding it keeps the default
+# `just sync` working with Python alone; build it explicitly with `just build-accel`.
+exclude = ["packages/eqty-lineage-query-rs"]
 
 [tool.uv.sources]
+eqty-lineage-agent-hooks = { workspace = true }
+eqty-lineage-core = { workspace = true }
 eqty-lineage-langchain = { workspace = true }
+eqty-lineage-query = { workspace = true }
+eqty-lineage-replicate = { workspace = true }
+eqty-lineage-transcript = { workspace = true }
 eqty-sdk = { index = "eqty" }
 
 [[tool.uv.index]]
@@ -36,3 +50,9 @@ python_executable = ".venv/bin/python"
 
 [tool.ruff]
 line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests that need `eqty_sdk` skip themselves when it is absent, so the parser, semiring and engine
+# suites run on a machine with no access to the private index.
+filterwarnings = ["ignore::DeprecationWarning"]
