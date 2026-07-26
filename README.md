@@ -78,7 +78,7 @@ just publish     # upload ./dist to pypi.eqtylab.io
 
 ### Tests
 
-`tests/` covers the recorder, both adapters, the semirings and the query engine — 238 tests, of which
+`tests/` covers the recorder, both adapters, the semirings and the query engine — 240 tests, of which
 the SDK-backed ones skip themselves when `eqty-sdk` is unavailable and the backend-agreement ones skip
 when the accelerator is not built. `just test-pure` is what runs anywhere.
 

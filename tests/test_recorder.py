@@ -166,14 +166,8 @@ class TestGraphShape:
 
 
 class TestCanonicalIdentity:
-    def test_activity_signatures_match_across_two_recordings_of_one_session(self, sdk, tmp_path):
-        """Statement CIDs are not stable; activity signatures are.
-
-        A statement CID covers a signed credential carrying ``validFrom``, so recording the same
-        computation twice yields two different activity CIDs. Comparing graphs therefore has to go
-        through ``(inputs, outputs)`` signatures. A corollary: two manifests of the same computation are
-        never byte-identical, so byte-comparison regression gates cannot work.
-        """
+    @staticmethod
+    def record_twice(sdk):
         from eqty_sdk.context import graph_context
 
         from eqty_lineage.core import LineageRecorder
@@ -184,9 +178,54 @@ class TestCanonicalIdentity:
                 r = LineageRecorder(framework="test", policy=PERMISSIVE)
                 r.handle_all(session_events())
                 graphs.append(list(r.triples))
+        return graphs
+
+    def test_activity_signatures_match_across_two_recordings_of_one_session(self, sdk):
+        """Statement CIDs are not stable; ``(inputs, outputs)`` signatures are.
+
+        A statement CID covers a signed credential carrying ``validFrom``, so recording the same
+        computation twice can yield two different activity CIDs. Comparison therefore has to go through
+        the signature -- the *values* of this mapping, never its keys. A corollary: two manifests of the
+        same computation are never byte-identical, so byte-comparison regression gates cannot work.
+        """
+        first, second = (activity_signatures(g) for g in self.record_twice(sdk))
+        assert first
+        assert set(first.values()) == set(second.values())
+
+    def test_canonicalized_graphs_of_one_session_compare_equal(self, sdk):
+        # The intended API: canonicalization rewrites activity CIDs to signature labels and leaves
+        # content-addressed entities alone, so two recordings compare as plain sets.
+        left, right = self.record_twice(sdk)
+        added, removed = graph_diff(left, right)[:2]
+        assert not added and not removed
+
+    def test_activity_cids_are_not_a_stable_comparison_key(self, sdk):
+        """The instability itself, pinned.
+
+        Comparing on activity CIDs passes roughly 95% of the time -- two recordings inside the same
+        clock second get the same CID -- which makes it exactly the kind of assertion that looks correct
+        until it fails in CI. Recording across a second boundary forces the divergence the docstring in
+        ``canonical.py`` describes.
+        """
+        import time
+
+        from eqty_sdk.context import graph_context
+
+        from eqty_lineage.core import LineageRecorder
+
+        graphs = []
+        for i in range(2):
+            if i:
+                time.sleep(1.05)
+            with graph_context(sdk):
+                r = LineageRecorder(framework="test", policy=PERMISSIVE)
+                r.handle_all(session_events())
+                graphs.append(list(r.triples))
 
         first, second = (activity_signatures(g) for g in graphs)
-        assert first and first.keys() == second.keys()
+        assert first.keys() != second.keys(), "activity CIDs unexpectedly stable across a second boundary"
+        # ...and the signature is unaffected, which is the entire point.
+        assert set(first.values()) == set(second.values())
 
     def test_graph_diff_of_a_session_with_itself_is_empty(self, recorder):
         recorder.handle_all(session_events())
