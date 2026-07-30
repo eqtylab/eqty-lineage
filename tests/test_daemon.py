@@ -116,14 +116,89 @@ class TestRecording:
     def test_a_failed_call_survives_in_the_graph(self, daemon):
         # PostToolUse fires only on success; without PostToolUseFailure every failed call vanishes --
         # and a failed call is often the one an audit cares about.
+        #
+        # The payload shape is the real one: a failure carries `error`, not `tool_response`. Reading
+        # the success key here recorded every failure as "tool returned no result", and a test written
+        # against the same wrong shape passed throughout.
         port, receiver, _ = daemon
         post(port, hook("SessionStart"))
         post(port, hook("PreToolUse", tool_name="Bash", tool_use_id="t1",
                         tool_input={"command": "false"}))
         post(port, hook("PostToolUseFailure", tool_name="Bash", tool_use_id="t1",
-                        tool_input={"command": "false"}, tool_response="exit 1"))
+                        tool_input={"command": "false"}, error="command failed: exit 1",
+                        duration_ms=12))
         state = receiver.registry.get(SESSION)
         assert "Bash" in [t.object for t in state.recorder.triples if t.predicate == prov.LABEL]
+        assert state.recorder.stats.get("ToolCallEnded") == 1
+
+    def test_a_batch_closes_every_call_with_its_real_result(self, daemon):
+        # PostToolBatch entries are {tool_name, tool_input, tool_use_id, tool_response} -- the same
+        # result key as PostToolUse. Reading `result`/`is_error` closed each call with nothing and
+        # dropped the file lineage the batch carried.
+        port, receiver, _ = daemon
+        post(port, hook("SessionStart"))
+        for call_id in ("t1", "t2"):
+            post(port, hook("PreToolUse", tool_name="Edit", tool_use_id=call_id,
+                            tool_input={"file_path": f"/repo/{call_id}.py"}))
+        post(port, hook("PostToolBatch", tool_calls=[
+            {"tool_name": "Edit", "tool_use_id": "t1",
+             "tool_input": {"file_path": "/repo/t1.py"},
+             "tool_response": {"filePath": "/repo/t1.py", "content": "a = 1\n"}},
+            {"tool_name": "Edit", "tool_use_id": "t2",
+             "tool_input": {"file_path": "/repo/t2.py"},
+             "tool_response": {"filePath": "/repo/t2.py", "content": "b = 2\n"}},
+        ]))
+        state = receiver.registry.get(SESSION)
+        assert sorted(state.recorder.file_versions) == ["/repo/t1.py", "/repo/t2.py"]
+        assert state.recorder.stats.get("ToolCallEnded") == 2
+
+    def test_the_recorder_does_not_observe_its_own_writes(self, daemon):
+        # --watch <repo> reports every change under a tree. If the sidecars and the SDK blob store live
+        # inside it, recording a file version writes blobs, the watcher reports them, and the recorder
+        # records those. A live session produced 55 versions of which 54 were its own blobs.
+        port, receiver, tmp_path = daemon
+        post(port, hook("SessionStart"))
+        for noise in (tmp_path / "triples" / "s.jsonl",
+                      tmp_path / "manifests" / "s.json",
+                      tmp_path / "state" / "s.json",
+                      tmp_path / ".eqty_sdk" / "blobs" / "baga6yaq6e"):
+            noise.parent.mkdir(parents=True, exist_ok=True)
+            noise.write_text("internal")
+            post(port, hook("FileChanged", file_path=str(noise), change_type="change"))
+
+        real = tmp_path / "real.py"
+        real.write_text("x = 1\n")
+        post(port, hook("FileChanged", file_path=str(real), change_type="change"))
+
+        state = receiver.registry.get(SESSION)
+        assert list(state.recorder.file_versions) == [str(real)]
+
+    def test_an_edit_the_agent_really_made_is_kept_even_under_a_watched_dir(self, daemon):
+        # Only watcher events are filtered. A tool call that edits a file there is the agent's doing.
+        port, receiver, tmp_path = daemon
+        target = tmp_path / "manifests" / "checked_in.json"
+        post(port, hook("SessionStart"))
+        post(port, hook("PreToolUse", tool_name="Edit", tool_use_id="t1",
+                        tool_input={"file_path": str(target)}))
+        post(port, hook("PostToolUse", tool_name="Edit", tool_use_id="t1",
+                        tool_response={"filePath": str(target), "content": "{}\n"}))
+        state = receiver.registry.get(SESSION)
+        assert str(target) in state.recorder.file_versions
+
+    def test_a_watcher_removal_is_a_tombstone_not_a_write(self, daemon):
+        # change_type is "change" or "unlink". A removal read back off disk yields no content, which is
+        # byte-identical to a file we failed to read -- and means the opposite thing.
+        port, receiver, tmp_path = daemon
+        target = tmp_path / "gone.py"
+        target.write_text("x = 1\n")
+        post(port, hook("SessionStart"))
+        post(port, hook("FileChanged", file_path=str(target), change_type="change"))
+        target.unlink()
+        post(port, hook("FileChanged", file_path=str(target), change_type="unlink"))
+
+        state = receiver.registry.get(SESSION)
+        versions = state.recorder.file_versions[str(target)]
+        assert [v.content_cid.startswith("deleted:") for v in versions] == [False, True]
 
     def test_everything_recorded_live_is_observed(self, daemon):
         # The live path sees events happen; nothing here is inferred from a snapshot delta.

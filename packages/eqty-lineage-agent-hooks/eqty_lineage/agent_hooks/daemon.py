@@ -11,6 +11,15 @@ route on localhost, and ``ThreadingHTTPServer`` is more than adequate for one ag
 **Bind to loopback.** Every payload contains prompts, file contents and tool output. The default bind is
 127.0.0.1 and there is no reason to change it; a token is supported for the case where something else on
 the machine could reach the port.
+
+**Watcher content is as-of-read, not as-of-change.** A ``FileChanged`` payload names a path; the adapter
+then reads that path off disk. Those are two moments, and nothing holds the file still between them. A
+second write landing in the gap is recorded as the content of the first event, and a path deleted in the
+gap reads as absent. This is why a removal is carried by ``change_type`` rather than inferred from a
+failed read -- an inference would be indistinguishable from losing the race. The window is small and
+unavoidable without an inotify payload carrying bytes, so the honest handling is to bound what is claimed:
+watcher versions are ``observed`` (the change really happened) but their *content* is only what the file
+held when it was read.
 """
 
 import json
@@ -20,6 +29,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+from eqty_lineage.core import FileObserved
 
 from .dialects import detect_dialect, to_events
 from .policy import HookPolicy
@@ -52,6 +63,53 @@ class HookReceiver:
         self.service_key = service_key
         self.handled = 0
         self.errors = 0
+        self._ignored_roots = self._own_storage()
+
+    def _own_storage(self) -> list:
+        """Directories this daemon writes to, which a watcher must not report back to it.
+
+        ``--watch <repo>`` asks the agent to report every change under a tree. If the manifest
+        directory, the triple sidecars or the SDK's blob store live inside that tree, recording a file
+        version writes blobs, which the watcher reports as changes, which the recorder records. A live
+        session with the default layout produced 55 file versions of which 54 were the recorder's own
+        content-addressed blobs -- the real edit was one node in a graph made almost entirely of
+        self-observation.
+        """
+        roots = []
+        for candidate in (
+            self.manifest_dir,
+            self.projection_dir,
+            getattr(self.registry, "state_dir", None),
+            getattr(self.registry, "triples_dir", None),
+        ):
+            if candidate is not None:
+                roots.append(Path(candidate).resolve())
+        return roots
+
+    def _is_own_storage(self, path: str) -> bool:
+        # `.eqty_sdk` is matched by name wherever it appears: the SDK resolves its store relative to the
+        # process's working directory, which the daemon does not choose and cannot report.
+        resolved = Path(path)
+        if any(part == ".eqty_sdk" for part in resolved.parts):
+            return True
+        try:
+            resolved = resolved.resolve()
+        except OSError:  # a path that no longer exists still has to be judged
+            return False
+        return any(resolved == root or root in resolved.parents for root in self._ignored_roots)
+
+    def _is_self_observation(self, event: Any) -> bool:
+        """Drop a file observation that is this daemon writing its own records.
+
+        Only watcher-derived observations are filtered. A tool call that genuinely edits a file under
+        one of these directories is the agent's doing and belongs in the graph.
+        """
+        return (
+            isinstance(event, FileObserved)
+            and event.tool_use_id is None
+            and bool(event.path)
+            and self._is_own_storage(event.path)
+        )
 
     def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         session_id = payload.get("session_id") or "unknown-session"
@@ -66,7 +124,7 @@ class HookReceiver:
             from eqty_sdk.context import graph_context
 
             context = self.registry.context_for(session_id)
-            events = to_events(payload, dialect)
+            events = [e for e in to_events(payload, dialect) if not self._is_self_observation(e)]
             try:
                 if context is not None:
                     with graph_context(context):

@@ -17,15 +17,17 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from eqty_lineage.core import (
     ContentPolicy,
-    LineageRecorder,
     TripleSink,
     project_manifest,
     select_file_lineage,
 )
+
+if TYPE_CHECKING:  # LineageRecorder pulls in eqty_sdk; see the note in eqty_lineage.core
+    from eqty_lineage.core import LineageRecorder
 
 logger = logging.getLogger("eqty.lineage.hooks")
 
@@ -35,7 +37,7 @@ DEFAULT_STATE_DIR = Path(".eqty_sdk") / "sessions"
 @dataclass
 class SessionState:
     session_id: str
-    recorder: LineageRecorder
+    recorder: "LineageRecorder"
     context_uuid: Optional[str] = None
     triples_path: Optional[Path] = None
     events_seen: int = 0
@@ -48,6 +50,12 @@ class SessionRegistry:
     Serializes per session with a lock. The recorder is not thread-safe by design -- a tool call's start
     and end must be applied in order -- and the daemon is free to serve different sessions concurrently
     because they share nothing.
+
+    ``store_blobs`` defaults to **off**. It maps to the SDK's ``set_store_all_blobs``, which is how every
+    file the agent reads becomes content-addressed and durable on disk -- the exact mechanism
+    :mod:`eqty_lineage.core.redaction` exists to bound. Lineage does not need it: identity, paths and
+    derivation edges are recorded either way, and only the *bytes* are withheld. Turn it on deliberately,
+    for a repository you are willing to have stored.
     """
 
     def __init__(
@@ -56,7 +64,7 @@ class SessionRegistry:
         policy: Optional[ContentPolicy] = None,
         triples_dir: Optional[Path] = None,
         verbose: bool = False,
-        store_blobs: bool = True,
+        store_blobs: bool = False,
     ) -> None:
         self.state_dir = Path(state_dir) if state_dir else DEFAULT_STATE_DIR
         self.policy = policy if policy is not None else ContentPolicy()
@@ -125,6 +133,7 @@ class SessionRegistry:
             return state
 
         self._ensure_sdk()
+        from eqty_lineage.core import LineageRecorder
         from eqty_sdk import Context
 
         sidecar = self._load_sidecar(session_id)
@@ -203,6 +212,18 @@ class SessionRegistry:
             # eqty-sdk 2.2.0 binds ~3 parameters per statement_graph_link row in a single un-chunked
             # query, so a context over ~10,922 statements exceeds SQLITE_MAX_VARIABLE_NUMBER. The
             # statements and the triple sidecar are unaffected; only the manifest file is lost.
+            #
+            # Say so loudly and name the surviving record. A long session failing this way is exactly
+            # when someone later asks where the manifest went, and "it is in the sidecar" is the answer
+            # -- silently returning a string left that discoverable only by reading this code.
+            if state is not None and state.triples_path is not None:
+                logger.warning(
+                    "manifest export failed for %s (%s statements recorded); the triple sidecar at %s "
+                    "is unaffected and remains the complete record of this session",
+                    session_id,
+                    len(state.recorder.triples),
+                    state.triples_path,
+                )
             return str(exc)
 
 
