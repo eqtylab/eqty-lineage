@@ -12,12 +12,12 @@ deployment that only wants "deny writes outside the repo" should not have to ins
 import fnmatch
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("eqty.lineage.hooks")
 
 Decision = Tuple[str, str]
-"""(permissionDecision, reason) -- "allow" | "deny" | "ask"."""
+"""(permissionDecision, reason) -- "allow" | "deny" | "ask" | "defer"."""
 
 # Tool inputs that name a file, by the key each agent uses.
 _PATH_KEYS = ("file_path", "path", "filePath", "notebook_path")
@@ -43,11 +43,15 @@ class HookPolicy:
     violations: List[str] = field(default_factory=list)
 
     def decide(self, payload: Dict[str, Any], recorder: Any = None) -> Optional[Decision]:
-        """Return a decision, or ``None`` to defer to the agent's normal permission flow.
+        """Return a decision, or ``None`` to say nothing at all.
 
         Deferring rather than allowing is deliberate: returning ``allow`` from a hook *overrides* the
         user's own settings, so a lineage recorder that answered ``allow`` by default would silently
-        widen the agent's permissions. Recording provenance must never grant authority.
+        widen the agent's permissions. Recording provenance must never grant authority. This policy
+        therefore only ever emits ``deny`` or ``defer`` -- never ``allow``.
+
+        ``None`` and ``("defer", ...)`` reach the agent the same way; the difference is that ``None``
+        means the policy had no opinion, while ``defer`` means it had one and is declining to enforce it.
         """
         tool = payload.get("tool_name") or ""
         tool_input = payload.get("tool_input") or {}
@@ -58,26 +62,51 @@ class HookPolicy:
         if tool not in self.write_tools:
             return None
 
-        path = None
-        if isinstance(tool_input, dict):
-            path = next((tool_input[k] for k in _PATH_KEYS if isinstance(tool_input.get(k), str)), None)
-        if not path:
+        paths = list(self._written_paths(tool, tool_input, payload.get("cwd")))
+        if not paths:
             return None
 
-        for pattern in self.deny_write_globs:
-            if fnmatch.fnmatch(path, pattern):
-                return self._verdict(f"write to '{path}' matches denied pattern '{pattern}'")
+        for path in paths:
+            for pattern in self.deny_write_globs:
+                if fnmatch.fnmatch(path, pattern):
+                    return self._verdict(f"write to '{path}' matches denied pattern '{pattern}'")
 
-        if self.allow_write_globs and not any(fnmatch.fnmatch(path, p) for p in self.allow_write_globs):
-            return self._verdict(f"write to '{path}' is outside the permitted set")
+            if self.allow_write_globs and not any(fnmatch.fnmatch(path, p) for p in self.allow_write_globs):
+                return self._verdict(f"write to '{path}' is outside the permitted set")
 
         return None
+
+    def _written_paths(self, tool: str, tool_input: Any, cwd: Optional[str]) -> Iterator[str]:
+        """Every path this call would write.
+
+        ``apply_patch`` carries a patch document rather than a path, so the key lookup finds nothing and
+        the call defers -- which left every Codex write unchecked while ``apply_patch`` sat in
+        ``write_tools`` looking enforced. One patch can also touch several files, and a policy that
+        stopped at the first would pass a patch whose second hunk escapes the permitted set.
+        """
+        if not isinstance(tool_input, dict):
+            return
+
+        for key in _PATH_KEYS:
+            if isinstance(tool_input.get(key), str) and tool_input[key]:
+                yield tool_input[key]
+                return
+
+        command = tool_input.get("command")
+        if isinstance(command, str):
+            from .dialects import parse_apply_patch
+
+            for path, _mode, _content in parse_apply_patch(command, cwd):
+                yield path
 
     def _verdict(self, reason: str) -> Decision:
         self.violations.append(reason)
         if self.dry_run:
+            # "defer" hands the call back to the user's own permission flow. Returning "allow" here --
+            # as this did -- *overrides* their settings, so rolling a policy out in report-only mode
+            # silently widened the agent's permissions on exactly the calls it was flagging.
             logger.warning("would deny: %s", reason)
-            return ("allow", f"eqty-lineage (dry run): {reason}")
+            return ("defer", f"eqty-lineage (dry run): {reason}")
         return ("deny", f"eqty-lineage: {reason}")
 
 

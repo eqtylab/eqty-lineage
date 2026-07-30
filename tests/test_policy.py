@@ -55,12 +55,75 @@ class TestPolicyNeverGrantsAuthority:
             {"tool_name": "Edit", "tool_input": {}}
         ) is None
 
-    def test_dry_run_reports_without_denying(self):
-        # The honest way to roll a policy out.
+    def test_dry_run_defers_rather_than_allowing(self):
+        # The honest way to roll a policy out -- and it must not *grant* anything on the way. Returning
+        # "allow" here overrode the user's own settings on precisely the calls being flagged, which is
+        # the failure this whole module is written to avoid.
         policy = HookPolicy(allow_write_globs=("/repo/*",), dry_run=True)
         decision = policy.decide(payload(path="/etc/passwd"))
-        assert decision[0] == "allow"
+        assert decision[0] == "defer"
         assert policy.violations, "a dry-run denial must still be recorded"
+
+    def test_no_configuration_can_make_this_policy_answer_allow(self):
+        for policy in (
+            HookPolicy(allow_write_globs=("/repo/*",)),
+            HookPolicy(deny_write_globs=("*",)),
+            HookPolicy(deny_tools=("Bash",), dry_run=True),
+            HookPolicy(allow_write_globs=("/nowhere/*",), dry_run=True),
+        ):
+            for call in (payload(), payload(tool="Bash"), payload(path="/etc/passwd")):
+                decision = policy.decide(call)
+                assert decision is None or decision[0] != "allow"
+
+
+class TestApplyPatchEnforcement:
+    """``apply_patch`` carries a patch document, not a path.
+
+    It was listed in ``write_tools`` while no path key could ever match it, so every Codex write
+    deferred -- the policy looked enforced and checked nothing.
+    """
+
+    ADD = ("*** Begin Patch\n"
+           "*** Add File: escape.py\n"
+           "+import os\n"
+           "*** End Patch\n")
+    TWO_FILES = ("*** Begin Patch\n"
+                 "*** Add File: inside.py\n"
+                 "+a = 1\n"
+                 "*** Update File: /etc/hosts\n"
+                 "@@\n"
+                 "-old\n"
+                 "+new\n"
+                 "*** End Patch\n")
+
+    def call(self, patch, cwd="/repo"):
+        return {"tool_name": "apply_patch", "tool_input": {"command": patch}, "cwd": cwd}
+
+    def test_a_patch_writing_outside_the_permitted_set_is_denied(self):
+        policy = HookPolicy(allow_write_globs=("/repo/*",))
+        assert policy.decide(self.call(self.ADD, cwd="/elsewhere"))[0] == "deny"
+
+    def test_a_patch_inside_the_permitted_set_defers(self):
+        policy = HookPolicy(allow_write_globs=("/repo/*",))
+        assert policy.decide(self.call(self.ADD)) is None
+
+    def test_every_file_in_a_patch_is_checked_not_just_the_first(self):
+        # A patch whose first hunk is permitted and whose second escapes must still be refused.
+        policy = HookPolicy(allow_write_globs=("/repo/*",))
+        decision = policy.decide(self.call(self.TWO_FILES))
+        assert decision[0] == "deny"
+        assert "/etc/hosts" in decision[1]
+
+    def test_a_deny_glob_matches_inside_a_patch(self):
+        policy = HookPolicy(deny_write_globs=("*.pem",))
+        patch = "*** Begin Patch\n*** Add File: secrets/key.pem\n+xxx\n*** End Patch\n"
+        assert policy.decide(self.call(patch))[0] == "deny"
+
+    def test_a_command_that_is_not_a_patch_defers(self):
+        # Bash is not a write tool, but a write tool carrying an unparseable command must not be
+        # guessed at either.
+        policy = HookPolicy(allow_write_globs=("/repo/*",))
+        assert policy.decide(self.call("ls -la")) is None
 
 
 class TestReplay:
