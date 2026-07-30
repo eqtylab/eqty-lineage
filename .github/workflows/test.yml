@@ -1,0 +1,73 @@
+# CI runs the part of the suite that needs no credentials.
+#
+# `eqty-sdk` resolves from a private index, so the recorder-backed tests cannot run here without
+# publishing index credentials to CI. Rather than skip them and report green, this installs the
+# packages with --no-deps and *asserts the SDK is absent* before running -- so a job that passes is
+# evidence the parser, the dialects, the policy, the semirings and the query engine are genuinely
+# independent of it, which is the claim the README makes.
+#
+# The SDK-backed tests (recorder, daemon, backend agreement, conformance) run locally via `just test`.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pure:
+    name: pure suite (no eqty-sdk)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install packages without their dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install --no-deps \
+            ./packages/eqty-lineage-core \
+            ./packages/eqty-lineage-transcript \
+            ./packages/eqty-lineage-agent-hooks \
+            ./packages/eqty-lineage-query
+      - name: Assert eqty-sdk really is absent
+        run: |
+          if python -c 'import eqty_sdk' 2>/dev/null; then
+            echo "eqty-sdk is installed; this job no longer proves what it claims to" >&2
+            exit 1
+          fi
+      - name: Run the pure suite
+        run: |
+          pytest tests/test_tool_results.py tests/test_transcript.py tests/test_semiring.py \
+                 tests/test_engine.py tests/test_codex.py tests/test_dialects.py tests/test_cli.py \
+                 tests/test_redaction.py tests/test_determination.py tests/test_policy.py
+
+  # No formatting or lint gate here on purpose. The tree does not currently satisfy `ruff format`
+  # (32 files differ, most of them untouched by this branch) and `ruff check` at default rules reports
+  # 635 findings because no rule set has been chosen. Both are worth fixing; neither should land inside
+  # a change this size, where the reformat diff would bury the review.
+
+  accelerator:
+    name: rust accelerator builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      # The Python evaluator is the reference oracle and the Rust port is optional, so this only has to
+      # prove the crate still compiles. Backend *agreement* is asserted by tests/test_backends.py, which
+      # needs the SDK and therefore runs locally.
+      #
+      # `check`, not `build`: this is a pyo3 extension module, so linking needs the interpreter symbols
+      # that maturin supplies. A bare `cargo build` fails at the link step on macOS and only passes on
+      # Linux because undefined symbols in a shared object are permitted there -- a gate that depends on
+      # that is testing the platform, not the crate.
+      - run: cargo check --release --manifest-path packages/eqty-lineage-query-rs/Cargo.toml
