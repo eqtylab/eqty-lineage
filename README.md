@@ -28,10 +28,17 @@ paths with no correlation ids and no shared database.
 eqty-lineage-transcript ~/.claude/projects/<project>/<session>.jsonl -o manifest.json
 
 # Live: run the hook daemon and point an agent at it
+export EQTY_LINEAGE_TOKEN=$(openssl rand -hex 16)
 eqty-lineage-hooks serve --port 8787 --manifests ./manifests --watch /path/to/repo
 eqty-lineage-hooks install --print              # settings.json wiring for Claude Code
 eqty-lineage-hooks install --dialect codex      # ~/.codex config for Codex
 ```
+
+File *contents* are not stored unless you ask for them (`--blobs`). Identity, paths and derivation edges
+are recorded either way; the flag only decides whether the bytes of everything the agent read become
+durable on disk. The token is read from `$EQTY_LINEAGE_TOKEN` rather than a flag, because a secret on the
+command line is visible in `ps`, and the emitted config passes it by env-var reference so a
+`settings.json` carrying it can still be committed.
 
 Then query it:
 
@@ -49,19 +56,42 @@ taint(triples, untrusted=[cid])     # did anything untrusted reach each artifact
 
 The offline and live paths share `eqty-lineage-core`, including tool-result parsing, so they cannot
 drift on the details that matter. `eqty-lineage-hooks verify` ingests a real transcript, separately
-replays it as hook payloads, and asserts every divergence falls into a declared bucket.
+replays it as hook payloads, and asserts every divergence falls into a declared bucket. 12/12 sessions
+conform at the time of writing.
+
+**What that does and does not prove.** Because both paths share `core`, this exercises the two
+*adapters*, not the recorder: a fault in shared code is invisible to it, which is the classic N-version
+result. Replay also cannot produce events a transcript has no record of — `InstructionsLoaded`,
+`FileChanged`, `PermissionRequest` — so those asymmetries are *declared*, not demonstrated. Conformance
+means no undeclared divergence, not that both paths are correct.
 
 The live path gets three things a transcript cannot provide: Bash side effects as *observed* rather than
 inferred, the instruction files that entered context, and the permission decisions themselves. See
 [`packages/eqty-lineage-agent-hooks/README.md`](packages/eqty-lineage-agent-hooks/README.md).
 
+**`SessionStart` is wired as a command hook, not HTTP.** It is the one event that accepts no HTTP
+handler. Configured as HTTP it is accepted by `settings.json` and then silently never delivered — and
+since `SessionStart` both creates the `Agent` asset and returns `watchPaths`, losing it means the
+manifest attests a transcript rather than a computation *and* no `FileChanged` ever fires, so every Bash
+side effect stays unobserved. `install` emits the correct mix; this was found by running a session and
+watching the event never arrive.
+
 ## Codex
 
-Verified end-to-end against **codex-cli 0.145.0**. Four things differ from Claude Code, all found by
-capturing real payloads rather than reading documentation — most importantly that Codex writes with
-`apply_patch`, whose payload carries a patch document rather than a file path and content, so a Codex
-session yields *no file lineage at all* unless the patch is parsed. The offline path does not cover
-Codex; its rollout files are a different format.
+Verified end-to-end against **codex-cli 0.145.0** — a live session through the daemon: hooks
+authenticated, `apply_patch` parsed, `slug.py` recorded as `Code` with its path, manifest exported, zero
+errors. Five things differ from Claude Code, all found by capturing real payloads rather than reading
+documentation. Most importantly Codex writes with `apply_patch`, whose payload carries a patch document
+rather than a file path and content, so a Codex session yields *no file lineage at all* unless the patch
+is parsed.
+
+One is a gap rather than a difference: **a failing Codex shell command is indistinguishable from a
+successful one.** Its `tool_response` is bare output text with no exit code and no error flag —
+`ls /nonexistent` and `echo hello` differ only in what they printed. Codex failures are therefore
+recorded as successes, and no care in the adapter changes that. Pinned by a test so a future codex-cli
+that starts reporting it shows up as a failure.
+
+The offline path does not cover Codex; its rollout files are a different format.
 
 ## Develop
 
@@ -78,9 +108,15 @@ just publish     # upload ./dist to pypi.eqtylab.io
 
 ### Tests
 
-`tests/` covers the recorder, both adapters, the semirings and the query engine — 240 tests, of which
-the SDK-backed ones skip themselves when `eqty-sdk` is unavailable and the backend-agreement ones skip
-when the accelerator is not built. `just test-pure` is what runs anywhere.
+`tests/` covers the recorder, both adapters, the semirings and the query engine — 286 tests, of which
+the backend-agreement ones skip when the accelerator is not built.
+
+`just test-pure` is the subset needing neither `eqty-sdk` nor a Rust toolchain: 234 of them, and they
+genuinely run with no SDK installed at all. `just test-nosdk` proves it, by building a throwaway venv,
+asserting `eqty_sdk` is absent, and running them there — which is what CI does, since `eqty-sdk` comes
+from a private index CI has no credentials for. That claim used to be false: importing anything from
+`eqty_lineage.core` pulled in the recorder, and the recorder imports the SDK at module scope. The
+recorder is now loaded on first use.
 
 Fixtures are synthetic or sanitised. Real Claude Code transcripts carry the full contents of whatever
 repository the session touched, so `tests/fixtures/claude_session.jsonl` is hand-built to exercise the

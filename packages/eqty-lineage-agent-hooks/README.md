@@ -3,6 +3,7 @@
 Live EQTY lineage capture from Claude Code and Codex hooks.
 
 ```bash
+export EQTY_LINEAGE_TOKEN=$(openssl rand -hex 16)
 eqty-lineage-hooks serve --port 8787 --manifests ./manifests --watch /path/to/repo
 eqty-lineage-hooks install --print          # settings.json / hooks.json wiring
 ```
@@ -18,13 +19,23 @@ Claude Code can deliver hooks as **HTTP POSTs**, not only as command invocations
 latency: with a persistent daemon the session's recorder and run tree stay in memory for the session's
 lifetime — the same shape the LangChain handler has always had.
 
+**Except `SessionStart`, which accepts no HTTP handler** — only `command` and `mcp_tool`. Wiring it as
+HTTP is accepted by `settings.json` and then never delivered, and it is the worst event to lose: it
+creates the `Agent` asset *and* returns `watchPaths`, so without it the manifest attests a transcript
+rather than a computation and no `FileChanged` ever fires. `install` emits `SessionStart` as a `command`
+hook that curls the daemon, and everything else over HTTP. Verified against Claude Code 2.1.220 by
+running a session with each wiring and counting what arrived: 5 events with SessionStart over HTTP, 20
+with it as a command hook.
+
 The command fallback (`eqty-lineage-hooks hook`, one payload on stdin) is genuinely lossier. A fresh
 process cannot hold an open tool call in memory, so Pre/Post correlation depends on the sidecar rather
 than on the run tree, and it pays interpreter startup per event (~40 ms measured with `init()` and a
 signer). Use it only where a daemon cannot run.
 
-Bind to loopback. Every payload carries prompts, file contents, and tool output; `--token` adds a bearer
-check for machines where something else could reach the port.
+Bind to loopback. Every payload carries prompts, file contents, and tool output. The bearer token is read
+from `$EQTY_LINEAGE_TOKEN`, not a flag, so it is not visible in `ps`; `install` emits it as an env-var
+reference (`headers` + `allowedEnvVars`) so the settings file carries no secret. File contents are not
+stored at all unless `--blobs` is passed.
 
 ## What the live path gets that transcripts cannot
 
@@ -32,6 +43,14 @@ check for machines where something else could reach the port.
 the resulting `FileChanged` events record what a shell command actually did. The offline path can only
 infer this from snapshot deltas and marks it `observed=False`. This is the single strongest reason to
 run the daemon.
+
+Two things bound that claim. A watcher names a path and the adapter then reads it, so the content is
+*as-of-read*, not as-of-change — a second write landing in the gap is recorded as the content of the
+first event. And `change_type` distinguishes `change` from `unlink`: a removal is recorded as a tombstone
+rather than a version whose bytes failed to load, because those are opposite claims. Observations of the
+daemon's own storage (the manifest and sidecar directories, anything under `.eqty_sdk`) are dropped —
+otherwise recording a file version writes blobs, the watcher reports them, and the recorder records
+those. Left in, one real edit came back as 55 file versions, 54 of them the recorder watching itself.
 
 **Instructions are inputs.** `InstructionsLoaded` names each CLAUDE.md and rules file as it enters
 context; they become `SystemPrompt` assets that everything downstream depends on. Transcripts have no
@@ -45,8 +64,22 @@ to the activity by `eqty:authorizedBy` — what the agent was *permitted* to do,
 ## Correctness details that are easy to get wrong
 
 - **`PostToolUse` fires only on success.** Without also subscribing to `PostToolUseFailure`, every failed
-  tool call vanishes — and a failed call is often the one an audit cares about.
+  tool call vanishes — and a failed call is often the one an audit cares about. The failure payload
+  carries its outcome under `error`, not `tool_response`; reading the success key records the call with
+  its substance missing, which is worse than dropping it, and a test written against the same assumption
+  passes.
 - **`PostToolBatch`** is the correlation primitive for parallel tool calls: one payload closing several.
+  Entries are `{tool_name, tool_input, tool_use_id, tool_response}` — the same result key as
+  `PostToolUse`, with no per-call error flag. (The published docs describe the array as `batch`; the
+  CLI sends `tool_calls`.)
+- **Codex reports outcomes in a string, and mostly does not report failure at all.** Its `tool_response`
+  is plain text, so a dict-only error check can never see a Codex failure. Where the text begins
+  `Exit code: N` — the `apply_patch` shape — that is read. Shell results carry no such marker: captured
+  from codex-cli 0.145.0, a failing `ls /nonexistent` returns `"ls: /nonexistent: No such file or
+  directory\n"` and a succeeding `echo hello` returns `"hello\n"`. Bare output either way. **A failing
+  Codex shell command is therefore recorded as a successful one**, and nothing in this adapter can fix
+  that; the signal is not in the payload. Pinned by a test so a future codex-cli that starts reporting it
+  shows up as a failure here.
 - **Dialect detection is automatic** — `turn_id` is Codex-only, `prompt_id` is Claude-Code-only.
 - **Unknown hook events yield nothing rather than raising.** Both agents add events between releases;
   an adapter that crashed on one would take down the session it is observing.
@@ -63,7 +96,13 @@ silently widen the agent's permissions. Returning nothing defers to the normal p
 eqty-lineage-hooks serve --allow-write '/repo/*' --deny-write '*.pem' --dry-run
 ```
 
-`--dry-run` logs what would be denied without denying it — the honest way to roll a policy out.
+`--dry-run` logs what would be denied and answers `defer` — the honest way to roll a policy out. It
+answers `defer` rather than `allow` for the reason above: reporting mode must not quietly grant
+permission on precisely the calls it is flagging.
+
+`apply_patch` is checked by parsing the patch document. It carries no path key, so a policy that looked
+for one deferred on every Codex write while listing `apply_patch` as a write tool — enforced-looking and
+checking nothing. Every file in a patch is checked, not just the first.
 
 ## Contexts
 

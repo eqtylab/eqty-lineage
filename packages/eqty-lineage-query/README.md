@@ -23,6 +23,11 @@ at all — an off-the-shelf engine answers *whether* something is derivable, and
 nothing else changes. It is optional by design — this package is the reference implementation and the
 oracle the port is verified against.
 
+**It is not published.** Build it from this tree with `just build-accel` (needs cargo and maturin) and
+install the resulting wheel. The `accel` extra resolves against the local path so the workspace lockfile
+is self-contained; a published `eqty-lineage-query[accel]` will not resolve until the accelerator is
+pushed to the index.
+
 ```python
 blast_radius(triples, source)                      # uses it when installed
 blast_radius(triples, source, backend="python")    # force the reference path

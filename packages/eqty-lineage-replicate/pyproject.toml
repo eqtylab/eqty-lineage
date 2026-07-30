@@ -4,13 +4,13 @@ build-backend = "uv_build"
 
 [project]
 name = "eqty-lineage-replicate"
-version = "0.0.0"
+version = "0.1.0"
 description = "Run an agent task N times and report which artifacts survived its nondeterminism."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-lineage-core",
-    "eqty-lineage-query",
+    "eqty-lineage-core>=0.1",
+    "eqty-lineage-query>=0.1",
     "eqty-lineage-transcript",
 ]
 

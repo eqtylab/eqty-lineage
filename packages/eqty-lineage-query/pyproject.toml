@@ -4,12 +4,12 @@ build-backend = "uv_build"
 
 [project]
 name = "eqty-lineage-query"
-version = "0.0.0"
+version = "0.1.0"
 description = "Semiring-parameterized Datalog queries over EQTY lineage graphs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-lineage-core",
+    "eqty-lineage-core>=0.1",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +22,10 @@ eqty-lineage-query = "eqty_lineage.query.__main__:main"
 [tool.uv.sources]
 eqty-lineage-core = { workspace = true }
 eqty-sdk = { index = "eqty" }
+# The accelerator is not published; it is built from this tree with `just build-accel`. A path source
+# keeps the `accel` extra resolvable without an index, so the lockfile is self-contained. It is excluded
+# from the workspace members so that a plain `just sync` still needs no Rust toolchain.
+eqty-lineage-query-rs = { path = "../eqty-lineage-query-rs" }
 
 [[tool.uv.index]]
 name = "eqty"

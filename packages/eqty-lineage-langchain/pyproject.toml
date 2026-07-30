@@ -4,12 +4,12 @@ build-backend = "uv_build"
 
 [project]
 name = "eqty-lineage-langchain"
-version = "0.0.0"
+version = "0.1.0"
 description = "EQTY lineage callback handler for LangChain and LangGraph."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-sdk",
+    "eqty-sdk>=2.2,<3",
     "langchain-core>=0.3",
 ]
 

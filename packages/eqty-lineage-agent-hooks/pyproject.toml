@@ -4,12 +4,12 @@ build-backend = "uv_build"
 
 [project]
 name = "eqty-lineage-agent-hooks"
-version = "0.0.0"
+version = "0.1.0"
 description = "Live EQTY lineage capture from Claude Code and Codex hooks."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-lineage-core",
+    "eqty-lineage-core>=0.1",
 ]
 
 [project.scripts]
