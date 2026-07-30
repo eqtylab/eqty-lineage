@@ -17,8 +17,10 @@ report: did every run produce the same bytes at this path?
 *Derivation support* -- in which runs is Y reachable from X. Needs the closure, evaluated in the
 determination semiring, and answers "in which runs did this input actually influence that output".
 
-The empirical case for caring: six runs of a task specified down to the algorithm produced five
-distinct implementations, three behaviourally distinct, all passing the same dictated test.
+The empirical case for caring, re-runnable rather than asserted: six runs of one task produced four
+distinct implementations in two behavioural classes, all six passing the same dictated tests, with the
+divergence sitting exactly where the specification was silent. See ``experiments/determination/`` for
+the template, the probe and the measurement.
 """
 
 import collections

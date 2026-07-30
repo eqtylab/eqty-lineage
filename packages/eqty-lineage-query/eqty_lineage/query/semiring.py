@@ -230,10 +230,19 @@ def integrity(classify: Callable[[str], Level], top: Level = UNTRUSTED, bottom: 
     annihilate, any path crossing a single clean edge would multiply down to ``trusted`` and taint
     would never propagate at all.
 
-    Structurally this is a bounded distributive lattice. Both identities still hold (``max(a, bottom) =
-    a`` for ``plus`` and ``times`` alike) and it is idempotent and absorptive, so the fixpoint
-    terminates and distributes correctly; annihilation is the only law given up, and nothing in the
-    evaluator depends on it.
+    Structurally it is a **bounded join-semilattice**, not a lattice: ``plus`` and ``times`` are the
+    same operation, so there is no meet to pair with the join. **Two laws are given up, not one.**
+    Annihilation is the deliberate one. Absorption also fails -- ``plus(a, times(a, b))`` is
+    ``max(a, b)``, not ``a`` -- and it cannot hold here, because absorption describes how a meet and a
+    join interact and there is only one operation. An earlier version of this docstring claimed
+    absorption held and that annihilation was the only casualty; the law tests in
+    ``tests/test_semiring_laws.py`` disagreed, and they were right.
+
+    What still holds is what the evaluator needs: both identities (``max(a, bottom) = a``),
+    commutativity, associativity, idempotence and distributivity. Termination does **not** rest on
+    absorption here -- it follows from the carrier being a finite chain under a monotone
+    non-decreasing operation, so the fixpoint is reached within the height of the chain. Nothing in the
+    evaluator branches on ``absorptive``; it only sharpens a diagnostic message.
     """
     return Semiring[Level](
         name="integrity",
@@ -243,7 +252,7 @@ def integrity(classify: Callable[[str], Level], top: Level = UNTRUSTED, bottom: 
         times=lambda a, b: a if a.rank >= b.rank else b,
         lift=classify,
         idempotent=True,
-        absorptive=True,
+        absorptive=False,
         describe=lambda v: v.label,
     )
 

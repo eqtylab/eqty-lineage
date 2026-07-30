@@ -3,9 +3,7 @@ _:
 
 # Tests needing neither eqty-sdk nor a Rust toolchain. Named once so `test-pure`, `test-nosdk` and CI
 # cannot drift -- a file quietly dropped from one of them is a suite that stops being run.
-PURE_TESTS := "tests/test_tool_results.py tests/test_transcript.py tests/test_semiring.py " + \
-              "tests/test_engine.py tests/test_codex.py tests/test_dialects.py tests/test_cli.py " + \
-              "tests/test_redaction.py tests/test_determination.py tests/test_policy.py"
+PURE_TESTS := "tests/test_tool_results.py tests/test_transcript.py tests/test_semiring.py tests/test_semiring_laws.py tests/test_engine.py tests/test_codex.py tests/test_dialects.py tests/test_cli.py tests/test_redaction.py tests/test_determination.py tests/test_policy.py tests/test_invariants.py tests/test_serialize.py"
 
 # UV sync to install dependencies
 sync:

@@ -187,14 +187,32 @@ class TestIntegrityIsALattice:
         assert through_clean == self.untrusted
 
     def test_the_laws_the_evaluator_actually_needs_still_hold(self):
-        # Identities, idempotence, absorption and distributivity are what make the fixpoint terminate
-        # and compose correctly. Annihilation is the only law given up.
+        # Identities, idempotence and distributivity are what make the fixpoint compose correctly.
         for a in (self.trusted, self.untrusted):
             assert self.s.plus(a, self.s.zero) == a
             assert self.s.times(a, self.s.one) == a
             assert self.s.plus(a, a) == a
         for a, b, c in itertools.product((self.trusted, self.untrusted), repeat=3):
             assert self.s.times(a, self.s.plus(b, c)) == self.s.plus(self.s.times(a, b), self.s.times(a, c))
+
+    def test_absorption_does_not_hold_either(self):
+        # This comment used to say "annihilation is the only law given up", and nothing tested it.
+        # Absorption fails too, and cannot hold: `plus` and `times` are the same operation, so there
+        # is no meet to pair with the join, and absorption is a statement about how the two interact.
+        assert self.s.plus(self.trusted, self.s.times(self.trusted, self.untrusted)) == self.untrusted
+        assert self.s.absorptive is False
+
+    def test_termination_rests_on_finite_height_not_absorption(self):
+        # Both operations are monotone non-decreasing over a finite chain, so iterating from any
+        # starting value reaches a fixpoint within the height of the chain. That is what bounds the
+        # evaluator here -- not the absorption property the other recursive semirings rely on.
+        value = self.trusted
+        for _ in range(len(("trusted", "untrusted")) + 1):
+            nxt = self.s.plus(value, self.untrusted)
+            if nxt == value:
+                break
+            value = nxt
+        assert value == self.untrusted
 
 
 class TestDetermination:
