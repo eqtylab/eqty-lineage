@@ -132,3 +132,56 @@ class TestCapturedSessionReplay:
         observed = [e for e in self.events(codex_payloads) if isinstance(e, FileObserved)]
         assert observed, "Codex session produced no file lineage"
         assert all(e.path.startswith("/") for e in observed)
+
+    def test_the_captured_session_records_no_spurious_failures(self, codex_payloads):
+        ended = [e for e in self.events(codex_payloads) if isinstance(e, ToolCallEnded)]
+        assert not any(e.is_error for e in ended)
+
+
+class TestCodexFailures:
+    """Codex returns a plain string, so a dict-only error check calls every failure a success.
+
+    The captured ``tool_response`` values begin ``Exit code: N`` -- the only failure signal a Codex
+    payload carries. ``is_error`` drives the result asset's name and the ``is-error`` metadata on the
+    activity, so getting it wrong means a graph in which nothing ever failed.
+    """
+
+    def ended(self, response):
+        events = to_events({"hook_event_name": "PostToolUse", "turn_id": "t1", "session_id": "s1",
+                            "tool_name": "Bash", "tool_use_id": "c1", "tool_response": response})
+        return next(e for e in events if isinstance(e, ToolCallEnded))
+
+    def test_a_nonzero_exit_is_an_error(self):
+        assert self.ended("Exit code: 1\nWall time: 0.1 seconds\nOutput:\nboom\n").is_error
+
+    def test_a_zero_exit_is_not(self):
+        assert not self.ended("Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess.\n").is_error
+
+    def test_a_negative_exit_is_an_error(self):
+        # A signal death reports a negative code; treating it as success would hide a kill.
+        assert self.ended("Exit code: -9\nOutput:\n").is_error
+
+    def test_a_string_that_is_not_an_exit_report_is_not_guessed_at(self):
+        # 626 of the Bash results in the surveyed corpus are bare strings. Only the ones that actually
+        # report a code say anything about success.
+        assert not self.ended("some tool output mentioning Exit code: 1 in passing").is_error
+
+    def test_a_failed_shell_command_is_indistinguishable_from_a_successful_one(self):
+        """A declared gap, captured from codex-cli 0.145.0 rather than assumed.
+
+        These two payloads are what the CLI actually sent for `ls /nonexistent-path-xyz` and
+        `echo hello-from-codex`. Bare output either way: no exit code, no flag, nothing separating
+        them. The `Exit code:` prefix rides on the apply_patch shape, not on shell results.
+
+        So a failing Codex shell command is recorded as a successful one, and no amount of care in
+        this adapter changes that -- the signal is not in the payload. Pinned as a test so that if a
+        later codex-cli starts reporting it, this fails and says so.
+        """
+        failed = self.ended("ls: /nonexistent-path-xyz: No such file or directory\n")
+        succeeded = self.ended("hello-from-codex\n")
+        assert failed.is_error == succeeded.is_error is False
+
+    def test_the_apply_patch_shape_does_carry_a_code(self):
+        # The other half of the same finding: where the payload states the outcome, it is read.
+        assert not self.ended("Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess.\n").is_error
+        assert self.ended("Exit code: 2\nWall time: 0.1 seconds\nOutput:\nfailed\n").is_error

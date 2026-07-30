@@ -22,6 +22,7 @@ failed call is often exactly the one an audit cares about.
 """
 
 import logging
+import re
 from typing import Any, Dict, Iterator, List, Optional
 
 from eqty_lineage.core import (
@@ -69,6 +70,9 @@ CLAUDE_CODE_EVENTS = (
 # Verified to fire against codex-cli 0.145.0: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
 # Stop, SessionEnd. The rest are accepted by its config schema but were not exercised by the sessions
 # tested, so they are subscribed optimistically -- an event that never fires costs nothing.
+#
+# `Stop` is deliberately absent: it fires once per turn and carries only `last_assistant_message`, which
+# the recorder has no event for. Subscribing would buy a round trip per turn and produce nothing.
 CODEX_EVENTS = (
     "SessionStart",
     "SessionEnd",
@@ -78,7 +82,6 @@ CODEX_EVENTS = (
     "PermissionRequest",
     "PreCompact",
     "PostCompact",
-    "Stop",
 )
 
 
@@ -176,9 +179,15 @@ def _dispatch(name: str, p: Dict[str, Any], dialect: str) -> Iterator[Event]:
         )
 
     elif name in ("PostToolUse", "PostToolUseFailure"):
-        response = p.get("tool_response")
-        # PostToolUse fires only on success in Claude Code; the failure case is a separate event.
+        # PostToolUse fires only on success in Claude Code; the failure case is a separate event --
+        # and it carries the outcome under `error`, not `tool_response`. Reading `tool_response` for a
+        # failure yields None, so the call that an audit most wants to see records "no result".
+        response = p.get("error") if name == "PostToolUseFailure" else p.get("tool_response")
         is_error = name == "PostToolUseFailure" or _looks_like_error(response)
+        if name == "PostToolUseFailure" and p.get("is_interrupt"):
+            # An interrupt is not a tool failure. Both end the call, and only this flag separates
+            # "the tool broke" from "the user stopped it".
+            response = {"error": response, "interrupted": True}
         events, _ = file_events_from_result(response, tool_use_id, at)
         yield from events
 
@@ -196,17 +205,20 @@ def _dispatch(name: str, p: Dict[str, Any], dialect: str) -> Iterator[Event]:
 
     elif name == "PostToolBatch":
         # The correlation primitive for parallel tool calls: one payload closing several at once.
+        # Each entry is {tool_name, tool_input, tool_use_id, tool_response} -- the same result key as
+        # PostToolUse, not `result`, and there is no per-call error flag to read.
         for call in p.get("tool_calls") or []:
             if not isinstance(call, dict):
                 continue
             call_id = call.get("tool_use_id")
-            events, _ = file_events_from_result(call.get("result"), call_id, at)
+            response = call.get("tool_response")
+            events, _ = file_events_from_result(response, call_id, at)
             yield from events
             yield ToolCallEnded(
                 at=at,
                 tool_use_id=call_id or "",
-                result=call.get("result"),
-                is_error=bool(call.get("is_error")),
+                result=response,
+                is_error=_looks_like_error(response),
             )
 
     elif name in ("PermissionRequest", "PermissionDenied"):
@@ -222,14 +234,18 @@ def _dispatch(name: str, p: Dict[str, Any], dialect: str) -> Iterator[Event]:
 
     elif name == "FileChanged":
         # The one capability the offline path cannot match: a watcher event makes a Bash side effect
-        # *observed* rather than reconstructed from a snapshot diff. Content is read from disk here,
-        # which is sound only because the event fires on the change -- see the daemon's note on races.
+        # *observed* rather than reconstructed from a snapshot diff. Content is read from disk here and
+        # is therefore as-of-read, not as-of-change -- see the daemon's note on watcher races.
+        #
+        # `change_type` is "change" or "unlink". Treating a removal as a write would record a version
+        # whose content merely failed to load, which is the opposite claim.
         path = p.get("file_path", "")
+        removed = p.get("change_type") == "unlink"
         yield FileObserved(
             at=at,
             path=path,
-            content=_read_bytes(path),
-            mode="changed",
+            content=None if removed else _read_bytes(path),
+            mode="deleted" if removed else "changed",
             observed=True,
         )
 
@@ -322,9 +338,28 @@ def _command_of(tool_name: Optional[str], tool_input: Any) -> Optional[str]:
     return None
 
 
+_EXIT_CODE = re.compile(r"^\s*Exit code:\s*(-?\d+)")
+
+
 def _looks_like_error(response: Any) -> bool:
+    """Whether a tool result reports failure.
+
+    Codex returns a plain string rather than a mapping, so inspecting only dicts can never see a Codex
+    failure at all. Some of those strings begin ``Exit code: N``, which is a real signal and is read
+    here.
+
+    **Codex shell failures are not detectable.** Captured from codex-cli 0.145.0: a failing
+    ``ls /nonexistent`` returns ``"ls: /nonexistent: No such file or directory\\n"`` and a succeeding
+    ``echo hello`` returns ``"hello\\n"``. Bare output either way -- no exit code, no flag, nothing that
+    separates them. The ``Exit code:`` prefix appears on the ``apply_patch`` shape, not on shell results.
+    Guessing from content (looking for "No such file", say) would attach a signed ``is-error`` claim to a
+    string that merely mentions an error, so this reports failure only where the payload states it.
+    """
     if isinstance(response, dict):
         return bool(response.get("is_error") or response.get("interrupted"))
+    if isinstance(response, str):
+        match = _EXIT_CODE.match(response)
+        return match is not None and match.group(1) != "0"
     return False
 
 

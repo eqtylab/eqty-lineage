@@ -104,12 +104,16 @@ def replay_payloads(transcript: Path) -> Iterator[Dict[str, Any]]:
             name = pending.pop(tool_use_id, "unknown")
             result = record["toolUseResult"]
             is_error = _is_error(content, result)
+            # A failure carries its payload under `error`; only success uses `tool_response`. Emitting
+            # the success key for both would make this harness disagree with the CLI it stands in for,
+            # and the equivalence test would then be comparing the offline path against a fiction.
+            outcome = {"error": result} if is_error else {"tool_response": result}
             yield base(
                 "PostToolUseFailure" if is_error else "PostToolUse",
                 tool_use_id=tool_use_id,
                 tool_name=name,
-                tool_response=result,
                 timestamp=at,
+                **outcome,
             )
 
     yield base("SessionEnd", reason="other", timestamp=records[-1].get("timestamp"))

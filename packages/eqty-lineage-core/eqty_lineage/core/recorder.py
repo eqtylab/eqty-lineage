@@ -287,10 +287,20 @@ class LineageRecorder:
         if not path:
             return None
 
+        deleted = event.mode == "deleted"
         data = as_bytes(event.content) if event.content is not None else None
         # Identity is always the CID of the *original* bytes, computed without storing them. Keying on
         # post-scrub content would collapse two different secrets into one version.
-        content_cid = str(get_cid_for_bytes(data, False)) if data is not None else f"unknown:{path}"
+        #
+        # A tombstone has no bytes to hash, and it must not share the `unknown:` identity of a version
+        # whose content merely could not be recovered: one says the file is gone, the other says we did
+        # not see it. Collapsing them would let a deletion dedupe against a failed read of the same path.
+        if deleted:
+            content_cid = f"deleted:{path}"
+        elif data is not None:
+            content_cid = str(get_cid_for_bytes(data, False))
+        else:
+            content_cid = f"unknown:{path}"
 
         existing = self._by_content.get((path, content_cid))
         if existing is not None:
@@ -309,22 +319,31 @@ class LineageRecorder:
                 prov.K_OBSERVED: event.observed,
                 prov.K_USER_MODIFIED: event.user_modified,
                 prov.K_REDACTED: redacted,
+                prov.K_DELETED: deleted,
                 "content-cid": content_cid,
             }
         )
 
-        if storable is None:
+        payload: Any
+        if deleted:
+            payload = {"path": path, "deleted": True}
+        elif storable is None:
             # Content withheld by policy (or absent). The node still exists and still carries the true
             # content CID, so lineage is complete even though the bytes are not published. The secret
             # bytes are never handed to an asset constructor at all.
-            payload: Any = {"path": path, "content-cid": content_cid, "redacted": redacted}
+            payload = {"path": path, "content-cid": content_cid, "redacted": redacted}
         else:
             payload = storable.decode("utf-8", errors="replace")
 
+        basename = path.rsplit("/", 1)[-1]
         asset = self._asset(asset_cls,
             payload,
-            name=f"{path.rsplit('/', 1)[-1]} (v{version})",
-            description=f"Version {version} of '{path}' observed during the agent session.",
+            name=f"{basename} (deleted)" if deleted else f"{basename} (v{version})",
+            description=(
+                f"Removal of '{path}' observed during the agent session."
+                if deleted
+                else f"Version {version} of '{path}' observed during the agent session."
+            ),
             **meta,
         )
 
@@ -357,11 +376,12 @@ class LineageRecorder:
             anchor = [previous.asset_cid] if previous is not None else (
                 [self._context_anchor] if self._context_anchor is not None else []
             )
-            label = (
-                f"{path.rsplit('/', 1)[-1]}: v{previous.version} -> v{version}"
-                if previous is not None
-                else f"{path.rsplit('/', 1)[-1]}: appeared (v{version})"
-            )
+            if deleted:
+                label = f"{basename}: deleted"
+            elif previous is not None:
+                label = f"{basename}: v{previous.version} -> v{version}"
+            else:
+                label = f"{basename}: appeared (v{version})"
             self._finalize(
                 name=label,
                 kind=prov.KIND_FILE_VERSION,

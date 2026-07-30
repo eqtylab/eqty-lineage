@@ -16,7 +16,10 @@ from typing import Any, Dict, List, Literal, Optional
 # "wrote" and "changed" make it an output. The distinction between the latter two is provenance, not
 # direction: "wrote" came from a tool whose declared purpose was to write, "changed" was noticed
 # afterwards (a watcher event, a snapshot diff) and may not be attributable to any single tool call.
-FileMode = Literal["read", "wrote", "changed"]
+FileMode = Literal["read", "wrote", "changed", "deleted"]
+"""``deleted`` is not a write with missing content. A watcher reports removal and a read-back returns
+nothing, which is byte-identical to a file the capture path simply failed to read -- and those two mean
+opposite things in a lineage graph. Kept as its own mode so the tombstone is explicit."""
 
 PermissionOutcome = Literal["allow", "deny", "ask", "defer"]
 

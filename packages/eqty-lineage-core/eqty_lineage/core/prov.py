@@ -92,6 +92,8 @@ K_FILE_PATH: Final = "file-path"
 K_FILE_VERSION: Final = "file-version"
 K_OPAQUE: Final = "opaque"
 K_REDACTED: Final = "redacted"
+K_DELETED: Final = "deleted"
+"""Marks a tombstone: the path was removed, as distinct from a version whose bytes were not recovered."""
 
 # ------------------------------------------------------------------ computation kinds
 KIND_TOOL: Final = "tool"
@@ -109,6 +111,7 @@ __all__ = [
     "HAS_PATH",
     "LABEL",
     "K_AGENT",
+    "K_DELETED",
     "K_EDGE_KIND",
     "K_EFFORT",
     "K_FILE_PATH",
