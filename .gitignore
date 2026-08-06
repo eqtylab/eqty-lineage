@@ -6,3 +6,4 @@ dist/
 
 .eqty_sdk
 /manifests/*.json
+**.mypy_cache/

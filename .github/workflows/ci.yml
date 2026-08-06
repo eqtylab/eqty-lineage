@@ -1,0 +1,70 @@
+name: CI
+description: "General CI code check. Runs on every PR"
+
+on:
+  pull_request:
+    types: [ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+
+      - name: Set up just
+        uses: taiki-e/install-action@just
+
+      - name: Install dependencies
+        run: just sync
+
+      - name: Format
+        id: format
+        continue-on-error: true
+        run: just fmt
+
+      - name: Lint
+        id: lint
+        continue-on-error: true
+        run: just lint
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: just build
+
+      - name: Summarize checks
+        if: always()
+        run: |
+          {
+            echo "## CI results"
+            echo
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| Format | ${{ steps.format.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Lint | ${{ steps.lint.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Build | ${{ steps.build.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if a check failed
+        if: always() && (steps.format.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.build.outcome == 'failure')
+        run: exit 1
