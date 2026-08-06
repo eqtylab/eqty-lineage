@@ -20,3 +20,7 @@ clean:
 # Format all Python code in the repo
 fmt:
   ruff format .
+
+# Lint all Python code in the repo
+lint:
+  ruff check .
