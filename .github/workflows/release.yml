@@ -1,0 +1,43 @@
+name: Release
+description: "Publishes package to pypi server on a release"
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.id }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+
+      - name: Set up just
+        uses: taiki-e/install-action@just
+
+      - name: Build packages
+        run: just build
+
+      - name: Publish packages
+        env:
+          UV_PUBLISH_USERNAME: "ci_runner"
+          UV_PUBLISH_PASSWORD: "${{ secrets.EQTY_PYPI_PASSWORD }}"
+        run: just publish
