@@ -12,28 +12,19 @@ concurrency:
   group: release-${{ github.event.release.id }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
 jobs:
   publish:
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: eqtylab-actions/checkout@v6
         with:
           ref: ${{ github.event.release.tag_name }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
-        with:
-          enable-cache: true
-
-      - name: Set up just
-        uses: taiki-e/install-action@just
 
       - name: Set package version from release tag
         env:

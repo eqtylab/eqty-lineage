@@ -13,26 +13,17 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
 jobs:
   checks:
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
-        with:
-          enable-cache: true
-
-      - name: Set up just
-        uses: taiki-e/install-action@just
+        uses: eqtylab-actions/checkout@v4
 
       - name: Install dependencies
         run: just sync
