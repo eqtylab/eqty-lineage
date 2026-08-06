@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -33,11 +35,46 @@ jobs:
       - name: Set up just
         uses: taiki-e/install-action@just
 
-      - name: Build packages
-        run: just build
+      - name: Set package version from release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          package="${RELEASE_TAG%@*}"
+          version="${RELEASE_TAG##*@}"
 
-      - name: Publish packages
+          if [[ "$package" == "$RELEASE_TAG" || "$package" == *"@"* || "$version" == *"@"* || ! "$package" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must use PACKAGE@MAJOR.MINOR.PATCH format (for example, eqty-lineage-langchain@1.2.3): $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          mapfile -t pyprojects < <(
+          python3 - "$package" <<'PY'
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          package = sys.argv[1]
+          for path in Path(".").rglob("pyproject.toml"):
+              with path.open("rb") as file:
+                  if tomllib.load(file).get("project", {}).get("name") == package:
+                      print(path)
+          PY
+          )
+
+          if [[ ${#pyprojects[@]} -ne 1 ]]; then
+            echo "Expected one pyproject.toml for package '$package', found ${#pyprojects[@]}" >&2
+            exit 1
+          fi
+
+          sed -i -E "s/^version = \"[^\"]*\"$/version = \"$version\"/" "${pyprojects[0]}"
+          echo "PACKAGE=$package" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build package
+        run: just build-package "$PACKAGE"
+
+      - name: Publish package
         env:
           UV_PUBLISH_USERNAME: "ci_runner"
           UV_PUBLISH_PASSWORD: "${{ secrets.EQTY_PYPI_PASSWORD }}"
-        run: just publish
+        run: just publish-package "$PACKAGE"
