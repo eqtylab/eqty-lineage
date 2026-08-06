@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
 jobs:
   checks:
     runs-on: ubuntu-latest
