@@ -19,7 +19,7 @@ eqty-sdk = { index = "eqty" }
 [[tool.uv.index]]
 name = "eqty"
 url = "https://pypi.eqtylab.io/simple/"
-publish-url = "https://pypi.eqtylab.io/legacy/"
+publish-url = "https://pypi.eqtylab.io/"
 explicit = true
 
 [tool.uv.build-backend]
