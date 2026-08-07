@@ -3,7 +3,7 @@ description: "General CI code check. Runs on every PR"
 
 on:
   pull_request:
-    types: [ready_for_review]
+    types: [ready_for_review, synchronize]
   workflow_dispatch:
 
 permissions:
