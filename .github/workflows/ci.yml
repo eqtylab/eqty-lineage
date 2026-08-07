@@ -20,6 +20,9 @@ defaults:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+     UV_INDEX_EQTY_USERNAME: "ci_runner"
+     UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
 
     steps:
       - name: Install Nix
