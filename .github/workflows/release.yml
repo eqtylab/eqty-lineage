@@ -41,7 +41,7 @@ jobs:
         continue-on-error: true
 
       - name: Check out repository
-        uses: eqtylab-actions/checkout@v6
+        uses: eqtylab-actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name || github.sha }}
 
