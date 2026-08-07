@@ -79,6 +79,6 @@ jobs:
 
       - name: Publish package
         env:
-          UV_PUBLISH_USERNAME: "ci_runner"
+          UV_PUBLISH_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
           UV_PUBLISH_PASSWORD: "${{ secrets.EQTY_PYPI_PASSWORD }}"
         run: just publish-package "$PACKAGE"
