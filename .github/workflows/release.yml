@@ -4,12 +4,18 @@ description: "Publishes package to pypi server on a release"
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Package release tag (for example, eqty-lineage-langchain@1.2.3)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.id }}
+  group: release-${{ github.event.release.id || inputs.release_tag }}
   cancel-in-progress: true
 
 defaults:
@@ -37,11 +43,11 @@ jobs:
       - name: Check out repository
         uses: eqtylab-actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - name: Set package version from release tag
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           package="${RELEASE_TAG%@*}"
           version="${RELEASE_TAG##*@}"
