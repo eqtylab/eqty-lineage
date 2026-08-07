@@ -3,7 +3,7 @@ description: "General CI code check. Runs on every PR"
 
 on:
   pull_request:
-    types: [ready_for_review]
+    types: [ready_for_review, synchronize]
   workflow_dispatch:
 
 permissions:
@@ -13,26 +13,35 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: nix develop --command bash -e {0}
+
 jobs:
   checks:
     runs-on: ubuntu-latest
+    env:
+     UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
+     UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
         with:
-          python-version: "3.11"
+          nix_path: nixpkgs=channel:nixos-unstable
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
         with:
-          enable-cache: true
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
 
-      - name: Set up just
-        uses: taiki-e/install-action@just
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install dependencies
         run: just sync
