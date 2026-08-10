@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from eqty_sdk import Configuration, Context, Dataset, Guardrail, Prompt, Signer, Tool, init, set_active_signer
+from eqty_sdk import Context, Dataset, Guardrail, Prompt, Signer, Tool, init, set_active_signer
 from eqty_sdk.context import graph_context
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
