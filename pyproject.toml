@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "eqty-lineage-langchain",
+    "eqty-lineage-codex",
 ]
 
 [dependency-groups]
@@ -23,6 +24,7 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 eqty-lineage-langchain = { workspace = true }
+eqty-lineage-codex = { workspace = true }
 eqty-sdk = { index = "eqty" }
 
 [[tool.uv.index]]

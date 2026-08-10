@@ -1,0 +1,10 @@
+{
+  "name": "eqty-lineage",
+  "version": "0.1.0",
+  "description": "Capture Codex hook events for signed lineage.",
+  "interface": {
+    "displayName": "EQTY Lineage",
+    "shortDescription": "Capture signed Codex session lineage.",
+    "capabilities": ["hooks"]
+  }
+}
