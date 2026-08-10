@@ -13,6 +13,14 @@ build:
 build-package package:
   uv build --package "{{package}}" --out-dir "dist/{{package}}" --clear --python "$(command -v python)" --no-managed-python --no-python-downloads
 
+# Run the test suite
+test *args:
+  uv run pytest tests {{args}}
+
+# Drive a real Codex session and assert the lineage it produces (needs codex on PATH)
+validate-codex *args:
+  ./scripts/validate-codex.sh {{args}}
+
 # Publish the whl and sdist to pypi.eqtylab.io
 publish:
   uv publish --index eqty

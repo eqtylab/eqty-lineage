@@ -5,6 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from eqty_lineage.codex.capture import (
+    ALLOW,
+    DENY,
+    UNKNOWN,
+    CodexSession,
+    load_session,
+    normalize,
+)
 from eqty_sdk import Context, Dataset, Guardrail, Prompt, Signer, Tool, init, set_active_signer
 from eqty_sdk.context import graph_context
 from eqty_sdk.metadata import Metadata
@@ -35,20 +43,33 @@ class CodexLineage:
         name: str,
         tool_input: dict[str, Any],
         *,
-        allowed: bool,
-        result: dict[str, Any] | None = None,
+        decision: str,
+        executed: bool | None = None,
+        result: Any = None,
         reason: str = "policy decision",
     ) -> None:
+        """Record one tool attempt: its input, the decision about it, and its result if it ran.
+
+        ``decision`` is ``allow``, ``deny`` or ``unknown``; ``unknown`` is a real outcome and is
+        recorded as one, because a capture that ends mid-call cannot distinguish a denial from a
+        truncation. A result node is attached only when the call actually executed, so a denied or
+        unresolved attempt has a guardrail node and no result -- which is the claim the graph should
+        make.
+        """
+        if decision not in (ALLOW, DENY, UNKNOWN):
+            raise ValueError(f"decision must be {ALLOW!r}, {DENY!r} or {UNKNOWN!r}, got {decision!r}")
+        ran = decision == ALLOW if executed is None else executed
+
         with graph_context(self.context):
             tool_asset = Tool.from_object({"name": name}, name=name)
             request = Dataset.from_object(tool_input, name=f"{name} input")
-            decision = Guardrail.from_object(
-                {"decision": "allow" if allowed else "deny", "reason": reason},
-                name=f"{'allow' if allowed else 'deny'}: {name}",
+            guardrail = Guardrail.from_object(
+                {"decision": decision, "reason": reason},
+                name=f"{decision}: {name}",
             )
-            outputs = [decision.cid]
-            if allowed:
-                outputs.append(Dataset.from_object(result or {}, name=f"{name} result").cid)
+            outputs = [guardrail.cid]
+            if ran:
+                outputs.append(Dataset.from_object(result if result is not None else {}, name=f"{name} result").cid)
             inputs = [asset.cid for asset in (self._prompt, tool_asset, request) if asset is not None]
             activity = add_computation_statement(inputs=inputs, outputs=outputs, context=self.context)[0]
             Metadata(
@@ -56,8 +77,23 @@ class CodexLineage:
                 computation_type="tool",
                 framework="codex",
                 session_id=self.session_id,
-                decision="allow" if allowed else "deny",
+                decision=decision,
+                executed=ran,
             ).create_statement(activity, None, self.context)
+
+    def replay(self, session: CodexSession) -> None:
+        """Build the graph for an already-normalized capture."""
+        for text in session.prompts:
+            self.prompt(text)
+        for attempt in session.attempts:
+            self.tool(
+                attempt.tool_name,
+                attempt.tool_input,
+                decision=attempt.decision,
+                executed=attempt.executed,
+                result=attempt.result,
+                reason=attempt.reason or "no decision recorded",
+            )
 
     def export(self) -> Path:
         self.output.parent.mkdir(parents=True, exist_ok=True)
@@ -65,12 +101,63 @@ class CodexLineage:
         return self.output
 
 
-def build_demo(output: str | Path) -> Path:
-    lineage = CodexLineage(output)
-    lineage.prompt("Run one safe command; block the forbidden write.")
-    lineage.tool("Bash", {"command": "printf 'allowed\\n'"}, allowed=True, result={"exit_code": 0})
-    lineage.tool("Bash", {"command": "touch forbidden.txt"}, allowed=False, reason="outside task scope")
+def replay_capture(capture: str | Path, output: str | Path) -> Path:
+    """Read a raw hook capture and export the signed graph it attests.
+
+    This is the whole point of the collector: the manifest is derived from bytes Codex emitted, not
+    from a script's idea of what a session looks like.
+    """
+    session = load_session(capture)
+    lineage = CodexLineage(output, session_id=session.session_id)
+    lineage.replay(session)
     return lineage.export()
 
 
-__all__ = ["CodexLineage", "build_demo"]
+def build_demo(output: str | Path) -> Path:
+    """Export the two-call allow/deny demo graph.
+
+    The events are written out here rather than read from a capture so the demo runs with no Codex
+    installed. It goes through the same :meth:`CodexLineage.replay` path a real capture does, so the
+    graph shape is the replay's, not a second hand-built one.
+    """
+    from eqty_lineage.codex.capture import CaptureRecord
+
+    records = [
+        CaptureRecord({"hook_event_name": "SessionStart", "session_id": "codex-demo", "model": "demo"}),
+        CaptureRecord(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "Run one safe command; block the forbidden write."}
+        ),
+        CaptureRecord(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "exec-allowed",
+                "tool_input": {"command": "printf 'allowed\\n'"},
+            }
+        ),
+        CaptureRecord(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "exec-allowed",
+                "tool_response": {"exit_code": 0},
+            }
+        ),
+        CaptureRecord(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_use_id": "exec-denied",
+                "tool_input": {"command": "touch forbidden.txt"},
+            },
+            {"decision": DENY, "decision_reason": "outside task scope"},
+        ),
+        CaptureRecord({"hook_event_name": "SessionEnd", "session_id": "codex-demo"}),
+    ]
+    session = normalize(records)
+    lineage = CodexLineage(output, session_id=session.session_id)
+    lineage.replay(session)
+    return lineage.export()
+
+
+__all__ = ["ALLOW", "DENY", "UNKNOWN", "CodexLineage", "build_demo", "replay_capture"]
