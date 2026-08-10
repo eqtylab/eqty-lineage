@@ -15,8 +15,12 @@ just sync     # uv sync --group dev, into ./.venv
 ```
 
 `eqty-sdk` resolves from `https://pypi.eqtylab.io/simple/`, not public PyPI, so this needs
-`UV_INDEX_EQTY_USERNAME` / `UV_INDEX_EQTY_PASSWORD` in your environment (`.envrc` loads them from
-`.env`).
+`UV_INDEX_EQTY_USERNAME` / `UV_INDEX_EQTY_PASSWORD` in your environment.
+
+> The committed `.env` holds a **stale** pair, and `.envrc` loads it over whatever you exported, so
+> under direnv a correct credential is silently replaced by one the index answers `403` to. Until that
+> file is fixed, export the working pair in a shell without direnv, or update `.env` itself. A `403`
+> from `uv sync` or `uv add` is this, not your credential.
 
 ## 2. See the graph without installing Codex
 
