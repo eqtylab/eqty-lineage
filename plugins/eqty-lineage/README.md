@@ -51,15 +51,34 @@ exposed a shell failure's `exit_code: 1` while the matching `PostToolUse` hook c
 traceback string. The adapter must preserve that outcome as unknown, or join it with the
 JSONL/app-server event stream. It must not infer success from the absence of a flag.
 
-## Wiring it up
+## Installing it
 
-`codex exec` can take the hooks inline, which is what the validation script does:
+Install as a plugin, which is the only route that applies to sessions in *other* repos. The
+marketplace manifest at the repo root makes this checkout installable directly:
 
 ```bash
-codex exec --dangerously-bypass-hook-trust \
-  -c 'hooks.PreToolUse=[{hooks=[{type="command",command="python3 .../capture_hook.py"}]}]' \
-  ... "your task"
+codex plugin marketplace add /path/to/eqty-lineage
+codex plugin add eqty-lineage@eqty-lineage
+codex plugin list | grep eqty          # installed, enabled
 ```
 
-Note `</dev/null` if you script this: with stdin left open, `codex exec` reads it as additional input
-and blocks forever on EOF.
+Then any session captures, with no per-invocation flags:
+
+```bash
+export EQTY_LINEAGE_CAPTURE=/tmp/codex-hooks.jsonl
+codex exec --dangerously-bypass-hook-trust "your task"
+```
+
+`--dangerously-bypass-hook-trust` is still needed per invocation until the hook is in the persisted
+trust store.
+
+**Installing copies the plugin into `~/.codex/plugins/cache/`.** Editing this directory afterwards
+changes nothing; `codex plugin remove` then `add` again to pick up a change.
+
+Codex also loads hooks from `~/.codex/hooks.json`, `~/.codex/config.toml`, `<repo>/.codex/hooks.json`
+and `<repo>/.codex/config.toml`, and layers `$CODEX_HOME/<name>.config.toml` when passed
+`--profile <name>`. Those are fine for a single repo or a one-off; the plugin is what makes the
+collector follow you across repos.
+
+If you script `codex exec`, redirect `</dev/null` — with stdin left open it reads it as additional
+input and blocks forever on EOF.

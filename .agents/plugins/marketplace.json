@@ -1,0 +1,20 @@
+{
+  "name": "eqty-lineage",
+  "interface": {
+    "displayName": "EQTY Lineage",
+    "shortDescription": "Signed lineage capture for coding agents."
+  },
+  "plugins": [
+    {
+      "name": "eqty-lineage",
+      "source": {
+        "source": "local",
+        "path": "./plugins/eqty-lineage"
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

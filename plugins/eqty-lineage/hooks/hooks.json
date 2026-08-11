@@ -1,10 +1,60 @@
 {
   "description": "Capture raw Codex lifecycle events before normalization.",
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 \\\"$PLUGIN_ROOT/scripts/capture_hook.py\\\"", "timeout": 10}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \\\"$PLUGIN_ROOT/scripts/capture_hook.py\\\"", "timeout": 10}]}],
-    "PreToolUse": [{"hooks": [{"type": "command", "command": "python3 \\\"$PLUGIN_ROOT/scripts/capture_hook.py\\\"", "timeout": 10}]}],
-    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3 \\\"$PLUGIN_ROOT/scripts/capture_hook.py\\\"", "timeout": 10}]}],
-    "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 \\\"$PLUGIN_ROOT/scripts/capture_hook.py\\\"", "timeout": 3}] }]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/capture_hook.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/capture_hook.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/capture_hook.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/capture_hook.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$PLUGIN_ROOT/scripts/capture_hook.py\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
   }
 }

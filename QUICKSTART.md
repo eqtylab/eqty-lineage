@@ -38,7 +38,26 @@ graph shape is the replay's, not a second hand-built one.
 
 ## 3. Capture a real session
 
-Register the collector on the events you want. This is the form the pilots used:
+Install the collector as a Codex plugin. This is the route that applies to sessions in *any* repo:
+
+```bash
+codex plugin marketplace add "$PWD"
+codex plugin add eqty-lineage@eqty-lineage
+
+export EQTY_LINEAGE_CAPTURE=/tmp/codex-hooks.jsonl
+export EQTY_LINEAGE_DENY_COMMAND='touch forbidden.txt'   # optional: refuse one exact command
+
+codex exec --dangerously-bypass-hook-trust "your task here"
+```
+
+Installing copies the plugin into `~/.codex/plugins/cache/`, so `codex plugin remove` then `add` again
+after any edit to it.
+
+<details>
+<summary>Without installing: inline hooks per invocation</summary>
+
+This is the form `scripts/validate-codex.sh` uses, since it must exercise the working tree rather than
+an installed copy:
 
 ```bash
 export EQTY_LINEAGE_CAPTURE=/tmp/codex-hooks.jsonl
@@ -52,6 +71,8 @@ codex exec --dangerously-bypass-hook-trust \
   -c 'hooks.SessionEnd=[{hooks=[{type="command",command="python3 plugins/eqty-lineage/scripts/capture_hook.py"}]}]' \
   "your task here"
 ```
+
+</details>
 
 Each hook appends one JSON line. The agent's payload is stored verbatim under `payload`; anything the
 collector concluded goes under `collector`, so a reader can always separate what Codex said from what
