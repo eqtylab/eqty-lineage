@@ -43,15 +43,33 @@ Install the collector as a Codex plugin. This is the route that applies to sessi
 ```bash
 codex plugin marketplace add "$PWD"
 codex plugin add eqty-lineage@eqty-lineage
+```
 
+Trust the hooks once, interactively — Codex skips untrusted hooks:
+
+```
+codex
+/hooks          # review the eqty-lineage hooks, trust them
+```
+
+Then capture any session:
+
+```bash
 export EQTY_LINEAGE_CAPTURE=/tmp/codex-hooks.jsonl
 export EQTY_LINEAGE_DENY_COMMAND='touch forbidden.txt'   # optional: refuse one exact command
 
-codex exec --dangerously-bypass-hook-trust "your task here"
+codex exec "your task here"
 ```
 
-Installing copies the plugin into `~/.codex/plugins/cache/`, so `codex plugin remove` then `add` again
-after any edit to it.
+> **An untrusted hook is skipped, not reported.** The session runs, exits 0, says nothing about hooks,
+> and writes no capture. If you get no lineage, check `/hooks` before suspecting anything else.
+>
+> Trust is keyed to the hook definition's hash. Installing copies the plugin into
+> `~/.codex/plugins/cache/`, so after editing it you need `codex plugin remove` then `add` — which
+> re-flags the hooks and needs re-trusting.
+
+For headless runs where nobody can answer `/hooks` — CI, a container — pass
+`--dangerously-bypass-hook-trust` instead. That is what `scripts/validate-codex.sh` does.
 
 <details>
 <summary>Without installing: inline hooks per invocation</summary>

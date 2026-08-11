@@ -63,18 +63,41 @@ codex plugin add eqty-lineage@eqty-lineage
 codex plugin list | grep eqty          # installed, enabled
 ```
 
-Then any session captures, with no per-invocation flags:
+Then trust the hooks once, interactively:
+
+```
+codex
+/hooks          # review the eqty-lineage hooks, trust them
+```
+
+After that, any session captures with no per-invocation flags:
 
 ```bash
 export EQTY_LINEAGE_CAPTURE=/tmp/codex-hooks.jsonl
-codex exec --dangerously-bypass-hook-trust "your task"
+codex exec "your task"
 ```
 
-`--dangerously-bypass-hook-trust` is still needed per invocation until the hook is in the persisted
-trust store.
+For headless runs on a machine nobody sits at — CI, a container — pass
+`--dangerously-bypass-hook-trust` instead of trusting interactively. That is what
+`scripts/validate-codex.sh` does.
 
-**Installing copies the plugin into `~/.codex/plugins/cache/`.** Editing this directory afterwards
-changes nothing; `codex plugin remove` then `add` again to pick up a change.
+## Untrusted hooks fail silently
+
+This is the failure you will actually hit, so it goes above the fold: an untrusted hook is **skipped,
+not reported**. Verified against codex-cli 0.147.0 — a session with untrusted hooks runs the task,
+exits 0, prints nothing about hooks, and writes no capture at all. "I installed it and got no lineage"
+almost always means untrusted, not broken.
+
+Trust is recorded against the hook definition's *hash*, which has two consequences:
+
+- **Installing copies the plugin into `~/.codex/plugins/cache/`**, so editing your checkout changes
+  nothing until `codex plugin remove` then `add` again — and that re-flags the hooks, so you must
+  re-trust through `/hooks`.
+- Any edit to `hooks.json` or the command it runs drops trust the same way.
+
+A wrong or invented `trusted_hash` in config is rejected just as silently, so it is not a way to
+pre-trust a hook from an installer. There is no supported programmatic route today
+(<https://github.com/openai/codex/issues/21615>).
 
 Codex also loads hooks from `~/.codex/hooks.json`, `~/.codex/config.toml`, `<repo>/.codex/hooks.json`
 and `<repo>/.codex/config.toml`, and layers `$CODEX_HOME/<name>.config.toml` when passed
