@@ -25,7 +25,8 @@ A reader can always separate what Codex said from what we decided. That split is
 denial happens *here* and leaves no trace in any later payload, so without recording it, a denied call
 is indistinguishable from a capture that was truncated mid-flight.
 
-`eqty_lineage.codex.replay_capture()` turns the file into a signed graph.
+`eqty-codex-lineage <capture>` turns the file into a signed graph;
+`eqty_lineage.codex.replay_capture()` is the library form.
 
 ## Configuration
 

@@ -101,16 +101,20 @@ class CodexLineage:
         return self.output
 
 
+def replay_session(session: CodexSession, output: str | Path) -> Path:
+    """Export the signed graph for an already-normalized session."""
+    lineage = CodexLineage(output, session_id=session.session_id)
+    lineage.replay(session)
+    return lineage.export()
+
+
 def replay_capture(capture: str | Path, output: str | Path) -> Path:
     """Read a raw hook capture and export the signed graph it attests.
 
     This is the whole point of the collector: the manifest is derived from bytes Codex emitted, not
     from a script's idea of what a session looks like.
     """
-    session = load_session(capture)
-    lineage = CodexLineage(output, session_id=session.session_id)
-    lineage.replay(session)
-    return lineage.export()
+    return replay_session(load_session(capture), output)
 
 
 def build_demo(output: str | Path) -> Path:
@@ -160,4 +164,4 @@ def build_demo(output: str | Path) -> Path:
     return lineage.export()
 
 
-__all__ = ["ALLOW", "DENY", "UNKNOWN", "CodexLineage", "build_demo", "replay_capture"]
+__all__ = ["ALLOW", "DENY", "UNKNOWN", "CodexLineage", "build_demo", "replay_capture", "replay_session"]

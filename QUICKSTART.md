@@ -4,7 +4,7 @@ Turn a Codex session into a signed lineage graph you can open in the Explorer, i
 capture the raw hook events, replay them into a manifest, upload it.
 
 ```
-codex  ──hooks──▶  capture_hook.py  ──▶  codex-hooks.jsonl  ──▶  replay_capture()  ──▶  manifest.json
+codex  ──hooks──▶  capture_hook.py  ──▶  codex-hooks.jsonl  ──▶ eqty-codex-lineage ──▶ manifest.json
         (raw payloads)                   (raw + decisions)        (normalize + sign)     (Explorer)
 ```
 
@@ -87,11 +87,20 @@ this repo decided:
 ## 4. Replay the capture into a signed manifest
 
 ```bash
-uv run python -c "
-from eqty_lineage.codex import replay_capture
-print(replay_capture('/tmp/codex-hooks.jsonl', '/tmp/codex-session.json'))
-"
+uv run eqty-codex-lineage /tmp/codex-hooks.jsonl -o /tmp/codex-session.json
 ```
+
+```
+session 019f9ff2-2dd9-77f0-b687-22723134122c · gpt-5.4-mini
+  1 prompt(s), 2 tool attempt(s)
+    allow    executed=True  apply_patch
+    deny     executed=False Bash
+/tmp/codex-session.json
+```
+
+Omit `-o` and it writes `<capture>.lineage.json` beside the capture. `--quiet` prints only the path,
+`--json` prints a machine-readable summary. Unresolved calls and any denial that executed anyway are
+called out on stderr. Also runnable as `python -m eqty_lineage.codex`.
 
 Upload `/tmp/codex-session.json` to the Explorer.
 
@@ -145,26 +154,11 @@ codex exec --dangerously-bypass-hook-trust --skip-git-repo-check --sandbox works
 test ! -e "$WORK/ws/forbidden.txt" && echo "OK: denied write never happened"
 
 cd "$REPO"
-uv run python -c "
-from eqty_lineage.codex import replay_capture
-replay_capture('$EQTY_LINEAGE_CAPTURE', '$WORK/session.json')
-"
+uv run eqty-codex-lineage "$EQTY_LINEAGE_CAPTURE" -o "$WORK/session.json"
 ```
 
-Check that the graph records both outcomes and that the denied call has no result:
-
-```bash
-uv run python - "$WORK/session.json" <<'PY'
-import base64, json, sys
-m = json.load(open(sys.argv[1]))
-for s in m["statements"].values():
-    if s.get("@type") != "MetadataRegistration":
-        continue
-    d = json.loads(base64.b64decode(m["blobs"][s["metadata"].replace("urn:cid:", "")]))
-    if d.get("computation_type") == "tool":
-        print(f'  {d["decision"]:8} executed={str(d["executed"]):5} {d["name"]}')
-PY
-```
+The summary it prints is the check: at least one `allow executed=True` and exactly one
+`deny executed=False`.
 
 A healthy run prints at least one `allow executed=True` and exactly one `deny executed=False`, and
 `forbidden.txt` does not exist.

@@ -9,6 +9,9 @@ description = "Minimal signed lineage capture for Codex hook events."
 requires-python = ">=3.11"
 dependencies = ["eqty-sdk"]
 
+[project.scripts]
+eqty-codex-lineage = "eqty_lineage.codex.__main__:main"
+
 [tool.uv.sources]
 eqty-sdk = { index = "eqty" }
 

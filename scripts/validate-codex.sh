@@ -101,9 +101,11 @@ denied = [r for r in rows if r["collector"].get("decision") == "deny"]
 if not pre:
     print("no PreToolUse events captured; the agent ran no tools", file=sys.stderr)
     sys.exit(3)
-if len(denied) != 1:
-    print(f"expected exactly one recorded denial, got {len(denied)}", file=sys.stderr)
-    print("the agent likely never attempted the exact command, or varied it", file=sys.stderr)
+if not denied:
+    # Not "exactly one": a model that retries a blocked command produces several denials, and that is
+    # a correctly-enforced session, not a failure. Zero is the signal that matters -- it means the
+    # agent never attempted the exact string, so nothing below proves anything.
+    print("no denial was recorded; the agent never attempted the exact command", file=sys.stderr)
     sys.exit(3)
 PY
 ok "capture recorded a denial"
@@ -115,10 +117,8 @@ ok "denied write never happened"
 
 # --- 3. the exported graph matches the session -----------------------------------------------------
 
-( cd "$ROOT" && uv run python -c "
-from eqty_lineage.codex import replay_capture
-replay_capture('$EQTY_LINEAGE_CAPTURE', '$WORK/session.json')
-" ) >"$WORK/replay.log" 2>&1 || fail "replay_capture failed (see $WORK/replay.log)" 5
+( cd "$ROOT" && uv run eqty-codex-lineage "$EQTY_LINEAGE_CAPTURE" -o "$WORK/session.json" ) \
+  >"$WORK/replay.log" 2>&1 || fail "eqty-codex-lineage failed (see $WORK/replay.log)" 5
 
 ( cd "$ROOT" && uv run python - "$WORK/session.json" <<'PY'
 import base64, json, sys
@@ -139,8 +139,8 @@ for tool in tools:
 denied = [t for t in tools if t["decision"] == "deny"]
 allowed = [t for t in tools if t["decision"] == "allow" and t["executed"]]
 problems = []
-if len(denied) != 1:
-    problems.append(f"expected one denied call in the graph, got {len(denied)}")
+if not denied:
+    problems.append("no denied call in the graph")
 if any(t["executed"] for t in denied):
     problems.append("a denied call is marked executed")
 if not allowed:

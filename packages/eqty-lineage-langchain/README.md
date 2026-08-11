@@ -43,6 +43,7 @@ metadata value as a string):
 from langchain_core.tools import tool
 from eqty_lineage.langchain import eqty_tool
 
+
 @tool
 @eqty_tool
 def search(query: str) -> str:
