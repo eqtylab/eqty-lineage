@@ -22,7 +22,31 @@ just sync     # uv sync --group dev, into ./.venv
 > file is fixed, export the working pair in a shell without direnv, or update `.env` itself. A `403`
 > from `uv sync` or `uv add` is this, not your credential.
 
-## 2. See the graph without installing Codex
+## 2. See the export without installing Codex
+
+A real captured session ships with the repo, so the export runs on a fresh clone with no agent
+involved:
+
+```console
+$ uv run eqty-codex-lineage tests/fixtures/codex_hooks.json -o /tmp/fixture.json
+session 019f9ff2-2dd9-77f0-b687-22723134122c · gpt-5.4-mini
+  1 prompt(s), 2 tool attempt(s)
+    allow    executed=True  apply_patch
+    allow    executed=True  Bash
+/tmp/fixture.json
+```
+
+Those are eight real codex-cli 0.145.0 hook payloads: a prompt, an `apply_patch` that wrote
+`slug.py`, and a `Bash` call that read it back. `--json` gives the same thing for scripts:
+
+```console
+$ uv run eqty-codex-lineage tests/fixtures/codex_hooks.json -o /tmp/fixture.json --json
+{"manifest": "/tmp/fixture.json", "session_id": "019f9ff2-…", "model": "gpt-5.4-mini",
+ "prompts": 1, "attempts": [{"tool": "apply_patch", "decision": "allow", "executed": true},
+                            {"tool": "Bash", "decision": "allow", "executed": true}]}
+```
+
+To see a *denied* call — which is where the graph earns its keep — export the demo instead:
 
 ```bash
 uv run python examples/codex_lineage_demo.py /tmp/codex-demo.json
@@ -116,9 +140,21 @@ session 019f9ff2-2dd9-77f0-b687-22723134122c · gpt-5.4-mini
 /tmp/codex-session.json
 ```
 
-Omit `-o` and it writes `<capture>.lineage.json` beside the capture. `--quiet` prints only the path,
-`--json` prints a machine-readable summary. Unresolved calls and any denial that executed anyway are
-called out on stderr. Also runnable as `python -m eqty_lineage.codex`.
+Omit `-o` and it writes `<capture>.lineage.json` beside the capture. Also runnable as
+`python -m eqty_lineage.codex`.
+
+| Flag | Effect |
+| --- | --- |
+| `-o PATH` | where to write the manifest |
+| `--quiet` | print only the path, for `MANIFEST=$(eqty-codex-lineage "$CAPTURE" --quiet)` |
+| `--json` | machine-readable summary on stdout |
+
+Two things it will not let you miss, both on stderr: calls left `unknown` because the capture ended
+mid-flight, and any call recorded `deny` that executed anyway — the shape of a hook that failed open.
+
+Exit codes: `0` exported, `2` the capture is missing or malformed, `3` the capture holds no prompts or
+tool calls. That last one is a valid but almost always accidental empty graph, so it fails rather than
+writing a manifest that claims a session did nothing.
 
 Upload `/tmp/codex-session.json` to the Explorer.
 
