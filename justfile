@@ -33,12 +33,25 @@ test *ARGS:
 langchain-diff-demo REF="":
   #!/usr/bin/env bash
   set -euo pipefail
-  # three processes: eqty_sdk.init() is process-global and raises on a second call, so the two runs
-  # cannot share one, and the comparison reads both summaries from stdin rather than from disk
+  # three processes: eqty_sdk.init() is process-global and a second call is ignored rather than
+  # refused, so two runs in one process would silently share the first one's store; the comparison
+  # reads both summaries from stdin rather than from disk
   before=$(uv run --no-sync python examples/langchain/diff_demo.py --baseline {{REF}})
   after=$(uv run --no-sync python examples/langchain/diff_demo.py)
   printf '%s\n%s\n' "$before" "$after" \
     | uv run --no-sync python examples/langchain/diff_demo.py --compare
+
+# Run only the tests that need no eqty-sdk, in an interpreter that does not have it. The recorder
+# reaches the SDK lazily, and this is what proves that claim rather than restating it.
+test-nosdk:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  venv="$(mktemp -d)/venv"
+  python3 -m venv "$venv"
+  "$venv/bin/pip" -q install pytest
+  "$venv/bin/pip" -q install --no-deps ./packages/eqty-lineage-core
+  ! "$venv/bin/python" -c 'import eqty_sdk' 2>/dev/null || { echo "eqty-sdk leaked in"; exit 1; }
+  "$venv/bin/python" -m pytest tests/test_redaction.py tests/test_serialize.py tests/test_tool_results.py
 
 # Format all Python code in the repo
 fmt:
