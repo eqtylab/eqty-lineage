@@ -1,0 +1,28 @@
+[
+  {
+    "session_id": "01a01ba1-1c24-7183-9896-f8985f2718ab",
+    "transcript_path": "/home/u/.codex/sessions/2026/08/19/rollout-2026-08-19T16-05-38-01a01ba1.jsonl",
+    "cwd": "/work",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "source": "startup"
+  },
+  {
+    "session_id": "01a01ba1-1c24-7183-9896-f8985f2718ab",
+    "turn_id": "01a01ba1-1c95-7372-b3e1-a8ed075a44d2",
+    "transcript_path": "/home/u/.codex/sessions/2026/08/19/rollout-2026-08-19T16-05-38-01a01ba1.jsonl",
+    "cwd": "/work",
+    "hook_event_name": "UserPromptSubmit",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "prompt": "Add a line saying 'Second line.' to notes.md, then create a file called hello.py containing a hello() function that returns the string 'hi'."
+  },
+  {
+    "session_id": "01a01ba1-1c24-7183-9896-f8985f2718ab",
+    "transcript_path": "/home/u/.codex/sessions/2026/08/19/rollout-2026-08-19T16-05-38-01a01ba1.jsonl",
+    "cwd": "/work",
+    "hook_event_name": "SessionEnd",
+    "reason": "other"
+  }
+]

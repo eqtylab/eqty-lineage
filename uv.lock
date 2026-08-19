@@ -5,6 +5,7 @@ requires-python = ">=3.11"
 [manifest]
 members = [
     "eqty-lineage",
+    "eqty-lineage-agent-hooks",
     "eqty-lineage-core",
     "eqty-lineage-langchain",
 ]
@@ -158,6 +159,7 @@ name = "eqty-lineage"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "eqty-lineage-agent-hooks" },
     { name = "eqty-lineage-core" },
     { name = "eqty-lineage-langchain" },
 ]
@@ -171,6 +173,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "eqty-lineage-agent-hooks", editable = "packages/eqty-lineage-agent-hooks" },
     { name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" },
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
 ]
@@ -181,6 +184,17 @@ dev = [
     { name = "langgraph", specifier = ">=0.2" },
     { name = "pytest", specifier = ">=8" },
 ]
+
+[[package]]
+name = "eqty-lineage-agent-hooks"
+version = "0.1.0"
+source = { editable = "packages/eqty-lineage-agent-hooks" }
+dependencies = [
+    { name = "eqty-lineage-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" }]
 
 [[package]]
 name = "eqty-lineage-core"

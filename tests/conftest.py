@@ -12,7 +12,23 @@ session-scoped context rather than initialising per test, and tests that do not 
 it -- the parser, the semirings and the engine are all exercised without a signer.
 """
 
+import json
+from pathlib import Path
+
 import pytest
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session")
+def codex_payloads() -> list:
+    """Eight hook payloads captured from a real codex-cli 0.145.0 session, sanitised.
+
+    Every Codex-specific finding in this suite came from reading these rather than from reading
+    documentation -- `apply_patch` carrying a patch document, lifecycle events lacking `turn_id`,
+    failures arriving as a bare `Exit code: N` string.
+    """
+    return json.loads((FIXTURES / "codex_hooks.json").read_text())
 
 
 @pytest.fixture(scope="session")

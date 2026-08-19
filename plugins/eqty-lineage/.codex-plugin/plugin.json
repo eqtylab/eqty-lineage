@@ -1,0 +1,10 @@
+{
+  "name": "eqty-lineage",
+  "version": "0.1.0",
+  "description": "Record signed Codex session lineage through the eqty-lineage daemon.",
+  "interface": {
+    "displayName": "EQTY Lineage",
+    "shortDescription": "Signed lineage for Codex sessions, live.",
+    "capabilities": ["hooks"]
+  }
+}
