@@ -25,6 +25,22 @@ publish-package package:
 clean:
   rm -rf ./dist
 
+# Run the test suite
+test *ARGS:
+  uv run --no-sync pytest {{ARGS}}
+
+# Run only the tests that need no eqty-sdk, in an interpreter that does not have it. The recorder
+# reaches the SDK lazily, and this is what proves that claim rather than restating it.
+test-nosdk:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  venv="$(mktemp -d)/venv"
+  python3 -m venv "$venv"
+  "$venv/bin/pip" -q install pytest
+  "$venv/bin/pip" -q install --no-deps ./packages/eqty-lineage-core
+  ! "$venv/bin/python" -c 'import eqty_sdk' 2>/dev/null || { echo "eqty-sdk leaked in"; exit 1; }
+  "$venv/bin/python" -m pytest tests/test_redaction.py tests/test_serialize.py tests/test_tool_results.py
+
 # Format all Python code in the repo
 fmt:
   ruff format .
