@@ -159,3 +159,39 @@ class TestScalarMetadata:
 
     def test_an_empty_mapping_stays_empty(self):
         assert scalar_metadata({}) == {}
+
+
+class TestFloatsAreStringified:
+    """A float in an asset's metadata makes the SDK drop that asset's *whole* metadata blob.
+
+    Measured on a real Codex session: 17 metadata registrations, 16 blobs stored, and the missing one
+    belonged to the coverage claim -- the only asset carrying a float (`content-known-rate`). The same
+    value as a string gives 17 of 17.
+
+    The failure is invisible at the point it happens. The registration statement is still written and
+    still verifies, so nothing raises and no count looks wrong; it surfaces only in a reader, as a node
+    with no name and no type. The graph explorer renders it as `UNKNOWN` beside a CID tail.
+    """
+
+    def test_a_float_becomes_a_string(self):
+        assert scalar_metadata({"rate": 0.95})["rate"] == "0.95"
+
+    def test_the_value_survives_the_round_trip(self):
+        # repr, not str: it is the shortest representation that reads back as the same float, so a
+        # consumer can recover the number rather than an approximation of it.
+        for value in (0.95, 1.0, 0.1 + 0.2, 1e-9, float("inf")):
+            assert float(scalar_metadata({"v": value})["v"]) == value
+
+    def test_ints_and_bools_are_left_alone(self):
+        # Only floats trigger it. Coercing these too would turn every count in the graph into a
+        # string and break anything filtering on them numerically.
+        out = scalar_metadata({"count": 12, "flag": True, "off": False})
+        assert out["count"] == 12
+        assert out["flag"] is True
+        assert out["off"] is False
+
+    def test_a_float_nested_in_a_structure_is_unaffected(self):
+        # Nested values are JSON-encoded wholesale, which the SDK stores without complaint -- it is
+        # only a float as a *top-level metadata value* that triggers the loss.
+        out = scalar_metadata({"nested": {"rate": 0.95}})
+        assert json.loads(out["nested"]) == {"rate": 0.95}

@@ -93,7 +93,17 @@ def scalar_metadata(
         while safe_key in reserved_set or safe_key in out:
             safe_key = f"{COLLISION_PREFIX}{safe_key}"
         jsonable = to_jsonable(value, extra)
-        out[safe_key] = jsonable if isinstance(jsonable, (str, int, float, bool)) else json.dumps(jsonable)
+        if isinstance(jsonable, float) and not isinstance(jsonable, bool):
+            # Floats are stringified because the SDK silently drops the *entire* metadata blob for an
+            # asset whose metadata carries one. Measured on a real session: 17 metadata registrations,
+            # 16 blobs stored, and the one missing belonged to the coverage claim -- the only asset
+            # with a float (`content-known-rate`). The same value as a string gives 17 of 17.
+            #
+            # The failure is invisible from here: the registration statement is still written and still
+            # verifies, so nothing errors. It surfaces only in a reader, which has a node with no name
+            # and no type -- the Explorer renders it as `UNKNOWN` beside a CID tail.
+            jsonable = repr(jsonable)
+        out[safe_key] = jsonable if isinstance(jsonable, (str, int, bool)) else json.dumps(jsonable)
 
     return out
 
