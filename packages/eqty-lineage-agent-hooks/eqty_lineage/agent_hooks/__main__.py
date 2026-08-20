@@ -55,17 +55,7 @@ def _verify(args) -> int:
     import os
     import tempfile
 
-    try:
-        from eqty_lineage.transcript.claude_code import find_sessions
-    except ImportError:
-        # `verify` replays recorded transcripts through the offline path and compares the result to
-        # the live one. That needs the transcript parser, which is a separate package and not a
-        # declared dependency -- recording does not need it, and only this command does.
-        print(
-            "verify needs eqty-lineage-transcript, which is not installed",
-            file=sys.stderr,
-        )
-        return 2
+    from eqty_lineage.transcript.claude_code import find_sessions
 
     from .equivalence import compare
 

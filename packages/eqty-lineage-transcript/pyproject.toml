@@ -3,20 +3,17 @@ requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "eqty-lineage-agent-hooks"
+name = "eqty-lineage-transcript"
 version = "0.1.0"
-description = "Live EQTY lineage capture from Claude Code and Codex hooks."
+description = "Offline EQTY lineage ingester for coding-agent session transcripts."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "eqty-lineage-core>=0.1",
-    # `verify` replays recorded transcripts through the offline path and compares the result to
-    # the live one, which needs the parser. Recording itself does not.
-    "eqty-lineage-transcript>=0.1",
 ]
 
 [project.scripts]
-eqty-lineage-hooks = "eqty_lineage.agent_hooks.__main__:main"
+eqty-lineage-transcript = "eqty_lineage.transcript.__main__:main"
 
 [tool.uv.sources]
 eqty-lineage-core = { workspace = true }
@@ -31,4 +28,4 @@ explicit = true
 [tool.uv.build-backend]
 # flat layout (module dir at package root, no src/); dotted name = namespace package
 module-root = ""
-module-name = "eqty_lineage.agent_hooks"
+module-name = "eqty_lineage.transcript"

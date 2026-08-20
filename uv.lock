@@ -8,6 +8,7 @@ members = [
     "eqty-lineage-agent-hooks",
     "eqty-lineage-core",
     "eqty-lineage-langchain",
+    "eqty-lineage-transcript",
 ]
 
 [[package]]
@@ -162,6 +163,7 @@ dependencies = [
     { name = "eqty-lineage-agent-hooks" },
     { name = "eqty-lineage-core" },
     { name = "eqty-lineage-langchain" },
+    { name = "eqty-lineage-transcript" },
 ]
 
 [package.dev-dependencies]
@@ -176,6 +178,7 @@ requires-dist = [
     { name = "eqty-lineage-agent-hooks", editable = "packages/eqty-lineage-agent-hooks" },
     { name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" },
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
+    { name = "eqty-lineage-transcript", editable = "packages/eqty-lineage-transcript" },
 ]
 
 [package.metadata.requires-dev]
@@ -191,10 +194,14 @@ version = "0.1.0"
 source = { editable = "packages/eqty-lineage-agent-hooks" }
 dependencies = [
     { name = "eqty-lineage-core" },
+    { name = "eqty-lineage-transcript" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" }]
+requires-dist = [
+    { name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" },
+    { name = "eqty-lineage-transcript", editable = "packages/eqty-lineage-transcript" },
+]
 
 [[package]]
 name = "eqty-lineage-core"
@@ -221,6 +228,17 @@ requires-dist = [
     { name = "eqty-sdk", index = "https://pypi.eqtylab.io/simple/" },
     { name = "langchain-core", specifier = ">=0.3" },
 ]
+
+[[package]]
+name = "eqty-lineage-transcript"
+version = "0.1.0"
+source = { editable = "packages/eqty-lineage-transcript" }
+dependencies = [
+    { name = "eqty-lineage-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" }]
 
 [[package]]
 name = "eqty-sdk"

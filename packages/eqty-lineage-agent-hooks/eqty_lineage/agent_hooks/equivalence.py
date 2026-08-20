@@ -117,10 +117,7 @@ def _without_coverage(triples):
 
 def compare(transcript: Path) -> Report:
     """Run both capture paths over one session and classify every divergence."""
-    try:
-        from eqty_lineage.transcript.claude_code import ClaudeCodeTranscript
-    except ImportError as exc:  # pragma: no cover - exercised by the CLI guard above
-        raise RuntimeError("the conformance harness needs eqty-lineage-transcript, which is not installed") from exc
+    from eqty_lineage.transcript.claude_code import ClaudeCodeTranscript
 
     transcript = Path(transcript)
     report = Report(session=transcript.stem)

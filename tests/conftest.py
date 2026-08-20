@@ -21,6 +21,16 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture(scope="session")
+def claude_transcript() -> Path:
+    """A hand-built Claude Code transcript exercising the parser's edge cases.
+
+    Synthetic on purpose: a real transcript carries the contents of whatever repository the session
+    touched, along with absolute paths and prompts, none of which can be committed.
+    """
+    return FIXTURES / "claude_session.jsonl"
+
+
+@pytest.fixture(scope="session")
 def codex_payloads() -> list:
     """Eight hook payloads captured from a real codex-cli 0.145.0 session, sanitised.
 
