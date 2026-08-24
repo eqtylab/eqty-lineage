@@ -5,10 +5,15 @@ replies are byte-identical between the two runs -- the model is scripted rather 
 difference in the exported manifest is attributable to the handler and nothing else. A live model would
 make the two runs incomparable, which is exactly what a before/after demo must not do.
 
-    just demo
+    just demo                       # working tree vs. the most recent release tag
+    just demo eqty-lineage-langchain@0.0.1   # ...or any ref you name
 
 writes ``manifests/before.json`` and ``manifests/after.json``, then prints the comparison. Load the two
 manifests side by side in the graph explorer to see the topology differ.
+
+The baseline defaults to the newest ``eqty-lineage-langchain@*`` tag rather than a pinned one, so this
+keeps answering "what changed since the last release" as releases are cut, instead of freezing into a
+comparison against whichever version happened to be current the day it was written.
 
 The graph is a document-review agent that exercises five of the ten defects at once::
 
@@ -40,29 +45,62 @@ from langgraph.graph import END, START, StateGraph
 HANDLER_PATH = "packages/eqty-lineage-langchain/eqty_lineage/langchain/__init__.py"
 
 
-def load_handler(baseline: bool):
-    """Import the handler under test: the committed one, or the one released as 0.0.1.
+class DemoError(RuntimeError):
+    """A failure in the demo's own scaffolding, reported without a traceback."""
 
-    Loaded from a file rather than by swapping the checkout so a single command can run both, and so the
-    baseline is read from git rather than from whatever happens to be in the working tree.
+
+def latest_release_ref() -> str:
+    """The newest eqty-lineage-langchain release tag."""
+    tags = subprocess.run(
+        ["git", "tag", "-l", "eqty-lineage-langchain@*", "--sort=-v:refname"],
+        capture_output=True,
+        text=True,
+        check=False,  # no tags is a case this handles itself, with a better message than a traceback
+    ).stdout.split()
+    if not tags:
+        raise DemoError(
+            "no eqty-lineage-langchain@* tag found to use as a baseline. Fetch tags with "
+            "`git fetch --tags`, or name a ref explicitly: just demo <ref>"
+        )
+    return tags[0]
+
+
+def load_handler(ref: str | None):
+    """Import the handler under test: the working tree's, or the one at ``ref``.
+
+    Read out of git and loaded from a file rather than by swapping the checkout, so one command can run
+    both and the baseline is whatever was released rather than whatever is lying around locally.
     """
-    if not baseline:
+    if ref is None:
         from eqty_lineage.langchain import EqtyCallbackHandler
 
         return EqtyCallbackHandler
 
-    source = subprocess.run(
-        ["git", "show", f"eqty-lineage-langchain@0.0.1:{HANDLER_PATH}"],
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{HANDLER_PATH}"],
         capture_output=True,
         text=True,
-        check=True,
-    ).stdout
+        check=False,  # a bad ref gets an explanation below, not a CalledProcessError
+    )
+    if result.returncode != 0:
+        raise DemoError(
+            f"could not read {HANDLER_PATH} at '{ref}'.\n"
+            f"  git said: {result.stderr.strip()}\n"
+            "  A shallow clone does not carry old trees -- try `git fetch --unshallow --tags`."
+        )
+
     tmp = Path(tempfile.mkdtemp()) / "baseline_handler.py"
-    tmp.write_text(source)
+    tmp.write_text(result.stdout)
     spec = importlib.util.spec_from_file_location("eqty_baseline_handler", tmp)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.EqtyCallbackHandler
+    try:
+        spec.loader.exec_module(module)
+        return module.EqtyCallbackHandler
+    except Exception as exc:
+        raise DemoError(
+            f"the handler at '{ref}' no longer imports against the installed dependencies "
+            f"({type(exc).__name__}: {exc}). Pick a more recent baseline ref."
+        ) from exc
 
 
 # ------------------------------------------------------------------ the agent ----
@@ -140,9 +178,22 @@ def build_graph(report: Path):
 # ------------------------------------------------------------------- the run ----
 
 
-def run(baseline: bool, out: Path) -> dict:
-    handler_cls = load_handler(baseline)
-    label = "before (0.0.1)" if baseline else "after (this PR)"
+def run(ref: str | None, out: Path) -> dict:
+    handler_cls = load_handler(ref)
+    # a release tag reads as its version; anything else (a sha, a branch) is shown abbreviated
+    shown = ref.split("@")[-1] if ref else ""
+    label = f"baseline ({shown[:12]})" if ref else "working tree"
+
+    # The SDK's Rust side logs unresolvable JSON-LD contexts at ERROR while exporting. Harmless, but it
+    # reads as a failure to anyone seeing this for the first time, which is the whole audience for a
+    # demo. Silenced with a handler rather than a level: the level is cached across the Rust/Python
+    # logging bridge, so setLevel here arrives too late, whereas giving the logger a handler stops
+    # logging's last-resort fallback from printing to stderr.
+    quiet = logging.getLogger("integrity_lineage_models")
+    quiet.addHandler(logging.NullHandler())
+    quiet.propagate = False
+    # the handler warns about the tool this graph deliberately fails; the table already reports it
+    logging.getLogger("eqty.langgraph").setLevel(logging.ERROR)
 
     recorded: list[dict[str, Any]] = []
 
@@ -207,15 +258,18 @@ def run(baseline: bool, out: Path) -> dict:
         "publish_linked_to_current_bytes": current_content in publish_inputs,
         "manifest_statements": len(json.loads(out.read_text()).get("statements", {})),
     }
-    (out.parent / f"{out.stem}-summary.json").write_text(json.dumps(summary, indent=2))
     return summary
 
 
-def compare(before: Path, after: Path) -> None:
-    b = json.loads((before.parent / f"{before.stem}-summary.json").read_text())
-    a = json.loads((after.parent / f"{after.stem}-summary.json").read_text())
+def compare(stream) -> None:
+    """Read the two runs' summaries, one compact JSON object per line."""
+    lines = [line for line in stream.read().splitlines() if line.strip()]
+    if len(lines) != 2:
+        raise DemoError(f"expected two summary lines on stdin, got {len(lines)}")
+    b, a = (json.loads(line) for line in lines)
 
     rows = [
+        ("handler", b["label"], a["label"]),
         (
             "exceptions swallowed by LangChain",
             "; ".join(b["swallowed_exceptions"]) or "none",
@@ -240,7 +294,7 @@ def compare(before: Path, after: Path) -> None:
 
     width = max(len(r[0]) for r in rows)
     print()
-    print(f"{'':<{width}}   {'BEFORE (0.0.1)':<62}  AFTER (this PR)")
+    print(f"{'':<{width}}   {'BEFORE':<62}  AFTER")
     print("-" * (width + 3 + 62 + 2 + 22))
     for name, before_value, after_value in rows:
         mark = " " if str(before_value) == str(after_value) else "*"
@@ -253,18 +307,39 @@ def compare(before: Path, after: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", action="store_true", help="use the handler released as 0.0.1")
-    parser.add_argument("--out", type=Path, required=False)
-    parser.add_argument("--compare", nargs=2, type=Path, metavar=("BEFORE", "AFTER"))
+    parser.add_argument(
+        "--baseline",
+        nargs="?",
+        const="",
+        metavar="REF",
+        help="run the handler at this git ref instead of the working tree "
+        "(defaults to the newest eqty-lineage-langchain@* tag)",
+    )
+    parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="read two summary lines from stdin and print the comparison",
+    )
     args = parser.parse_args()
 
-    if args.compare:
-        compare(*args.compare)
-        return
+    try:
+        if args.compare:
+            compare(sys.stdin)
+            return
 
-    out = args.out or Path("manifests") / ("before.json" if args.baseline else "after.json")
-    summary = run(args.baseline, out)
-    print(f"{summary['label']}: {summary['computations']} computations -> {out}", file=sys.stderr)
+        ref = None
+        if args.baseline is not None:
+            ref = args.baseline or latest_release_ref()
+
+        out = args.out or Path("manifests") / ("before.json" if ref else "after.json")
+        summary = run(ref, out)
+        # the summary goes to stdout for the compare step; progress goes to stderr for the human
+        print(json.dumps(summary), flush=True)
+        print(f"{summary['label']}: {summary['computations']} computations -> {out}", file=sys.stderr)
+    except DemoError as exc:
+        print(f"demo: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

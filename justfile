@@ -29,14 +29,16 @@ clean:
 test *ARGS:
   uv run --no-sync pytest {{ARGS}}
 
-# Run the before/after lineage demo (writes manifests/before.json and manifests/after.json)
-demo:
+# Compare the lineage the handler produces now against a released one (default: newest release tag)
+demo REF="":
   #!/usr/bin/env bash
   set -euo pipefail
-  # separate processes: eqty_sdk.init() is process-global and raises on a second call
-  uv run --no-sync python examples/lineage_diff_demo.py --baseline
-  uv run --no-sync python examples/lineage_diff_demo.py
-  uv run --no-sync python examples/lineage_diff_demo.py --compare manifests/before.json manifests/after.json
+  # three processes: eqty_sdk.init() is process-global and raises on a second call, so the two runs
+  # cannot share one, and the comparison reads both summaries from stdin rather than from disk
+  before=$(uv run --no-sync python examples/lineage_diff_demo.py --baseline {{REF}})
+  after=$(uv run --no-sync python examples/lineage_diff_demo.py)
+  printf '%s\n%s\n' "$before" "$after" \
+    | uv run --no-sync python examples/lineage_diff_demo.py --compare
 
 # Format all Python code in the repo
 fmt:

@@ -23,17 +23,23 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 ## Demo: what the lineage looks like before and after
 
 ```bash
-just demo
+just demo                                 # working tree vs. the newest release tag
+just demo eqty-lineage-langchain@0.0.1    # ...or any ref you name
 ```
 
-Runs one identical document-review agent twice — once through the handler released as
-`eqty-lineage-langchain@0.0.1`, once through the working tree — and writes `manifests/before.json` and
-`manifests/after.json`. The model is scripted rather than live, so the two runs are byte-identical and every
-difference in the manifest is attributable to the handler alone.
+Runs one identical document-review agent twice — once through the handler at the baseline ref, once through
+the working tree — and writes `manifests/before.json` and `manifests/after.json`. The model is scripted rather
+than live, so the two runs are byte-identical and every difference in the manifest is attributable to the
+handler alone.
 
-Load both manifests in the graph explorer to compare the topology, or read the printed table:
+The baseline defaults to the newest `eqty-lineage-langchain@*` tag, so this keeps answering "what changed
+since the last release" as releases are cut, rather than freezing into a comparison against one fixed version.
+Rows that differ are marked `*`; a run against an unchanged baseline marks nothing.
 
-| | before (0.0.1) | after |
+Load both manifests in the graph explorer to compare the topology, or read the printed table. Against
+`0.0.1`:
+
+| | before | after |
 | --- | --- | --- |
 | exceptions swallowed by LangChain | `KeyError('state_in')`, `TypeError(... NoneType)` | none |
 | computations recorded | 7 | 10 |

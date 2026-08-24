@@ -458,7 +458,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning(run_id)
+        logger.warning("%s run %s failed: %s: %s", "chain", run_id, type(error).__name__, error)
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
@@ -562,7 +562,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning(run_id)
+        logger.warning("%s run %s failed: %s: %s", "llm", run_id, type(error).__name__, error)
         run = self._runs.pop(run_id, None)
 
         if run is not None:
@@ -669,7 +669,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning(run_id)
+        logger.warning("%s run %s failed: %s: %s", "tool", run_id, type(error).__name__, error)
         run = self._runs.pop(run_id, None)
 
         if run is None:
