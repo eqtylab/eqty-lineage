@@ -43,6 +43,7 @@ metadata value as a string):
 from langchain_core.tools import tool
 from eqty_lineage.langchain import eqty_tool
 
+
 @tool
 @eqty_tool
 def search(query: str) -> str:
@@ -62,6 +63,24 @@ Notes:
 - tools without the decorator still get a Tool asset, registered from a name/description stub instead of source
 - source capture uses `inspect.getsource`, so it only works for functions defined in real files
 (not a REPL or `exec`'d code); the tool's registered source includes its decorator lines
+
+## What lands on each computation
+
+Every computation statement carries a `framework` tag, read from the run's own metadata rather than assumed:
+LangSmith's `ls_integration` when the harness sets it (`deepagents`, `langchain_create_agent`), `langgraph` when the run
+carries `langgraph_*` metadata, and `langchain` otherwise. The root computation is named after the agent's
+`lc_agent_name` when there is one, so a named agent no longer shows up as `LangGraph`.
+
+Failures are recorded rather than dropped. A node, tool or model call that raises produces a computation with
+`computation_type` of `graph_node_error`, `tool_error` or `chat_model_error` and a Dataset output holding the error type
+and message. A failed tool's error also feeds the enclosing node's output state, because that is what the model sees.
+
+Work nested inside a tool — a model call, another chain — is linked to the tool's result, and a node that returns `None`
+(as LangChain middleware does to mean "no state update") is still recorded, scoped to that node so unrelated middleware
+nodes do not collapse onto one shared entity.
+
+LangGraph `Command` results are unwrapped rather than stringified, so the state update a tool applied — including files a
+DeepAgents subagent wrote via `task` — stays structured and its `Path` values are still collected.
 
 ## `Path` values in graph state
 

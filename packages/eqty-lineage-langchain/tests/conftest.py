@@ -41,9 +41,11 @@ def recording_handler(sdk):
         def __init__(self) -> None:
             super().__init__()
             self.computations: list[tuple[str, str, list[str], list[str]]] = []
+            self.frameworks: list[str] = []
 
         def _finalize(self, name, kind, input_cids, output_cids):
             self.computations.append((name, kind, [str(c) for c in input_cids], [str(c) for c in output_cids]))
+            self.frameworks.append(self._framework or "langchain")
             return super()._finalize(name, kind, input_cids, output_cids)
 
         def inputs_of(self, name: str) -> list[str]:

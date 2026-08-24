@@ -61,6 +61,18 @@ def _to_jsonable(obj: Any, on_path: Optional[Callable[[Path], None]] = None) -> 
         return {str(k): _to_jsonable(v, on_path) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(item, on_path) for item in obj]
+    if type(obj).__name__ == "Command":
+        # A LangGraph Command carries the state update a tool applied -- which is the whole payload of
+        # DeepAgents' `task` tool, including any files the subagent wrote. Falling through to str() below
+        # would record it as an opaque blob. Duck-typed on the class name because this package depends on
+        # langchain-core alone and must not import langgraph.
+        command = {
+            field: _to_jsonable(getattr(obj, field), on_path)
+            for field in ("update", "goto", "graph", "resume")
+            if getattr(obj, field, None) is not None
+        }
+        if command:
+            return {"command": command}
     if hasattr(obj, "model_dump"):
         try:
             return _to_jsonable(obj.model_dump(), on_path)
@@ -132,6 +144,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._sibling_outputs: Dict[Optional[UUID], Dict[int, List[CID]]] = {}
         # parent run id -> synthetic step counter, for runs LangGraph gives no langgraph_step
         self._fallback_steps: Dict[Optional[UUID], int] = {}
+        # which harness produced this run, resolved from run metadata rather than assumed
+        self._framework: Optional[str] = None
         # tool name -> Tool asset CID, so each tool is registered once
         self._tool_cids: Dict[str, CID] = {}
         # (resolved path, content CID) -> Dataset CID. Keyed on the *contents* as well as the path: the same
@@ -185,6 +199,12 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         created: List[CID] = []
         extra = self._verbose_metadata(extra or {})
 
+        if obj is None:
+            # LangChain middleware nodes return None to mean "no state update", and the SDK cannot hash
+            # None. Recorded explicitly and scoped to the node that produced it: the node did run, and a
+            # single shared empty sentinel would make unrelated nodes converge on one entity in the graph.
+            obj = {"state_update": None, "produced_by": name}
+
         def collect(path: Path) -> None:
             key = str(path.resolve())
             try:
@@ -222,12 +242,48 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
         return asset, carried, created
 
+    def _note_framework(self, metadata: Optional[Dict[str, Any]]) -> None:
+        """Record which harness produced this run, the first time a run says so.
+
+        ``ls_integration`` is LangSmith's tag; LangChain's ``create_agent`` sets it to
+        ``langchain_create_agent`` and DeepAgents to ``deepagents``. A plain ``StateGraph`` sets neither, so
+        the ``langgraph_*`` keys stand in as the evidence there. Anything else is plain LangChain.
+        """
+        if self._framework is not None:
+            return
+        meta = metadata or {}
+        integration = meta.get("ls_integration")
+        if isinstance(integration, str) and integration:
+            self._framework = integration
+        elif any(key.startswith("langgraph_") for key in meta):
+            self._framework = "langgraph"
+
     def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
         """Create the computation node w/ metadata."""
 
         statement_ids = add_computation_statement(inputs=input_cids, outputs=output_cids)
 
-        Metadata(name=name, computation_type=kind, framework="langgraph").create_statement(statement_ids[0], None, None)
+        Metadata(name=name, computation_type=kind, framework=self._framework or "langchain").create_statement(
+            statement_ids[0], None, None
+        )
+
+    def _finalize_error(self, run: Dict[str, Any], error: BaseException) -> Optional[CID]:
+        """Record a failed activity instead of erasing it.
+
+        A tool that raised is part of what happened, and a lineage graph that quietly omits every failure
+        overstates how cleanly the run went.
+        """
+        try:
+            failure = Dataset.from_object(
+                {"error": type(error).__name__, "message": str(error)},
+                name=f"{run['name']}: error",
+                description=f"Failure raised by '{run['name']}'.",
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register the failure of '%s'", run.get("name"))
+            return None
+        self._finalize(run["name"], f"{run['kind']}_error", run.get("inputs", []), [failure.cid])
+        return failure.cid
 
     def _step_for(self, parent_run_id: Optional[UUID], metadata: Optional[Dict[str, Any]]) -> int:
         """The superstep this node belongs to.
@@ -300,6 +356,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         logger.debug(run_id)
+        self._note_framework(metadata)
         self._parents[run_id] = parent_run_id
 
         # LangGraph emits many internal chain runs (channel reads/writes, task wrappers).
@@ -314,7 +371,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             logger.info("is_node and is_graph are None")
             return
 
-        label = node if is_node else (name or "graph")
+        # an unnamed graph reports itself as "LangGraph"; lc_agent_name is the agent's own name when set
+        label = node if is_node else ((metadata or {}).get("lc_agent_name") or name or "graph")
 
         state_in, carried, created = self._register_state(
             inputs,
@@ -402,8 +460,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
         self._parents.pop(run_id, None)
-        self._runs.pop(run_id, None)
+        run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
+
+        if run is not None:
+            self._finalize_error(run, error)
 
     ################################################## Chain Calls #################################################
 
@@ -460,13 +521,18 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         input_cids = [prompt.cid, model.cid]
         node = self._enclosing_node(parent_run_id)
         if node is not None:
-            # the prompt is derived from the node's input state
-            input_cids.append(node["state_in"])
+            # the prompt is derived from whatever the enclosing activity started from -- a node's input
+            # state, or a tool's arguments when the model is being called from inside a tool
+            enclosing_input = node.get("state_in")
+            if enclosing_input is not None:
+                input_cids.append(enclosing_input)
 
         self._runs[run_id] = {
             "name": model_name,
             "kind": "chat_model",
+            "state_in": prompt.cid,
             "inputs": input_cids,
+            "child_outputs": [],
             "node": node,
         }
 
@@ -492,12 +558,15 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
 
         if run["node"] is not None:
-            run["node"]["child_outputs"].append(output.cid)
+            run["node"].setdefault("child_outputs", []).append(output.cid)
 
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
-        self._runs.pop(run_id, None)
+        run = self._runs.pop(run_id, None)
+
+        if run is not None:
+            self._finalize_error(run, error)
 
     ################################################## LLM Calls ###################################################
 
@@ -558,12 +627,18 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         node = self._enclosing_node(parent_run_id)
         if node is not None:
             # the tool call was requested by the state entering the node
-            input_cids.append(node["state_in"])
+            enclosing_input = node.get("state_in")
+            if enclosing_input is not None:
+                input_cids.append(enclosing_input)
 
         self._runs[run_id] = {
             "name": tool_name,
             "kind": "tool",
+            # a tool's arguments are what anything nested inside it derives from; keeping the key uniform
+            # across run kinds is what lets _enclosing_node return any of them
+            "state_in": tool_input.cid,
             "inputs": input_cids,
+            "child_outputs": [],
             "node": node,
         }
 
@@ -582,17 +657,30 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             extra={"callback": "on_tool_end", "run_id": run_id, **kwargs},
         )
 
-        input_cids = run["inputs"] + [c for c in carried if c not in run["inputs"]]
+        # whatever ran inside the tool -- a nested model call, a nested chain -- contributed to its result,
+        # the same way a node's children contribute to the node's output state
+        input_cids = run["inputs"] + run.get("child_outputs", [])
+        input_cids += [c for c in carried if c not in input_cids]
         output_cids = [tool_output.cid, *created]
         self._finalize(run["name"], run["kind"], input_cids, output_cids)
 
         if run["node"] is not None:
-            run["node"]["child_outputs"].extend(output_cids)
+            run["node"].setdefault("child_outputs", []).extend(output_cids)
 
     @_synchronized
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning(run_id)
-        self._runs.pop(run_id, None)
+        run = self._runs.pop(run_id, None)
+
+        if run is None:
+            return
+
+        failure = self._finalize_error(run, error)
+
+        # the error message goes back to the model as a ToolMessage, so the enclosing node's output state
+        # is derived from the failure just as it would be from a successful result
+        if failure is not None and run["node"] is not None:
+            run["node"].setdefault("child_outputs", []).append(failure)
 
 
 ################################################## Tool Calls ##################################################
