@@ -36,8 +36,18 @@ The baseline defaults to the newest `eqty-lineage-langchain@*` tag, so this keep
 since the last release" as releases are cut, rather than freezing into a comparison against one fixed version.
 Rows that differ are marked `*`; a run against an unchanged baseline marks nothing.
 
-Load both manifests in the graph explorer to compare the topology, or read the printed table. Against
-`0.0.1`:
+Against `0.0.1`, the exported manifests look like this in the graph explorer.
+
+Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:
+
+![lineage before](docs/images/lineage-before.png)
+
+After — `Prompt`, `Model` and `Reasoning` appear on the left (the model call that was being dropped), a
+second tool wrench for the tool that fails, and both parallel branches feeding the next node:
+
+![lineage after](docs/images/lineage-after.png)
+
+Or read the printed table:
 
 | | before | after |
 | --- | --- | --- |
