@@ -25,6 +25,10 @@ publish-package package:
 clean:
   rm -rf ./dist
 
+# Run the test suite
+test *ARGS:
+  uv run --no-sync pytest {{ARGS}}
+
 # Format all Python code in the repo
 fmt:
   ruff format .

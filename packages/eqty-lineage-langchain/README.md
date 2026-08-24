@@ -67,5 +67,15 @@ Notes:
 
 `pathlib.Path` values in graph state get special treatment: if the path exists, the file or directory is registered as
 its own Dataset asset via `Dataset.from_path` (CIDing full directory contents) and linked into the computation that
-carried it. A path first seen in a computation's output is recorded as *created* by it; a path seen before is linked as
-an input. Keep filesystem references in state as `Path` objects rather than strings to opt in.
+carried it. Keep filesystem references in state as `Path` objects rather than strings to opt in.
+
+Versions are keyed on `(path, content CID)`, not on the path alone, so a file rewritten partway through a run is a
+distinct entity from the one registered earlier:
+
+- **new content at a known path** — a new Dataset asset, recorded as an *output* of the computation that wrote it, with
+  the version it replaced linked as an *input*. Successive edits form a chain rather than unrelated assets.
+- **content already registered** — carried through as an *input*, never re-emitted as an output (which would put a cycle
+  in the graph).
+
+Keying on the path alone would resolve every later sighting to the first one's asset, so any computation running after a
+rewrite would be attested against content it never saw.
