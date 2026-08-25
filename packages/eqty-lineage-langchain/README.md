@@ -43,6 +43,7 @@ metadata value as a string):
 from langchain_core.tools import tool
 from eqty_lineage.langchain import eqty_tool
 
+
 @tool
 @eqty_tool
 def search(query: str) -> str:
@@ -63,9 +64,37 @@ Notes:
 - source capture uses `inspect.getsource`, so it only works for functions defined in real files
 (not a REPL or `exec`'d code); the tool's registered source includes its decorator lines
 
+## What lands on each computation
+
+Every computation statement carries a `framework` tag, read from the run's own metadata rather than assumed:
+LangSmith's `ls_integration` when the harness sets it (`deepagents`, `langchain_create_agent`), `langgraph` when the run
+carries `langgraph_*` metadata, and `langchain` otherwise. The root computation is named after the agent's
+`lc_agent_name` when there is one, so a named agent no longer shows up as `LangGraph`.
+
+Failures are recorded rather than dropped. A node, tool or model call that raises produces a computation with
+`computation_type` of `graph_node_error`, `tool_error` or `chat_model_error` and a Dataset output holding the error type
+and message. A failed tool's error also feeds the enclosing node's output state, because that is what the model sees.
+
+Work nested inside a tool — a model call, another chain — is linked to the tool's result, and a node that returns `None`
+(as LangChain middleware does to mean "no state update") is still recorded, scoped to that node so unrelated middleware
+nodes do not collapse onto one shared entity.
+
+LangGraph `Command` results are unwrapped rather than stringified, so the state update a tool applied — including files a
+DeepAgents subagent wrote via `task` — stays structured and its `Path` values are still collected.
+
 ## `Path` values in graph state
 
 `pathlib.Path` values in graph state get special treatment: if the path exists, the file or directory is registered as
 its own Dataset asset via `Dataset.from_path` (CIDing full directory contents) and linked into the computation that
-carried it. A path first seen in a computation's output is recorded as *created* by it; a path seen before is linked as
-an input. Keep filesystem references in state as `Path` objects rather than strings to opt in.
+carried it. Keep filesystem references in state as `Path` objects rather than strings to opt in.
+
+Versions are keyed on `(path, content CID)`, not on the path alone, so a file rewritten partway through a run is a
+distinct entity from the one registered earlier:
+
+- **new content at a known path** — a new Dataset asset, recorded as an *output* of the computation that wrote it, with
+  the version it replaced linked as an *input*. Successive edits form a chain rather than unrelated assets.
+- **content already registered** — carried through as an *input*, never re-emitted as an output (which would put a cycle
+  in the graph).
+
+Keying on the path alone would resolve every later sighting to the first one's asset, so any computation running after a
+rewrite would be attested against content it never saw.

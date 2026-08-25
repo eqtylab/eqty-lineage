@@ -20,6 +20,49 @@ from eqty_lineage.langchain import EqtyCallbackHandler
 app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 ```
 
+## Demo: what the lineage looks like before and after
+
+```bash
+just demo                                 # working tree vs. the newest release tag
+just demo eqty-lineage-langchain@0.0.1    # ...or any ref you name
+```
+
+Runs one identical document-review agent twice — once through the handler at the baseline ref, once through
+the working tree — and writes `manifests/before.json` and `manifests/after.json`. The model is scripted rather
+than live, so the two runs are byte-identical and every difference in the manifest is attributable to the
+handler alone.
+
+The baseline defaults to the newest `eqty-lineage-langchain@*` tag, so this keeps answering "what changed
+since the last release" as releases are cut, rather than freezing into a comparison against one fixed version.
+Rows that differ are marked `*`; a run against an unchanged baseline marks nothing.
+
+Every row is a property of the lineage and is stable run to run. The manifest's raw statement and asset
+counts are deliberately not reported: assets are content-addressed, so two state payloads that happen to
+coincide collapse into one registration and the totals move by one between otherwise identical runs.
+
+Against `0.0.1`, the exported manifests look like this in the graph explorer.
+
+Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:
+
+![lineage before](docs/images/lineage-before.png)
+
+After — `Prompt`, `Model` and `Reasoning` appear on the left (the model call that was being dropped), a
+second tool wrench for the tool that fails, and both parallel branches feeding the next node:
+
+![lineage after](docs/images/lineage-after.png)
+
+Or read the printed table:
+
+| | before | after |
+| --- | --- | --- |
+| exceptions swallowed by LangChain | `KeyError('state_in')`, `TypeError(... NoneType)` | none |
+| computations recorded | 7 | 10 |
+| graph nodes present | `checkpoint` missing | all six |
+| computation kinds | no `chat_model`, no `tool_error` | both present |
+| orphaned node outputs | `verify_b` | none |
+| `report.md` versions tracked | 1 | 2 |
+| `publish` linked to the bytes it read | **no** | yes |
+
 ## Develop
 
 ```bash

@@ -25,16 +25,14 @@ import os
 from pathlib import Path
 from typing import Annotated, TypedDict
 
-from langchain_openai import ChatOpenAI
+from eqty_lineage.langchain import EqtyCallbackHandler, eqty_tool
+from eqty_sdk import Context, Signer, init, set_active_signer
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-
-from eqty_sdk import Context, Signer, init, set_active_signer
-
-from eqty_lineage.langchain import EqtyCallbackHandler, eqty_tool
 
 WEATHER = {
     "amsterdam": "14°C, light rain, wind 20 km/h",
@@ -102,7 +100,7 @@ def calculate(expression: str) -> str:
     if not expression or not set(expression) <= allowed:
         return "Error: only digits and + - * / ( ) are supported."
     try:
-        return str(eval(expression, {"__builtins__": {}}, {}))  # noqa: S307 - input is character-whitelisted
+        return str(eval(expression, {"__builtins__": {}}, {}))
     except Exception as exc:  # noqa: BLE001
         return f"Error: {exc}"
 
