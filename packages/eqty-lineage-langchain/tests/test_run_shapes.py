@@ -160,3 +160,54 @@ def test_command_paths_are_still_collected(tmp_path):
     seen: list[Any] = []
     _to_jsonable(Command(update={"report": target}), on_path=seen.append)
     assert seen == [target]
+
+
+# ----------------------------------------------------- model identity ----
+def test_model_named_from_its_class_when_params_are_bare(recording_handler):
+    """GenericFakeChatModel declares no model name; the class name beats 'unknown-model'."""
+    from langchain_core.runnables import RunnableLambda
+
+    model = GenericFakeChatModel(messages=iter([AIMessage("hi")]))
+    RunnableLambda(lambda _: model.invoke("x")).invoke(1, config={"callbacks": [recording_handler]})
+
+    names = [name for name, kind, _, _ in recording_handler.computations if kind == "chat_model"]
+    assert names == ["GenericFakeChatModel"], f"got {names}"
+
+
+def test_model_identity_prefers_invocation_params(recording_handler):
+    """A provider that names itself in invocation_params wins over every fallback."""
+    resolve = recording_handler._model_identity
+
+    assert resolve({"name": "ChatOpenAI"}, {"model": "gpt-4o-mini"}, {"ls_model_name": "other"}) == (
+        "gpt-4o-mini",
+        "unknown",
+    )
+    assert resolve({"name": "ChatOpenAI"}, {"model_name": "gpt-4o-mini"}, None)[0] == "gpt-4o-mini"
+
+
+def test_model_identity_falls_back_through_metadata_then_class(recording_handler):
+    resolve = recording_handler._model_identity
+
+    # ls_model_name is LangSmith's standardised field, set from _get_ls_params
+    assert resolve({"name": "ChatFoo"}, {}, {"ls_model_name": "foo-1", "ls_provider": "foo"}) == ("foo-1", "foo")
+    # nothing names the model, but the runnable's class does
+    assert resolve({"name": "ChatFoo"}, {}, {})[0] == "ChatFoo"
+    # nothing at all
+    assert resolve(None, {}, None) == ("unknown-model", "unknown")
+
+
+def test_provider_prefers_ls_provider_over_type(recording_handler):
+    resolve = recording_handler._model_identity
+
+    assert resolve(None, {"_type": "openai-chat"}, {"ls_provider": "openai"})[1] == "openai"
+    assert resolve(None, {"_type": "openai-chat"}, {})[1] == "openai-chat"
+
+
+def test_a_model_call_does_not_rename_the_framework(recording_handler):
+    """langchain-core tags every model run `langchain_chat_model`; that names a component, not a harness."""
+    from langchain_core.runnables import RunnableLambda
+
+    model = GenericFakeChatModel(messages=iter([AIMessage("hi")]))
+    RunnableLambda(lambda _: model.invoke("x")).invoke(1, config={"callbacks": [recording_handler]})
+
+    assert set(recording_handler.frameworks) == {"langchain"}

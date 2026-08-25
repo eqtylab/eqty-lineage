@@ -30,6 +30,7 @@ import argparse
 import importlib.util
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -208,6 +209,14 @@ def run(ref: str | None, out: Path) -> dict:
                 }
             )
             return super()._finalize(name, kind, input_cids, output_cids)
+
+    # init() puts its .eqty_sdk store under the working directory, so each run gets a fresh one in a
+    # temp dir. Two runs sharing a store make the second one's manifest depend on what the first left
+    # behind -- the statement counts drifted between invocations before this -- and a demo whose numbers
+    # move when you run it twice is not a demo. It also keeps 6MB of store out of the repo.
+    out = out.resolve()
+    store = Path(tempfile.mkdtemp(prefix="eqty-demo-"))
+    os.chdir(store)
 
     ctx = Context.new(f"Document review -- {label}")
     cfg = init(default_context=ctx).set_store_all_blobs(True)

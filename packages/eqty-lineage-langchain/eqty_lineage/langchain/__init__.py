@@ -158,6 +158,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ##################################################   Helpers   #################################################
     # kwargs the SDK asset constructors claim for themselves; verbose metadata must not shadow them
     _RESERVED_SDK_KWARGS = frozenset({"obj", "path", "name", "description", "_store"})
+    # ls_integration values that identify a component rather than the harness running it
+    _COMPONENT_INTEGRATIONS = frozenset({"langchain_chat_model"})
 
     def _verbose_metadata(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Sanitize verbose fields into scalar metadata values safe to unpack into SDK asset constructors.
@@ -248,15 +250,44 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         ``ls_integration`` is LangSmith's tag; LangChain's ``create_agent`` sets it to
         ``langchain_create_agent`` and DeepAgents to ``deepagents``. A plain ``StateGraph`` sets neither, so
         the ``langgraph_*`` keys stand in as the evidence there. Anything else is plain LangChain.
+
+        Not every ``ls_integration`` names a harness: langchain-core stamps ``langchain_chat_model`` on
+        every model run, which says what the *component* is, not what is orchestrating it. Taking it would
+        label a plain LCEL chain after the model it happens to call.
         """
         if self._framework is not None:
             return
         meta = metadata or {}
         integration = meta.get("ls_integration")
-        if isinstance(integration, str) and integration:
+        if isinstance(integration, str) and integration and integration not in self._COMPONENT_INTEGRATIONS:
             self._framework = integration
         elif any(key.startswith("langgraph_") for key in meta):
             self._framework = "langgraph"
+
+    @staticmethod
+    def _model_identity(
+        serialized: Optional[Dict[str, Any]],
+        params: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        """Work out what model this was, from whichever source actually names it.
+
+        ``invocation_params`` is the richest source when a provider fills it in, but nothing requires one
+        to: ``GenericFakeChatModel`` reports only ``_type``, and providers vary in whether they use
+        ``model`` or ``model_name``. LangSmith's ``ls_model_name`` and ``ls_provider`` are the
+        standardised fields and are set from ``_get_ls_params``, so they are the next best thing, and the
+        runnable's own class name beats calling a model that plainly exists "unknown".
+        """
+        meta = metadata or {}
+        name = (
+            params.get("model")
+            or params.get("model_name")
+            or meta.get("ls_model_name")
+            or (serialized or {}).get("name")
+            or "unknown-model"
+        )
+        provider = meta.get("ls_provider") or params.get("_type") or "unknown"
+        return str(name), str(provider)
 
     def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
         """Create the computation node w/ metadata."""
@@ -482,8 +513,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         logger.debug(run_id)
+        self._note_framework(metadata)
         params = kwargs.get("invocation_params") or {}
-        model_name = params.get("model") or params.get("model_name") or "unknown-model"
+        model_name, provider = self._model_identity(serialized, params, metadata)
 
         prompt = Prompt.from_object(
             _to_jsonable(messages),
@@ -503,7 +535,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         )
 
         model = Model.from_object(
-            {"model": model_name, "provider": params.get("_type", "unknown")},
+            {"model": model_name, "provider": provider},
             name=model_name,
             **self._verbose_metadata(
                 {
