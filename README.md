@@ -36,6 +36,10 @@ The baseline defaults to the newest `eqty-lineage-langchain@*` tag, so this keep
 since the last release" as releases are cut, rather than freezing into a comparison against one fixed version.
 Rows that differ are marked `*`; a run against an unchanged baseline marks nothing.
 
+Every row is a property of the lineage and is stable run to run. The manifest's raw statement and asset
+counts are deliberately not reported: assets are content-addressed, so two state payloads that happen to
+coincide collapse into one registration and the totals move by one between otherwise identical runs.
+
 Against `0.0.1`, the exported manifests look like this in the graph explorer.
 
 Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:

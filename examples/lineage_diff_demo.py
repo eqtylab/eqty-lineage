@@ -242,6 +242,10 @@ def run(ref: str | None, out: Path) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     cfg.get_default_context().export(out)
 
+    # Deliberately not reported: the manifest's raw statement and asset counts. Assets are
+    # content-addressed, so two state payloads that happen to coincide collapse into one registration and
+    # the totals move by one between otherwise identical runs. Everything below is a property of the
+    # lineage rather than of the store's accounting, and is stable run to run.
     consumed = {i for c in recorded for i in c["inputs"]}
     orphans = [(c["name"], o) for c in recorded if c["kind"] == "graph_node" for o in c["outputs"] if o not in consumed]
     publish_inputs = {i for c in recorded if c["name"] == "publish" for i in c["inputs"]}
@@ -265,7 +269,6 @@ def run(ref: str | None, out: Path) -> dict:
         "file_versions_registered": tracked,
         "swallowed_exceptions": sorted(set(swallowed)),
         "publish_linked_to_current_bytes": current_content in publish_inputs,
-        "manifest_statements": len(json.loads(out.read_text()).get("statements", {})),
     }
     return summary
 
@@ -285,7 +288,6 @@ def compare(stream) -> None:
             "; ".join(a["swallowed_exceptions"]) or "none",
         ),
         ("computations recorded", b["computations"], a["computations"]),
-        ("statements in manifest", b["manifest_statements"], a["manifest_statements"]),
         ("graph nodes present", ", ".join(b["node_names"]) or "-", ", ".join(a["node_names"]) or "-"),
         ("computation kinds", ", ".join(b["kinds"]), ", ".join(a["kinds"])),
         (
@@ -309,6 +311,13 @@ def compare(stream) -> None:
         mark = " " if str(before_value) == str(after_value) else "*"
         print(f"{name:<{width}} {mark} {before_value!s:<62}  {after_value}")
     print()
+    root = Path.cwd()
+    for entry in (b, a):
+        path = Path(entry["manifest"])
+        try:
+            entry["manifest"] = str(path.relative_to(root))
+        except ValueError:
+            pass
     print(f"  before: {b['manifest']}")
     print(f"  after:  {a['manifest']}")
     print("\nLoad both in the graph explorer to see the topology differ.")
