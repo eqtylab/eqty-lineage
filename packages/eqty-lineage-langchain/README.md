@@ -6,6 +6,8 @@ EQTY data assets and computation statements, threaded together into one end-to-e
 - every graph node run → input/output Dataset assets + a computation statement
 - every chat model call → Prompt + Model assets in, Reasoning asset out + computation
 - every tool call → Tool + input Dataset in, output Dataset out + computation
+- every retrieval → Tool + query Prompt in, one Document asset per retrieved document out
+- every subagent → its own `agent` computation, linked to the tool that delegated to it
 
 ## Usage
 
@@ -81,6 +83,51 @@ nodes do not collapse onto one shared entity.
 
 LangGraph `Command` results are unwrapped rather than stringified, so the state update a tool applied — including files a
 DeepAgents subagent wrote via `task` — stays structured and its `Path` values are still collected.
+
+## Subagents
+
+A subagent's root run carries its own name but inherits `langgraph_node` from the tool that spawned it, so it matches
+neither the node rule nor the root rule. It is detected instead by its `lc_agent_name` differing from its parent's —
+LangChain's own rule, from `langchain.agents._subagent_transformer` — and recorded with `computation_type` of `agent`.
+Its final state feeds the tool that delegated to it, so DeepAgents' `task` no longer appears to produce its result from
+nothing. A plain subgraph inherits the parent's name and is not a boundary.
+
+## Retrievals
+
+`on_retriever_start` / `on_retriever_end` register the retriever as a `Tool`, the query as a `Prompt`, and **each
+retrieved document as its own `Document` asset** — one per document rather than one per result set, so the same
+document retrieved by two different queries is recognisably the same entity. For a RAG chain this is the provenance
+that matters most.
+
+## `StateExtractor` — teaching the handler about your state
+
+```python
+from eqty_lineage.langchain import UNCLAIMED, EqtyCallbackHandler, StateExtractor
+
+class FilesExtractor(StateExtractor):
+    def extract(self, key_path, value, sink):
+        if key_path != ("files",):
+            return UNCLAIMED
+        for path, data in value.items():
+            asset = Dataset.from_object(data, name=path, **sink.metadata)
+            sink.create(asset.cid)
+        return {"extracted": sorted(value)}
+
+handler = EqtyCallbackHandler()
+handler.add_extractor(FilesExtractor())
+```
+
+By default everything a state holds is serialized into that node's state Dataset, every time — so a filesystem carried
+in state is embedded once per node, and no file is ever an entity in its own right. An extractor claims part of a
+state, registers whatever assets represent it, and returns what stands in its place in the payload.
+
+- `key_path` is the sequence of dict keys that led to the value, so an extractor claims a particular state key rather
+than guessing from the value's shape
+- `sink.carry(cid)` for an entity that already existed (an input); `sink.create(cid)` for one this computation produced
+(an output). Never both — re-emitting a carried asset as an output puts a cycle in the graph
+- `sink.metadata` is the sanitized verbose metadata, ready to unpack into an SDK asset constructor
+- extractors are consulted in registration order, newest first, so yours beats the built-in `PathExtractor`
+- an extractor that raises is skipped rather than taking down the run being observed
 
 ## `Path` values in graph state
 

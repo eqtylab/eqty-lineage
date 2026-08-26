@@ -150,16 +150,24 @@ def test_command_tool_output_keeps_its_state_update(recording_handler):
 
 
 def test_command_paths_are_still_collected(tmp_path):
-    """Paths nested inside a Command's update must reach the path collector."""
-    from eqty_lineage.langchain import _to_jsonable
+    """Paths nested inside a Command's update must reach the extractor hook, key path intact."""
+    from pathlib import Path
+
+    from eqty_lineage.langchain import UNCLAIMED, _to_jsonable
     from langgraph.types import Command
 
     target = tmp_path / "written.md"
     target.write_text("content")
 
     seen: list[Any] = []
-    _to_jsonable(Command(update={"report": target}), on_path=seen.append)
-    assert seen == [target]
+
+    def collect(key_path, value):
+        if isinstance(value, Path):
+            seen.append((key_path, value))
+        return UNCLAIMED
+
+    _to_jsonable(Command(update={"report": target}), on_value=collect)
+    assert seen == [(("update", "report"), target)]
 
 
 # ----------------------------------------------------- model identity ----

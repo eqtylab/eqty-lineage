@@ -14,6 +14,11 @@ The handler listens to the runs LangGraph emits and turns them into EQTY lineage
 ``pathlib.Path`` values in graph state get special treatment: if the path exists on disk, the file or directory it
 points to is registered as its own Dataset asset via ``Dataset.from_path`` (CIDing the full directory contents), and
 that asset is linked into the computation that carried the path.
+
+That treatment is one :class:`StateExtractor` -- :class:`PathExtractor` -- and more can be registered with
+``add_extractor``. An extractor claims part of a state, registers whatever assets represent it, and replaces it in the
+bulk state blob, which is how a framework package teaches this handler about its own state without this package
+having to know the framework exists.
 """
 
 import functools
@@ -36,38 +41,51 @@ from eqty_sdk.statements import add_computation_statement
 logger = logging.getLogger("eqty.langgraph")
 
 
-def _to_jsonable(obj: Any, on_path: Optional[Callable[[Path], None]] = None) -> Any:
+#: Returned by a claim hook that does not want the value; a plain None cannot serve, because None is
+#: itself a legitimate replacement.
+UNCLAIMED = object()
+
+
+def _to_jsonable(
+    obj: Any,
+    on_value: Optional[Callable[[Tuple[str, ...], Any], Any]] = None,
+    _key_path: Tuple[str, ...] = (),
+) -> Any:
     """Convert LangChain/LangGraph values into plain JSON-serializable data.
 
-    ``on_path`` is invoked for every existing ``pathlib.Path`` encountered, so the caller can register the
-    file/directory as its own EQTY asset.
+    ``on_value`` is offered every value encountered, with the sequence of dict keys that led to it. It
+    returns ``UNCLAIMED`` to decline, or a replacement to substitute into the payload -- which is how a
+    :class:`StateExtractor` lifts something out of the bulk state blob and into an asset of its own.
     """
+    if on_value is not None:
+        claimed = on_value(_key_path, obj)
+        if claimed is not UNCLAIMED:
+            return claimed
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, Path):
-        if on_path is not None and obj.exists():
-            on_path(obj)
         return str(obj)
     if isinstance(obj, BaseMessage):
-        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content, on_path)}
+        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content, on_value, _key_path)}
         tool_calls = getattr(obj, "tool_calls", None)
         if tool_calls:
-            data["tool_calls"] = _to_jsonable(tool_calls, on_path)
+            data["tool_calls"] = _to_jsonable(tool_calls, on_value, _key_path)
         usage = getattr(obj, "usage_metadata", None)
         if usage:
-            data["usage"] = _to_jsonable(usage, on_path)
+            data["usage"] = _to_jsonable(usage, on_value, _key_path)
         return data
     if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v, on_path) for k, v in obj.items()}
+        return {str(k): _to_jsonable(v, on_value, (*_key_path, str(k))) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(item, on_path) for item in obj]
+        # the index is not part of the key path: an extractor claims a state key, not a position in a list
+        return [_to_jsonable(item, on_value, _key_path) for item in obj]
     if type(obj).__name__ == "Command":
         # A LangGraph Command carries the state update a tool applied -- which is the whole payload of
         # DeepAgents' `task` tool, including any files the subagent wrote. Falling through to str() below
         # would record it as an opaque blob. Duck-typed on the class name because this package depends on
         # langchain-core alone and must not import langgraph.
         command = {
-            field: _to_jsonable(getattr(obj, field), on_path)
+            field: _to_jsonable(getattr(obj, field), on_value, (*_key_path, field))
             for field in ("update", "goto", "graph", "resume")
             if getattr(obj, field, None) is not None
         }
@@ -75,7 +93,7 @@ def _to_jsonable(obj: Any, on_path: Optional[Callable[[Path], None]] = None) -> 
             return {"command": command}
     if hasattr(obj, "model_dump"):
         try:
-            return _to_jsonable(obj.model_dump(), on_path)
+            return _to_jsonable(obj.model_dump(), on_value, _key_path)
         except Exception:  # noqa: BLE001 - best-effort serialization
             pass
     return str(obj)
@@ -104,6 +122,101 @@ def eqty_tool(obj: Any) -> Any:
         except (OSError, TypeError):
             logger.debug("no source available for tool '%s'", name)
     return obj
+
+
+class AssetSink:
+    """Where an extractor records the assets it produced, and why each one is there.
+
+    *Carried* means the entity already existed and this computation merely handled it, so it is an input.
+    *Created* means this computation produced it, so it is an output. Getting the distinction wrong is how
+    a lineage graph grows a cycle.
+    """
+
+    def __init__(self, metadata: Dict[str, Any]) -> None:
+        #: sanitized verbose metadata, ready to unpack into an SDK asset constructor
+        self.metadata = metadata
+        self.carried: List[CID] = []
+        self.created: List[CID] = []
+
+    def carry(self, cid: CID) -> None:
+        if cid not in self.carried and cid not in self.created:
+            self.carried.append(cid)
+
+    def create(self, cid: CID) -> None:
+        if cid not in self.created and cid not in self.carried:
+            self.created.append(cid)
+
+
+class StateExtractor:
+    """Lifts part of a graph state into assets of its own, and out of the bulk state blob.
+
+    Without this, everything a node's state contains is re-serialized into that node's state Dataset,
+    every time -- so a filesystem carried in state is embedded once per node, and no file is ever an
+    entity in its own right. An extractor claims a value, registers whatever assets represent it, and
+    returns what should stand in its place in the payload.
+
+    Subclass and register with ``EqtyCallbackHandler.add_extractor`` to teach the handler about a
+    framework's own state. The DeepAgents package uses this to turn its virtual filesystem into real
+    file assets without this package ever importing ``deepagents``.
+    """
+
+    def extract(self, key_path: Tuple[str, ...], value: Any, sink: AssetSink) -> Any:
+        """Claim ``value`` and return its replacement, or ``UNCLAIMED`` to decline.
+
+        ``key_path`` is the sequence of dict keys that led here, so an extractor can claim a particular
+        state key (``("files",)``) rather than guessing from the value's shape.
+        """
+        raise NotImplementedError
+
+
+class PathExtractor(StateExtractor):
+    """Registers an existing ``pathlib.Path`` in state as a Dataset of its own.
+
+    Versions are keyed on ``(path, content CID)``, not on the path alone. A file rewritten between two
+    nodes is a genuinely different entity, and reusing the first sighting's asset would attest content the
+    later computation never saw. The version a rewrite replaced is carried as an input, which is what
+    makes successive edits a chain rather than unrelated assets.
+
+    The cost is re-hashing each path per sighting, which is what ``Dataset.from_path`` would do anyway on
+    a miss.
+    """
+
+    def __init__(self, handler: "EqtyCallbackHandler") -> None:
+        self._handler = handler
+
+    def extract(self, key_path: Tuple[str, ...], value: Any, sink: AssetSink) -> Any:
+        if not isinstance(value, Path):
+            return UNCLAIMED
+        if not value.exists():
+            return str(value)
+
+        key = str(value.resolve())
+        try:
+            content_cid = str(get_cid_for_path(value))
+        except Exception:  # noqa: BLE001 - an unreadable path must not take down the run being observed
+            logger.debug("could not compute a content CID for '%s'; skipping", value)
+            return str(value)
+
+        known = self._handler._path_versions.get((key, content_cid))
+        if known is not None:
+            sink.carry(known)
+            return str(value)
+
+        asset = Dataset.from_path(
+            value,
+            name=value.name,
+            description=f"Filesystem asset referenced by LangGraph state: '{value}'.",
+            **sink.metadata,
+        )
+        self._handler._path_versions[(key, content_cid)] = asset.cid
+
+        previous = self._handler._path_latest.get(key)
+        if previous is not None:
+            sink.carry(previous)
+        self._handler._path_latest[key] = asset.cid
+
+        sink.create(asset.cid)
+        return str(value)
 
 
 def _synchronized(method: Callable) -> Callable:
@@ -159,6 +272,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._path_versions: Dict[Tuple[str, str], CID] = {}
         # resolved path -> Dataset CID of its most recent version, so a rewrite can be linked to what it replaced
         self._path_latest: Dict[str, CID] = {}
+        # consulted in order for every value in a state; see add_extractor
+        self._extractors: List[StateExtractor] = [PathExtractor(self)]
 
     ##################################################   Helpers   #################################################
     # kwargs the SDK asset constructors claim for themselves; verbose metadata must not shadow them
@@ -187,24 +302,25 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             out[safe_key] = jsonable if isinstance(jsonable, (str, int, float, bool)) else json.dumps(jsonable)
         return out
 
+    def add_extractor(self, extractor: StateExtractor) -> None:
+        """Teach the handler to lift something out of graph state into assets of its own.
+
+        Extractors are consulted in registration order, and the first to claim a value wins, so a
+        subclass registering its own takes precedence over the built-in :class:`PathExtractor`.
+        """
+        with self._lock:
+            self._extractors.insert(0, extractor)
+
     def _register_state(
         self, obj: Any, name: str, description: str, extra: Optional[Dict[str, Any]] = None
     ) -> Tuple[Dataset, List[CID], List[CID]]:
-        """Register ``obj`` as a Dataset; existing Paths inside it become their own assets.
+        """Register ``obj`` as a Dataset, after the extractors have taken what they own.
 
-        Returns ``(state_asset, carried_path_cids, created_path_cids)``. A path whose contents this run has not
-        seen before is a new version *created* by the current computation; a path whose exact bytes are already
-        registered is merely *carried* through the state and must be linked as an input, never re-emitted as an
-        output (which would create a cycle in the lineage graph).
-
-        Versions are keyed on ``(path, content CID)``, not on the path alone. A file that is rewritten between two
-        nodes is a genuinely different entity, and reusing the first sighting's asset would attest content that the
-        later computation never saw. The cost is re-hashing each path per sighting, which is what
-        ``Dataset.from_path`` would do anyway on a miss.
+        Returns ``(state_asset, carried_cids, created_cids)``. Carried assets already existed and are
+        linked as inputs; created ones were produced here and become outputs. Never both: re-emitting a
+        carried asset as an output puts a cycle in the graph.
         """
-        carried: List[CID] = []
-        created: List[CID] = []
-        extra = self._verbose_metadata(extra or {})
+        sink = AssetSink(self._verbose_metadata(extra or {}))
 
         if obj is None:
             # LangChain middleware nodes return None to mean "no state update", and the SDK cannot hash
@@ -212,42 +328,21 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             # single shared empty sentinel would make unrelated nodes converge on one entity in the graph.
             obj = {"state_update": None, "produced_by": name}
 
-        def collect(path: Path) -> None:
-            key = str(path.resolve())
-            try:
-                content_cid = str(get_cid_for_path(path))
-            except Exception:  # noqa: BLE001 - an unreadable path must not take down the run being observed
-                logger.debug("could not compute a content CID for '%s'; skipping", path)
-                return
+        def dispatch(key_path: Tuple[str, ...], value: Any) -> Any:
+            for extractor in self._extractors:
+                try:
+                    claimed = extractor.extract(key_path, value, sink)
+                except Exception:  # noqa: BLE001 - a broken extractor must not take down the run
+                    logger.debug("extractor %s failed at %s", type(extractor).__name__, key_path)
+                    continue
+                if claimed is not UNCLAIMED:
+                    return claimed
+            return UNCLAIMED
 
-            known = self._path_versions.get((key, content_cid))
-            if known is not None:
-                if known not in carried and known not in created:
-                    carried.append(known)
-                return
+        payload = _to_jsonable(obj, on_value=dispatch)
+        asset = Dataset.from_object(payload, name=name, description=description, **sink.metadata)
 
-            asset = Dataset.from_path(
-                path,
-                name=path.name,
-                description=f"Filesystem asset referenced by LangGraph state: '{path}'.",
-                **extra,
-            )
-            self._path_versions[(key, content_cid)] = asset.cid
-
-            # the version this one replaced is an input to whatever produced it, which is what makes the
-            # successive versions of a file a chain in the graph rather than unrelated assets
-            previous = self._path_latest.get(key)
-            if previous is not None and previous not in carried and previous not in created:
-                carried.append(previous)
-            self._path_latest[key] = asset.cid
-
-            if asset.cid not in created:
-                created.append(asset.cid)
-
-        payload = _to_jsonable(obj, on_path=collect)
-        asset = Dataset.from_object(payload, name=name, description=description, **extra)
-
-        return asset, carried, created
+        return asset, sink.carried, sink.created
 
     def _note_framework(self, metadata: Optional[Dict[str, Any]]) -> None:
         """Record which harness produced this run, the first time a run says so.
@@ -886,4 +981,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ################################################## Retrievers ##################################################
 
 
-__all__ = ["EqtyCallbackHandler", "eqty_tool"]
+__all__ = [
+    "UNCLAIMED",
+    "AssetSink",
+    "EqtyCallbackHandler",
+    "PathExtractor",
+    "StateExtractor",
+    "eqty_tool",
+]
