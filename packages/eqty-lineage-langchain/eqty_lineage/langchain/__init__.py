@@ -29,7 +29,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Dataset, Model, Prompt, Reasoning, Tool, get_cid_for_path
+from eqty_sdk import CID, Dataset, Document, Model, Prompt, Reasoning, Tool, get_cid_for_path
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
 
@@ -151,6 +151,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._framework: Optional[str] = None
         # tool name -> Tool asset CID, so each tool is registered once
         self._tool_cids: Dict[str, CID] = {}
+        # retriever name -> Tool asset CID, likewise
+        self._retriever_cids: Dict[str, CID] = {}
         # (resolved path, content CID) -> Dataset CID. Keyed on the *contents* as well as the path: the same
         # bytes at the same path are one entity, but rewritten bytes are a new version, and keying on the path
         # alone would attest the previous content for every computation that ran after the change.
@@ -761,7 +763,127 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if failure is not None and run["node"] is not None:
             run["node"].setdefault("child_outputs", []).append(failure)
 
+    ################################################## Tool Calls ##################################################
 
-################################################## Tool Calls ##################################################
+    ################################################## Retrievers ##################################################
+    @_synchronized
+    def on_retriever_start(
+        self,
+        serialized: Dict[str, Any],
+        query: str,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Register a retrieval as its own computation.
+
+        For a RAG chain the retrieved documents are the provenance that matters most -- they are where
+        the answer's content actually came from -- and they were leaving no trace at all. The retriever
+        itself is registered as a Tool, because that is what it is from the graph's point of view: a named
+        capability the run invoked, content-addressed so a changed retriever is a changed asset.
+        """
+        logger.debug(run_id)
+        self._note_framework(metadata)
+        name = kwargs.get("name") or (serialized or {}).get("name") or "retriever"
+
+        if name not in self._retriever_cids:
+            asset = Tool.from_object(
+                {"retriever": name},
+                name=name,
+                description=(serialized or {}).get("description", ""),
+                **self._verbose_metadata(
+                    {
+                        "callback": "on_retriever_start",
+                        "serialized": serialized,
+                        "run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                        "tags": tags,
+                        "metadata": metadata,
+                        **kwargs,
+                    }
+                ),
+            )
+            self._retriever_cids[name] = asset.cid
+
+        query_asset = Prompt.from_object(
+            _to_jsonable(query),
+            name=f"{name}: query",
+            description=f"Query issued to retriever '{name}'.",
+            **self._verbose_metadata(
+                {
+                    "callback": "on_retriever_start",
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                    "tags": tags,
+                    "metadata": metadata,
+                    **kwargs,
+                }
+            ),
+        )
+
+        input_cids = [self._retriever_cids[name], query_asset.cid]
+        node = self._enclosing_node(parent_run_id)
+        if node is not None:
+            enclosing_input = node.get("state_in")
+            if enclosing_input is not None:
+                input_cids.append(enclosing_input)
+
+        self._runs[run_id] = {
+            "name": name,
+            "kind": "retriever",
+            "state_in": query_asset.cid,
+            "inputs": input_cids,
+            "child_outputs": [],
+            "node": node,
+        }
+
+    @_synchronized
+    def on_retriever_end(self, documents: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        """Each retrieved document becomes its own Document asset.
+
+        One asset per document rather than one per result set: the same document retrieved by two
+        different queries is the same entity, and content-addressing makes that identity automatic. A
+        single blob of "the results" would hide it.
+        """
+        logger.debug(run_id)
+        run = self._runs.pop(run_id, None)
+
+        if run is None:
+            return
+
+        output_cids: List[CID] = []
+        for index, document in enumerate(documents or []):
+            payload = _to_jsonable(document)
+            source = None
+            if isinstance(payload, dict):
+                source = (payload.get("metadata") or {}).get("source")
+            asset = Document.from_object(
+                payload,
+                name=str(source) if source else f"{run['name']}: document {index + 1}",
+                description=f"Document retrieved by '{run['name']}'.",
+                **self._verbose_metadata({"callback": "on_retriever_end", "run_id": run_id, **kwargs}),
+            )
+            if asset.cid not in output_cids:
+                output_cids.append(asset.cid)
+
+        self._finalize(run["name"], run["kind"], run["inputs"], output_cids)
+
+        # the documents are what the enclosing node's output was built from
+        if run["node"] is not None:
+            run["node"].setdefault("child_outputs", []).extend(output_cids)
+
+    @_synchronized
+    def on_retriever_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.warning("retriever run %s failed: %s: %s", run_id, type(error).__name__, error)
+        run = self._runs.pop(run_id, None)
+
+        if run is not None:
+            self._finalize_error(run, error)
+
+    ################################################## Retrievers ##################################################
+
 
 __all__ = ["EqtyCallbackHandler", "eqty_tool"]
