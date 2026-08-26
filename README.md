@@ -42,6 +42,8 @@ coincide collapse into one registration and the totals move by one between other
 
 Against `0.0.1`, the exported manifests look like this in the graph explorer.
 
+(The screenshots below predate the retrieval and subagent steps, so they show the earlier, smaller graph.)
+
 Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:
 
 ![lineage before](docs/images/lineage-before.png)
@@ -56,10 +58,13 @@ Or read the printed table:
 | | before | after |
 | --- | --- | --- |
 | exceptions swallowed by LangChain | `KeyError('state_in')`, `TypeError(... NoneType)` | none |
-| computations recorded | 7 | 10 |
-| graph nodes present | `checkpoint` missing | all six |
-| computation kinds | no `chat_model`, no `tool_error` | both present |
-| orphaned node outputs | `verify_b` | none |
+| computations recorded | 11 | 16 |
+| retrievals recorded | 0 | 1 |
+| documents registered | 0 | 2 |
+| subagents recorded | none | `specialist` |
+| graph nodes present | `checkpoint` missing | all nine |
+| computation kinds | `graph`, `graph_node`, `tool` | plus `agent`, `chat_model`, `retriever`, `tool_error` |
+| orphaned node outputs | `verify_b`, `assess` | none |
 | `report.md` versions tracked | 1 | 2 |
 | `publish` linked to the bytes it read | **no** | yes |
 
