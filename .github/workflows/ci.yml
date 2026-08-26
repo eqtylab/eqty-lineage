@@ -3,7 +3,10 @@ description: "General CI code check. Runs on every PR"
 
 on:
   pull_request:
-    types: [ready_for_review, synchronize]
+    # `opened` matters: without it a pull request created directly as ready-for-review gets no run at
+    # all until someone pushes to it, and reads as "no checks" rather than "not checked yet".
+    # `reopened` covers a PR closed and brought back, which likewise produces no synchronize event.
+    types: [opened, reopened, ready_for_review, synchronize]
   workflow_dispatch:
 
 permissions:
