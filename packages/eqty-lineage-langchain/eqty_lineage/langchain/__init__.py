@@ -144,6 +144,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._sibling_outputs: Dict[Optional[UUID], Dict[int, List[CID]]] = {}
         # parent run id -> synthetic step counter, for runs LangGraph gives no langgraph_step
         self._fallback_steps: Dict[Optional[UUID], int] = {}
+        # run_id -> the agent that run belongs to, inherited from its parent when it names none of its own.
+        # A nested run that names a *different* agent is a subagent boundary; see _agent_boundary.
+        self._agent_names: Dict[UUID, Optional[str]] = {}
         # which harness produced this run, resolved from run metadata rather than assumed
         self._framework: Optional[str] = None
         # tool name -> Tool asset CID, so each tool is registered once
@@ -353,6 +356,31 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         """Drop the per-parent bookkeeping a finished run owned, so a long session does not accumulate it."""
         self._sibling_outputs.pop(run_id, None)
         self._fallback_steps.pop(run_id, None)
+        self._agent_names.pop(run_id, None)
+
+    def _agent_boundary(
+        self, run_id: UUID, parent_run_id: Optional[UUID], metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Return this run's agent name if it starts a *new* agent, else None.
+
+        This is LangChain's own rule, from ``langchain.agents._subagent_transformer``: a subagent boundary
+        is a nested run whose ``lc_agent_name`` is set and differs from its parent's. Plain subgraphs
+        inherit the parent's name and are excluded, which is what keeps every internal LangGraph run from
+        being mistaken for an agent.
+
+        Without this a DeepAgents subagent is invisible: its root run carries the subagent's name but
+        inherits ``langgraph_node`` from the ``task`` tool that spawned it, so it matches neither the node
+        rule nor the root rule, and its internal work is never linked to the call that asked for it.
+        """
+        own = (metadata or {}).get("lc_agent_name")
+        inherited = self._agent_names.get(parent_run_id) if parent_run_id is not None else None
+        self._agent_names[run_id] = own or inherited
+
+        if not isinstance(own, str) or not own:
+            return None
+        if parent_run_id is None:
+            return None  # the trace root is handled as the graph itself
+        return own if own != inherited else None
 
     def _enclosing_node(self, parent_run_id: Optional[UUID]) -> Optional[Dict[str, Any]]:
         """Walk up the run tree to the nearest tracked node (or graph) run to get a node so we can link the graph."""
@@ -397,13 +425,20 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         name = kwargs.get("name") or (serialized or {}).get("name")
         is_node = node is not None and name == node
         is_graph = parent_run_id is None
+        subagent = self._agent_boundary(run_id, parent_run_id, metadata)
 
-        if not (is_node or is_graph):
-            logger.info("is_node and is_graph are None")
+        if not (is_node or is_graph or subagent):
+            logger.debug("untracked chain run %s (%s)", run_id, name)
             return
 
-        # an unnamed graph reports itself as "LangGraph"; lc_agent_name is the agent's own name when set
-        label = node if is_node else ((metadata or {}).get("lc_agent_name") or name or "graph")
+        # a subagent names itself; an unnamed graph reports itself as "LangGraph", and lc_agent_name is
+        # the agent's own name when it has one
+        if subagent:
+            label = subagent
+        elif is_node:
+            label = node
+        else:
+            label = (metadata or {}).get("lc_agent_name") or name or "graph"
 
         state_in, carried, created = self._register_state(
             inputs,
@@ -429,9 +464,16 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             if prev != state_in.cid and prev not in input_cids:
                 input_cids.append(prev)
 
+        if subagent:
+            kind = "agent"
+        elif is_graph:
+            kind = "graph"
+        else:
+            kind = "graph_node"
+
         self._runs[run_id] = {
             "name": label,
-            "kind": "graph" if is_graph else "graph_node",
+            "kind": kind,
             "parent": parent_run_id,
             "step": step,
             "state_in": state_in.cid,
@@ -460,7 +502,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         # nested LLM/tool outputs are inputs to the node's final state
         input_cids = run["inputs"] + run["child_outputs"]
 
-        if run["kind"] == "graph":
+        if run["kind"] in ("graph", "agent"):
             # the final state is derived from the last node that ran inside it
             last = run.get("last_child_output")
             if last is not None and last not in input_cids:
@@ -486,6 +528,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
         if enclosing is not None:
             enclosing["last_child_output"] = state_out.cid
+            if run["kind"] == "agent":
+                # the enclosing run is the tool that spawned this subagent -- DeepAgents' `task`. Its
+                # result *is* the subagent's final state, so without this edge the whole delegated run
+                # hangs off nothing and the graph has a hole exactly where the work was handed over.
+                enclosing.setdefault("child_outputs", []).append(state_out.cid)
 
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
