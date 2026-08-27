@@ -79,3 +79,78 @@ def test_failing_retriever_is_recorded(recording_handler):
 
     kinds = [kind for _, kind, _, _ in recording_handler.computations]
     assert "retriever_error" in kinds, "a failed retrieval must leave a record"
+
+
+# ------------------------------------------------- retriever identity ----
+def test_same_class_different_corpus_is_a_different_asset(recording_handler):
+    """The gap this closes: a class name alone cannot tell two corpora apart.
+
+    Deliberately no `run_name` on either -- both report the same callback name, so the only thing that can
+    distinguish them is the config the caller attached. Give them different names and this passes whether
+    or not the config is read, which proves nothing.
+    """
+    docs = [LCDocument(page_content="x")]
+
+    legal = Fake(docs=docs).with_config(metadata={"index": "pinecone://legal-v3"})
+    hr = Fake(docs=docs).with_config(metadata={"index": "pinecone://hr-v1"})
+
+    legal.invoke("q", config={"callbacks": [recording_handler]})
+    hr.invoke("q", config={"callbacks": [recording_handler]})
+
+    assert len(recording_handler._retriever_cids) == 2, "the two corpora collapsed into one asset"
+    # CID is not hashable, so compare the string forms
+    assert len({str(c) for c in recording_handler._retriever_cids.values()}) == 2
+
+
+def test_a_renamed_run_of_one_corpus_is_still_that_corpus(recording_handler):
+    """run_name renames the run, not the corpus -- the class is kept alongside it."""
+    docs = [LCDocument(page_content="x")]
+    Fake(docs=docs).with_config(run_name="nightly", metadata={"index": "a"}).invoke(
+        "q", config={"callbacks": [recording_handler]}
+    )
+    identity = next(iter(recording_handler._retriever_cids))
+    assert '"class": "fake"' in identity, identity
+    assert '"retriever": "nightly"' in identity, identity
+
+
+def test_the_same_retriever_twice_is_one_asset(recording_handler):
+    retriever = Fake(docs=[LCDocument(page_content="x")]).with_config(metadata={"index": "a"})
+    retriever.invoke("one", config={"callbacks": [recording_handler]})
+    retriever.invoke("two", config={"callbacks": [recording_handler]})
+
+    assert len(recording_handler._retriever_cids) == 1
+
+
+def test_identity_keeps_class_run_name_config_and_tags(recording_handler):
+    identity = recording_handler._retriever_identity(
+        "legal-index",
+        {"ls_retriever_name": "myvectorstore", "index": "pinecone://legal-v3", "langgraph_step": 3},
+        ["corpus:legal"],
+    )
+    assert identity["retriever"] == "legal-index"
+    assert identity["class"] == "myvectorstore"
+    assert identity["config"] == {"index": "pinecone://legal-v3"}
+    assert identity["tags"] == ["corpus:legal"]
+
+
+def test_run_scoped_metadata_is_excluded_from_identity(recording_handler):
+    """Anything the framework stamps per run would mint a new asset on every call."""
+    noisy = {
+        "ls_retriever_name": "lib",
+        "langgraph_step": 7,
+        "langgraph_node": "research",
+        "checkpoint_ns": "tools:abc",
+        "lc_agent_name": "researcher",
+        "index": "kept",
+    }
+    identity = recording_handler._retriever_identity("Lib", noisy, None)
+    assert identity["config"] == {"index": "kept"}, identity
+
+
+def test_identity_is_stable_across_invocations(recording_handler):
+    """Two calls of the same retriever inside a graph must not mint two assets."""
+    retriever = Fake(docs=[LCDocument(page_content="x")])
+    first = recording_handler._retriever_identity("Lib", {"ls_retriever_name": "lib", "langgraph_step": 1}, [])
+    second = recording_handler._retriever_identity("Lib", {"ls_retriever_name": "lib", "langgraph_step": 9}, [])
+    assert first == second
+    assert retriever is not None

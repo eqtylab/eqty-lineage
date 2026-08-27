@@ -99,13 +99,31 @@ nothing. A plain subgraph inherits the parent's name and is not a boundary.
 
 `on_retriever_start` / `on_retriever_end` register the retriever as a `Tool`, the query as a `Prompt`, and **each
 retrieved document as its own `Document` asset** — one per document rather than one per result set, so the same
-document retrieved by two different queries is recognisably the same entity. For a RAG chain this is the provenance
-that matters most.
+document retrieved by two different queries is recognisably the same entity. Each document asset carries the
+document's own `metadata`, which is where per-document provenance normally lives (`source`, page, chunk id), and is
+named from `metadata["source"]` when present. For a RAG chain this is the provenance that matters most.
+
+The retriever's own asset is content-addressed to its **identity**, not just its class name — a class name alone
+cannot tell two corpora apart. Whatever you attach with `with_config` is folded in:
+
+```python
+retriever.with_config(run_name="legal-index", metadata={"index": "pinecone://legal-v3"})
+```
+
+- `retriever` — what this run called it (`run_name` when set, otherwise the class)
+- `class` — from LangSmith's `ls_retriever_name`, stable even when `run_name` renames the run
+- `config` — the metadata you attached, minus the frameworks' own run-scoped keys (`langgraph_*`, `ls_*`, `lc_*`,
+`checkpoint_ns`), which would otherwise mint a new asset on every call
+- `tags` — any tags you attached
+
+So the same wrapper class aimed at two indexes registers as two assets, and the manifest records *which* corpus was
+consulted. Nothing is required: an un-configured retriever still gets an asset, just a less specific one.
 
 ## `StateExtractor` — teaching the handler about your state
 
 ```python
 from eqty_lineage.langchain import UNCLAIMED, EqtyCallbackHandler, StateExtractor
+
 
 class FilesExtractor(StateExtractor):
     def extract(self, key_path, value, sink):
@@ -115,6 +133,7 @@ class FilesExtractor(StateExtractor):
             asset = Dataset.from_object(data, name=path, **sink.metadata)
             sink.create(asset.cid)
         return {"extracted": sorted(value)}
+
 
 handler = EqtyCallbackHandler()
 handler.add_extractor(FilesExtractor())

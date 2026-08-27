@@ -264,7 +264,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._framework: Optional[str] = None
         # tool name -> Tool asset CID, so each tool is registered once
         self._tool_cids: Dict[str, CID] = {}
-        # retriever name -> Tool asset CID, likewise
+        # retriever identity (JSON) -> Tool asset CID, so one retriever config is registered once
         self._retriever_cids: Dict[str, CID] = {}
         # (resolved path, content CID) -> Dataset CID. Keyed on the *contents* as well as the path: the same
         # bytes at the same path are one entity, but rewritten bytes are a new version, and keying on the path
@@ -343,6 +343,47 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         asset = Dataset.from_object(payload, name=name, description=description, **sink.metadata)
 
         return asset, sink.carried, sink.created
+
+    #: metadata the frameworks stamp on every run; scoped to one invocation, so including it in an asset
+    #: payload would mint a new asset on each call rather than identifying the thing being invoked
+    _RUN_SCOPED_METADATA_PREFIXES = ("langgraph_", "ls_", "lc_")
+    _RUN_SCOPED_METADATA_KEYS = frozenset({"checkpoint_ns", "thread_id", "run_id", "run_name"})
+
+    @classmethod
+    def _caller_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The metadata the caller attached, with the frameworks' own run-scoped keys removed."""
+        return {
+            key: value
+            for key, value in (metadata or {}).items()
+            if not key.startswith(cls._RUN_SCOPED_METADATA_PREFIXES) and key not in cls._RUN_SCOPED_METADATA_KEYS
+        }
+
+    def _retriever_identity(
+        self, name: str, metadata: Optional[Dict[str, Any]], tags: Optional[List[str]]
+    ) -> Dict[str, Any]:
+        """What identifies this retriever, as opposed to what it returned.
+
+        A retriever is a class pointed at a corpus, and the class name alone cannot tell two of them
+        apart -- the same wrapper aimed at a different index looks identical. Whatever the caller attached
+        via ``with_config`` is therefore folded in, so a manifest records *which* corpus was consulted and
+        not merely that something was.
+
+        ``ls_retriever_name`` is the class, stable even when ``run_name`` renames the run; ``name`` is what
+        this run called it. Both are kept rather than guessing which is which.
+        """
+        identity: Dict[str, Any] = {"retriever": name}
+
+        class_name = (metadata or {}).get("ls_retriever_name")
+        if class_name:
+            identity["class"] = str(class_name)
+
+        config = self._caller_metadata(metadata)
+        if config:
+            identity["config"] = _to_jsonable(config)
+        if tags:
+            identity["tags"] = sorted(str(t) for t in tags)
+
+        return identity
 
     def _note_framework(self, metadata: Optional[Dict[str, Any]]) -> None:
         """Record which harness produced this run, the first time a run says so.
@@ -878,15 +919,23 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         For a RAG chain the retrieved documents are the provenance that matters most -- they are where
         the answer's content actually came from -- and they were leaving no trace at all. The retriever
         itself is registered as a Tool, because that is what it is from the graph's point of view: a named
-        capability the run invoked, content-addressed so a changed retriever is a changed asset.
+        capability the run invoked.
+
+        Its asset is content-addressed to its identity, which includes whatever the caller attached with
+        ``with_config`` -- so pointing the same class at a different index produces a different asset,
+        and the manifest records which corpus was consulted rather than only that one was.
         """
         logger.debug(run_id)
         self._note_framework(metadata)
         name = kwargs.get("name") or (serialized or {}).get("name") or "retriever"
+        identity = self._retriever_identity(name, metadata, tags)
+        # keyed on the identity rather than the name, so the same class aimed at two different corpora
+        # registers as two assets instead of silently collapsing into one
+        key = json.dumps(identity, sort_keys=True)
 
-        if name not in self._retriever_cids:
+        if key not in self._retriever_cids:
             asset = Tool.from_object(
-                {"retriever": name},
+                identity,
                 name=name,
                 description=(serialized or {}).get("description", ""),
                 **self._verbose_metadata(
@@ -901,7 +950,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                     }
                 ),
             )
-            self._retriever_cids[name] = asset.cid
+            self._retriever_cids[key] = asset.cid
 
         query_asset = Prompt.from_object(
             _to_jsonable(query),
@@ -919,7 +968,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             ),
         )
 
-        input_cids = [self._retriever_cids[name], query_asset.cid]
+        input_cids = [self._retriever_cids[key], query_asset.cid]
         node = self._enclosing_node(parent_run_id)
         if node is not None:
             enclosing_input = node.get("state_in")
