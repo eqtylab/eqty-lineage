@@ -295,7 +295,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if not self.verbose:
             return {}
         out: Dict[str, Any] = {}
-        for key, value in fields.items():
+        # verbose mode attaches raw callback kwargs, which is the third path a credential can take
+        for key, value in self._redact(fields).items():
             safe_key = key
             while safe_key in self._RESERVED_SDK_KWARGS or safe_key in out:
                 safe_key = f"LC-{safe_key}"
@@ -355,18 +356,52 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     #: as its own asset, so folding their schemas in here would bloat the Model asset and change it every
     #: time the tool belt does.
     _NON_SAMPLING_PARAMS = frozenset({"tools", "functions", "model", "model_name", "_type"})
-    #: words that mark a parameter as credential material; asset payloads are stored as blobs. Matched as
-    #: whole words rather than substrings, because `max_completion_tokens` is a sampling knob and not a
-    #: credential -- "tokens" is not "token".
-    _SECRET_PARAM_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "credential", "auth", "bearer"})
+    #: Words that mark a parameter as credential material. Matched as whole words, because
+    #: `max_completion_tokens` is a sampling knob and not a credential -- "tokens" is not "token".
+    _SECRET_PARAM_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "passwd", "pwd", "auth", "bearer"})
+    #: Stems for which no ordinary parameter shares the prefix, so a prefix match is safe and catches the
+    #: inflections whole-word matching misses -- `authorization` is the standard header name for a
+    #: credential, and is not the word "auth". Deliberately excludes anything that would swallow "author".
+    _SECRET_PARAM_STEMS = ("secret", "password", "credential", "authoriz", "apikey", "privatekey")
     #: tags the frameworks generate themselves. `seq:step:N` and `graph:step:N` encode a position in a
     #: sequence or a superstep, so treating them as caller intent would mint a new asset for the same
     #: thing invoked at a different point in the graph.
     _FRAMEWORK_TAG_PREFIXES = ("seq:step:", "graph:step:", "map:key:", "langsmith:")
 
+    #: stands in for a redacted value, so a manifest records that a credential was configured without
+    #: recording the credential. Constant on purpose: two runs differing only in their key are the same
+    #: computation, and folding the key into the CID would both leak it and split the asset.
+    _REDACTED = "[redacted]"
+
     @classmethod
     def _is_secret_param(cls, key: str) -> bool:
-        return any(word in cls._SECRET_PARAM_WORDS for word in re.split(r"[^a-z0-9]+", key.lower()))
+        """Whether a parameter name reads as credential material.
+
+        Two rules, because neither alone is right. Whole-word matching keeps `max_completion_tokens` --
+        "tokens" is not "token" -- but misses `authorization`, which is not the word "auth". Prefix matching
+        catches that, but only for stems no ordinary parameter shares, so `author` is not mistaken for one.
+        """
+        words = re.split(r"[^a-z0-9]+", key.lower())
+        if any(word in cls._SECRET_PARAM_WORDS for word in words):
+            return True
+        return any(word.startswith(cls._SECRET_PARAM_STEMS) for word in words)
+
+    @classmethod
+    def _redact(cls, value: Any, key: Optional[str] = None) -> Any:
+        """Replace credential-named values anywhere inside ``value``.
+
+        Applied to everything that can reach an asset payload, and applied *recursively*: a caller can nest
+        configuration arbitrarily -- ``extra_body={"api_key": ...}`` is the obvious one -- so checking only
+        the keys at the top of a mapping lets the interesting cases through. Asset payloads are stored as
+        blobs, so a leak here is a credential written to disk and content-addressed.
+        """
+        if key is not None and cls._is_secret_param(key):
+            return cls._REDACTED
+        if isinstance(value, dict):
+            return {k: cls._redact(v, str(k)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._redact(item) for item in value]
+        return value
 
     @classmethod
     def _caller_tags(cls, tags: Optional[List[str]]) -> List[str]:
@@ -380,20 +415,20 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         Temperature and the rest change what the model does, so two calls that differ only in sampling are
         genuinely different computations and must not share a Model asset.
         """
-        return {
-            key: value
-            for key, value in (params or {}).items()
-            if key not in cls._NON_SAMPLING_PARAMS and not cls._is_secret_param(key)
-        }
+        # redacted rather than dropped: a nested `extra_body` may hold both a credential and real
+        # configuration, so the structure has to survive with the secret removed from inside it
+        return cls._redact({key: value for key, value in (params or {}).items() if key not in cls._NON_SAMPLING_PARAMS})
 
     @classmethod
     def _caller_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The metadata the caller attached, with the frameworks' own run-scoped keys removed."""
-        return {
-            key: value
-            for key, value in (metadata or {}).items()
-            if not key.startswith(cls._RUN_SCOPED_METADATA_PREFIXES) and key not in cls._RUN_SCOPED_METADATA_KEYS
-        }
+        return cls._redact(
+            {
+                key: value
+                for key, value in (metadata or {}).items()
+                if not key.startswith(cls._RUN_SCOPED_METADATA_PREFIXES) and key not in cls._RUN_SCOPED_METADATA_KEYS
+            }
+        )
 
     def _retriever_identity(
         self, name: str, metadata: Optional[Dict[str, Any]], tags: Optional[List[str]]

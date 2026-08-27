@@ -43,7 +43,7 @@ def test_bound_tools_are_not_part_of_the_model(recording_handler):
 
 
 def test_credentials_never_reach_the_payload(recording_handler):
-    """Asset payloads are stored as blobs."""
+    """Asset payloads are stored as blobs, so a leak here is a credential written to disk."""
     params = recording_handler._sampling_params(
         {
             "temperature": 0.0,
@@ -53,8 +53,8 @@ def test_credentials_never_reach_the_payload(recording_handler):
             "some_secret": "SECRET",
         }
     )
-    assert params == {"temperature": 0.0}
-    assert "SECRET" not in str(params)
+    assert params["temperature"] == 0.0
+    assert "SECRET" not in str(params), params
 
 
 def test_top_k_is_not_mistaken_for_a_credential(recording_handler):
@@ -149,5 +149,47 @@ def test_max_tokens_is_a_sampling_knob_not_a_credential(recording_handler):
     """`max_completion_tokens` contains "token"; matching substrings would silently drop it."""
     for name in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
         assert recording_handler._sampling_params({name: 512}) == {name: 512}, name
-    for name in ("api_key", "openai_api_key", "auth_token", "bearer_token", "some_secret"):
-        assert recording_handler._sampling_params({name: "SECRET"}) == {}, name
+    redacted = recording_handler._REDACTED
+    for name in ("api_key", "openai_api_key", "auth_token", "bearer_token", "some_secret", "authorization"):
+        assert recording_handler._sampling_params({name: "SECRET"}) == {name: redacted}, name
+    # ...and words that merely look similar are not credentials
+    for name in ("author", "authoring_model", "top_k", "keyword_boost"):
+        assert recording_handler._sampling_params({name: "kept"}) == {name: "kept"}, name
+
+
+# ------------------------------------------------------ redaction ----
+def test_caller_metadata_is_redacted(recording_handler):
+    """`with_config(metadata={"api_key": ...})` reaches an asset payload directly."""
+    kept = recording_handler._caller_metadata({"api_key": "sk-SECRET", "index": "legal"})
+    assert kept["index"] == "legal", "ordinary config must survive"
+    assert "SECRET" not in str(kept), kept
+
+
+def test_nested_credentials_are_redacted(recording_handler):
+    """A credential can be nested arbitrarily; checking only top-level keys misses it."""
+    params = recording_handler._sampling_params({"temperature": 0.0, "extra_body": {"api_key": "sk-SECRET", "seed": 7}})
+    assert params["extra_body"]["seed"] == 7, "the structure around a secret must survive"
+    assert "SECRET" not in str(params), params
+
+
+def test_credentials_inside_lists_are_redacted(recording_handler):
+    payload = recording_handler._redact({"headers": [{"authorization": "Bearer SECRET"}, {"accept": "json"}]})
+    assert "SECRET" not in str(payload), payload
+    assert payload["headers"][1]["accept"] == "json"
+
+
+def test_verbose_metadata_is_redacted(recording_handler):
+    """Verbose mode attaches raw callback kwargs -- the third path a credential can take."""
+    from eqty_lineage.langchain import EqtyCallbackHandler
+
+    verbose = EqtyCallbackHandler(verbose=True)
+    out = verbose._verbose_metadata({"metadata": {"api_key": "sk-SECRET"}, "tags": ["prod"]})
+    assert "SECRET" not in str(out), out
+    assert recording_handler is not None
+
+
+def test_redaction_keeps_the_key_visible(recording_handler):
+    """A manifest should record that a credential was configured, not silently omit it."""
+    kept = recording_handler._caller_metadata({"api_key": "sk-SECRET"})
+    assert "api_key" in kept
+    assert kept["api_key"] == recording_handler._REDACTED
