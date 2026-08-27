@@ -1,0 +1,510 @@
+"""DeepAgents callback handler that records a deep agent run as EQTY lineage.
+
+Attach one handler to the invocation, exactly as with the LangChain handler it subclasses::
+
+    from eqty_lineage.deepagents import EqtyDeepAgentsHandler
+
+    agent.invoke({"messages": [...]}, config={"callbacks": [EqtyDeepAgentsHandler()]})
+
+Everything the LangChain handler records -- graph nodes, model calls, tool calls, retrievals, subagent
+boundaries, failures -- is recorded here too. This package adds the parts of a deep agent that live in its
+state rather than in its callbacks:
+
+- every file in the virtual filesystem -> a Document asset, versioned by content and chained across edits
+- every revision of the todo list     -> a Dataset asset, chained to the revision it replaced
+- every loaded skill                  -> a Skill asset, carried into the model turn that could use it
+- the agent and each subagent         -> an Agent asset, input to the run it identifies
+- each model turn's system prompt     -> a SystemPrompt asset
+
+``deepagents`` is not imported. Everything here is read from the callback stream and from graph state, so
+the handler works against whatever version of DeepAgents produced the run.
+"""
+
+import hashlib
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
+
+from langchain_core.messages import BaseMessage
+
+from eqty_sdk import CID, Agent, Dataset, Document, Skill, SystemPrompt
+
+from eqty_lineage.langchain import UNCLAIMED, AssetSink, EqtyCallbackHandler, PathExtractor, StateExtractor, eqty_tool
+from eqty_lineage.langchain._serialize import _to_jsonable
+
+from eqty_lineage.deepagents.extractors import SkillExtractor, TodoListExtractor, VirtualFileExtractor
+
+logger = logging.getLogger("eqty.deepagents")
+
+#: DeepAgents filesystem tools whose arguments name a file the call reads or rewrites. The backend applies
+#: its writes through LangGraph's channel API rather than through the tool's return value, so the tool
+#: result never carries the file -- these are the names that say which file a call was about.
+_WRITE_TOOL = "write_file"
+_EDIT_TOOL = "edit_file"
+_FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, "read_file", "delete"})
+
+
+def _digest(value: Any) -> str:
+    """A stable local key for a payload, so a repeat sighting costs no SDK registration."""
+    if not isinstance(value, str):
+        value = json.dumps(value, sort_keys=True, default=str)
+    return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+class EqtyDeepAgentsHandler(EqtyCallbackHandler):
+    """Registers a DeepAgents run as EQTY data assets and computation statements."""
+
+    def __init__(self, verbose: bool = False) -> None:
+        super().__init__(verbose=verbose)
+        # (path, content digest) -> Document CID. Keyed on the contents as well as the path for the same
+        # reason PathExtractor is: a file rewritten mid-run is a different entity, and keying on the path
+        # alone would attest content a later computation never saw.
+        self._file_versions: Dict[Tuple[str, str], CID] = {}
+        # path -> Document CID of its current version, so a rewrite can be chained to what it replaced
+        self._file_latest: Dict[str, CID] = {}
+        # path -> the current content, which is what makes an edit_file result reconstructable; see
+        # _apply_edit. Held only for paths the run has actually seen.
+        self._file_contents: Dict[str, str] = {}
+        # plan digest -> Dataset CID, and the CID of the most recent revision
+        self._todo_versions: Dict[str, CID] = {}
+        self._todo_latest: Optional[CID] = None
+        # (name, identity digest) -> CID, so one skill or agent is registered once per run and two
+        # things wearing the same name but configured differently stay two assets
+        self._skill_cids: Dict[Tuple[str, str], CID] = {}
+        self._agent_cids: Dict[Tuple[str, str], CID] = {}
+        # prompt digest -> CID; a system prompt has no name of its own to key on
+        self._system_prompt_cids: Dict[str, CID] = {}
+        # tool run id -> the filesystem mutation its arguments describe, applied when the call succeeds
+        self._pending_writes: Dict[UUID, Dict[str, Any]] = {}
+        # one-shot outputs for the computation being finalized right now; see _finalize
+        self._pending_outputs: List[CID] = []
+        # True while a tool's arguments are being registered; see registering_tool_arguments
+        self._in_tool_arguments = False
+
+        self.add_extractor(SkillExtractor(self))
+        self.add_extractor(TodoListExtractor(self))
+        self.add_extractor(VirtualFileExtractor(self))
+
+    @property
+    def registering_tool_arguments(self) -> bool:
+        """Whether the value an extractor is being offered came from a tool's arguments.
+
+        The arguments of a call and the state it produces are serialized by the same code, so a state key
+        an extractor claims is indistinguishable by key path from a tool argument of the same name --
+        ``write_todos(todos=[...])`` being exactly that. Claiming it there would register the new plan as
+        an *input* to the call that wrote it, which reverses the one edge the plan's lineage is for.
+        """
+        return self._in_tool_arguments
+
+    ################################################## Registries ##################################################
+    def register_virtual_file(
+        self, path: str, content: str, metadata: Dict[str, Any]
+    ) -> Tuple[Optional[CID], bool, Optional[CID]]:
+        """Register one version of a virtual file, or return the version already registered.
+
+        Returns ``(cid, created, replaced)``: ``created`` says whether this call minted the version, and
+        ``replaced`` is the version it supersedes, which the caller links as an input so successive edits
+        form a chain rather than unrelated assets.
+
+        The path is part of the payload, so the same bytes written to two paths are two files rather than
+        one entity wearing whichever name happened to be registered first.
+        """
+        key = (path, _digest(content))
+        self._file_contents[path] = content
+
+        known = self._file_versions.get(key)
+        if known is not None:
+            # a sighting always shows the file as it is now, so this is the current version even when the
+            # bytes are ones seen before -- a revert chains from what it reverted, not from its ancestor
+            self._file_latest[path] = known
+            return known, False, None
+
+        try:
+            asset = Document.from_object(
+                {"path": path, "content": content},
+                name=path,
+                description=f"File '{path}' in the DeepAgents virtual filesystem.",
+                **metadata,
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register virtual file '%s'", path)
+            return None, False, None
+
+        self._file_versions[key] = asset.cid
+        replaced = self._file_latest.get(path)
+        self._file_latest[path] = asset.cid
+        return asset.cid, True, replaced
+
+    def register_todos(
+        self, todos: List[Dict[str, Any]], metadata: Dict[str, Any]
+    ) -> Tuple[Optional[CID], bool, Optional[CID]]:
+        """Register one revision of the todo list, or return the revision already registered."""
+        key = _digest(todos)
+        known = self._todo_versions.get(key)
+        if known is not None:
+            self._todo_latest = known
+            return known, False, None
+
+        try:
+            asset = Dataset.from_object(
+                _to_jsonable(todos),
+                name="todo list",
+                description="The deep agent's plan, as of this revision.",
+                **metadata,
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register a todo list revision")
+            return None, False, None
+
+        self._todo_versions[key] = asset.cid
+        replaced = self._todo_latest
+        self._todo_latest = asset.cid
+        return asset.cid, True, replaced
+
+    def register_skill(self, entry: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[CID]:
+        """Register a loaded skill from the metadata ``SkillsMiddleware`` parsed out of its ``SKILL.md``.
+
+        Content-addressed to that metadata, so editing a skill's frontmatter produces a different asset and
+        the manifest records which version of the skill the run was given.
+        """
+        payload = _to_jsonable(self._redact(entry))
+        name = str(entry.get("name") or entry.get("path") or "skill")
+        key = (name, _digest(payload))
+        known = self._skill_cids.get(key)
+        if known is not None:
+            return known
+
+        try:
+            asset = Skill.from_object(
+                payload,
+                name=name,
+                description=str(entry.get("description") or f"Skill '{name}' loaded by the deep agent."),
+                **metadata,
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register skill '%s'", name)
+            return None
+
+        self._skill_cids[key] = asset.cid
+        return asset.cid
+
+    def _register_agent(self, name: str, metadata: Optional[Dict[str, Any]], role: str) -> Optional[CID]:
+        """Register the agent a run belongs to.
+
+        A deep agent's root run reports its name in ``lc_agent_name`` and the library versions behind it in
+        ``lc_versions``; a subagent's root run reports its own name the same way. Both are identity rather
+        than position, which is why they are read directly instead of through ``_caller_metadata`` -- that
+        strips every ``lc_*`` key, since most of them do encode a position.
+        """
+        meta = metadata or {}
+        payload: Dict[str, Any] = {"agent": name, "role": role, "framework": self._framework or "deepagents"}
+        versions = meta.get("lc_versions")
+        if isinstance(versions, dict) and versions:
+            payload["versions"] = _to_jsonable(versions)
+        config = self._caller_metadata(meta)
+        if config:
+            payload["config"] = _to_jsonable(config)
+
+        key = (name, _digest(payload))
+        known = self._agent_cids.get(key)
+        if known is not None:
+            return known
+
+        try:
+            asset = Agent.from_object(
+                payload,
+                name=name,
+                description=f"The {role} '{name}'.",
+                **self._verbose_metadata({"callback": "on_chain_start", "metadata": metadata}),
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register agent '%s'", name)
+            return None
+
+        self._agent_cids[key] = asset.cid
+        return asset.cid
+
+    def _register_system_prompt(self, messages: List[List[BaseMessage]], model_name: str) -> Optional[CID]:
+        """Register the system prompt a model turn was given, if it had one.
+
+        The deep agent's prompt is not the string the caller passed: the middleware stack appends its own
+        sections to it -- the skills catalogue, the todo instructions -- so what the model was actually
+        told is only visible here. Content-addressed, so the parent agent's prompt and each subagent's are
+        distinct assets and an unchanged prompt is one asset across the whole run.
+        """
+        system = next(
+            (message for batch in messages for message in batch if getattr(message, "type", None) == "system"),
+            None,
+        )
+        if system is None:
+            return None
+
+        payload = _to_jsonable(system.content)
+        key = _digest(payload)
+        known = self._system_prompt_cids.get(key)
+        if known is not None:
+            return known
+
+        try:
+            asset = SystemPrompt.from_object(
+                payload,
+                name=f"{model_name}: system prompt",
+                description="System prompt the deep agent's middleware stack assembled for this turn.",
+            )
+        except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+            logger.debug("could not register the system prompt for '%s'", model_name)
+            return None
+
+        self._system_prompt_cids[key] = asset.cid
+        return asset.cid
+
+    ################################################## Registries ##################################################
+
+    def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
+        """Fold in any outputs the callback that is finalizing could not put in ``output_cids`` itself.
+
+        A file written by a tool is one: the DeepAgents state backend applies writes through LangGraph's
+        channel API, so the new content is in neither the tool's result nor the enclosing node's output
+        state, and the base handler has nowhere to hang it. ``on_tool_end`` reconstructs it and leaves it
+        here for the ``_finalize`` its own ``super()`` call is about to make -- a single hand-off, made
+        under the handler's lock and cleared in a ``finally``, so it can neither race another callback nor
+        leak into the next computation if registration raises.
+        """
+        if self._pending_outputs:
+            pending, self._pending_outputs = self._pending_outputs, []
+            output_cids = [*output_cids, *(cid for cid in pending if cid not in output_cids)]
+        return super()._finalize(name, kind, input_cids, output_cids)
+
+    ################################################## Chain Calls #################################################
+    def on_chain_start(
+        self,
+        serialized: Dict[str, Any],
+        inputs: Dict[str, Any],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Link the agent a tracked run belongs to into that run's inputs.
+
+        The base handler already decides which runs are worth tracking and which of them are subagent
+        boundaries, so this reads its decision back off the run rather than repeating the rule.
+        """
+        super().on_chain_start(
+            serialized,
+            inputs,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            tags=tags,
+            metadata=metadata,
+            **kwargs,
+        )
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run["kind"] not in ("graph", "agent"):
+                return
+
+            role = "deep agent" if run["kind"] == "graph" else "subagent"
+            agent_cid = self._register_agent(run["name"], metadata, role)
+            if agent_cid is None:
+                return
+            if agent_cid not in run["inputs"]:
+                run["inputs"].append(agent_cid)
+
+            if run["kind"] == "agent":
+                # the subagent spec is also an input to the `task` call that asked for it, which would
+                # otherwise show a subagent's whole run appearing from a tool call that named nothing
+                spawning_tool = self._enclosing_node(parent_run_id)
+                if spawning_tool is not None and agent_cid not in spawning_tool["inputs"]:
+                    spawning_tool["inputs"].append(agent_cid)
+
+    ################################################## Chain Calls #################################################
+
+    ################################################## LLM Calls ###################################################
+    def on_chat_model_start(
+        self,
+        serialized: Dict[str, Any],
+        messages: List[List[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Register the system prompt this turn was given as an input of its own."""
+        super().on_chat_model_start(
+            serialized,
+            messages,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            tags=tags,
+            metadata=metadata,
+            **kwargs,
+        )
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+            prompt_cid = self._register_system_prompt(messages, run["name"])
+            if prompt_cid is not None and prompt_cid not in run["inputs"]:
+                run["inputs"].append(prompt_cid)
+
+    ################################################## LLM Calls ###################################################
+
+    ################################################## Tool Calls ##################################################
+    def on_tool_start(
+        self,
+        serialized: Dict[str, Any],
+        input_str: str,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Link the file a filesystem tool was pointed at, and remember what the call is about to change.
+
+        The file a call reads or rewrites is an input to it: the version being replaced is what the edit
+        was made against, and the version being read is what the model went on to reason from. Neither is
+        visible in the tool's arguments as an asset -- the arguments name a path -- so the link is made
+        from the version registry instead.
+        """
+        with self._lock:
+            self._in_tool_arguments = True
+            try:
+                super().on_tool_start(
+                    serialized,
+                    input_str,
+                    run_id=run_id,
+                    parent_run_id=parent_run_id,
+                    tags=tags,
+                    metadata=metadata,
+                    inputs=inputs,
+                    **kwargs,
+                )
+            finally:
+                self._in_tool_arguments = False
+
+        tool_name = (serialized or {}).get("name", "tool")
+        if tool_name not in _FILE_TOOLS or not isinstance(inputs, dict):
+            return
+        path = inputs.get("file_path")
+        if not isinstance(path, str) or not path:
+            return
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return
+
+            current = self._file_latest.get(path)
+            if current is not None and current not in run["inputs"]:
+                run["inputs"].append(current)
+
+            if tool_name == _WRITE_TOOL and isinstance(inputs.get("content"), str):
+                self._pending_writes[run_id] = {"path": path, "content": inputs["content"]}
+            elif tool_name == _EDIT_TOOL and isinstance(inputs.get("old_string"), str):
+                self._pending_writes[run_id] = {
+                    "path": path,
+                    "old_string": inputs["old_string"],
+                    "new_string": inputs.get("new_string") or "",
+                    "replace_all": bool(inputs.get("replace_all")),
+                }
+
+    def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        """Record the file a successful filesystem call wrote, as an output of that call.
+
+        Without this a written file is an input to every computation that later reads it and an output of
+        none, which in a provenance graph says the run found it already there. It says that because the
+        DeepAgents state backend writes through LangGraph's channel API: the content reaches ``files`` in
+        state without ever passing through the tool's result, so the only place it can be attributed to
+        the call that produced it is here, from the arguments the call was made with.
+        """
+        with self._lock:
+            pending = self._pending_writes.pop(run_id, None)
+            try:
+                if pending is not None:
+                    self._record_write(run_id, pending, output)
+                super().on_tool_end(output, run_id=run_id, **kwargs)
+            finally:
+                # cleared unconditionally: if registration raised, the hand-off must not survive into
+                # whichever computation is finalized next
+                self._pending_outputs = []
+
+    def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        self._pending_writes.pop(run_id, None)
+        super().on_tool_error(error, run_id=run_id, **kwargs)
+
+    def _record_write(self, run_id: UUID, pending: Dict[str, Any], output: Any) -> None:
+        """Register the new version of a written file and hand it to the finalize that follows."""
+        if _is_tool_error(output):
+            return
+
+        path = pending["path"]
+        if "content" in pending:
+            content = pending["content"]
+        else:
+            content = self._apply_edit(path, pending)
+            if content is None:
+                return
+
+        cid, created, replaced = self.register_virtual_file(path, content, self._verbose_metadata({}))
+        if cid is None or not created:
+            return
+
+        run = self._runs.get(run_id)
+        if run is not None and replaced is not None and replaced not in run["inputs"]:
+            run["inputs"].append(replaced)
+        self._pending_outputs.append(cid)
+
+    def _apply_edit(self, path: str, pending: Dict[str, Any]) -> Optional[str]:
+        """The content ``edit_file`` produced, or ``None`` when that cannot be known exactly.
+
+        ``edit_file`` reports only that it succeeded, so the resulting content has to be derived from the
+        version the edit was made against. That is a plain string replacement -- and the same occurrence
+        rules the backend applies are re-checked here, so a case where this would be guessing produces
+        nothing rather than a file version the run never had. The file then registers at its next sighting
+        in state, as an input, which understates its provenance but does not misstate it.
+        """
+        current = self._file_contents.get(path)
+        if current is None:
+            return None
+        old = pending["old_string"]
+        occurrences = current.count(old)
+        if occurrences == 0 or (occurrences > 1 and not pending["replace_all"]):
+            return None
+        return current.replace(old, pending["new_string"])
+
+    ################################################## Tool Calls ##################################################
+
+
+def _is_tool_error(output: Any) -> bool:
+    """Whether a filesystem tool reported a failure in its result rather than by raising.
+
+    DeepAgents' filesystem tools return their errors as ordinary text -- a missing string, an ambiguous
+    match -- so a call that "succeeded" as far as the callbacks are concerned may have changed nothing.
+    """
+    content = getattr(output, "content", output)
+    return isinstance(content, str) and content.lstrip().startswith("Error")
+
+
+__all__ = [
+    "UNCLAIMED",
+    "AssetSink",
+    "EqtyCallbackHandler",
+    "EqtyDeepAgentsHandler",
+    "PathExtractor",
+    "SkillExtractor",
+    "StateExtractor",
+    "TodoListExtractor",
+    "VirtualFileExtractor",
+    "eqty_tool",
+]

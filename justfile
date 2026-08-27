@@ -40,6 +40,10 @@ langchain-diff-demo REF="":
   printf '%s\n%s\n' "$before" "$after" \
     | uv run --no-sync python examples/langchain/diff_demo.py --compare
 
+# Run the DeepAgents research agent and export its lineage to manifests/deep-agent.json
+deepagents-demo *ARGS:
+  uv run --no-sync python examples/deepagents/research_agent.py {{ARGS}}
+
 # Format all Python code in the repo
 fmt:
   ruff format .
