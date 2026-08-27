@@ -10,7 +10,7 @@ passed to the graph via LangChain's callbacks config.
 
 Requires OPENAI_API_KEY.
 
-    uv run python examples/research_agent/main.py "your question"
+    uv run python examples/langchain/research_agent.py "your question"
 """
 
 import argparse
