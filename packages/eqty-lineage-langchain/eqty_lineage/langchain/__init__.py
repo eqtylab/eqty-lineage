@@ -25,6 +25,7 @@ import functools
 import inspect
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -262,7 +263,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._agent_names: Dict[UUID, Optional[str]] = {}
         # which harness produced this run, resolved from run metadata rather than assumed
         self._framework: Optional[str] = None
-        # tool name -> Tool asset CID, so each tool is registered once
+        # tool identity (JSON) -> Tool asset CID, so one tool configuration is registered once
         self._tool_cids: Dict[str, CID] = {}
         # retriever identity (JSON) -> Tool asset CID, so one retriever config is registered once
         self._retriever_cids: Dict[str, CID] = {}
@@ -349,6 +350,42 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     _RUN_SCOPED_METADATA_PREFIXES = ("langgraph_", "ls_", "lc_")
     _RUN_SCOPED_METADATA_KEYS = frozenset({"checkpoint_ns", "thread_id", "run_id", "run_name"})
 
+    #: invocation_params entries that do not describe how the model was asked to sample. The bound tool
+    #: belt is the agent's shape rather than the model's -- and each of those tools is already registered
+    #: as its own asset, so folding their schemas in here would bloat the Model asset and change it every
+    #: time the tool belt does.
+    _NON_SAMPLING_PARAMS = frozenset({"tools", "functions", "model", "model_name", "_type"})
+    #: words that mark a parameter as credential material; asset payloads are stored as blobs. Matched as
+    #: whole words rather than substrings, because `max_completion_tokens` is a sampling knob and not a
+    #: credential -- "tokens" is not "token".
+    _SECRET_PARAM_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "credential", "auth", "bearer"})
+    #: tags the frameworks generate themselves. `seq:step:N` and `graph:step:N` encode a position in a
+    #: sequence or a superstep, so treating them as caller intent would mint a new asset for the same
+    #: thing invoked at a different point in the graph.
+    _FRAMEWORK_TAG_PREFIXES = ("seq:step:", "graph:step:", "map:key:", "langsmith:")
+
+    @classmethod
+    def _is_secret_param(cls, key: str) -> bool:
+        return any(word in cls._SECRET_PARAM_WORDS for word in re.split(r"[^a-z0-9]+", key.lower()))
+
+    @classmethod
+    def _caller_tags(cls, tags: Optional[List[str]]) -> List[str]:
+        """The tags the caller attached, with the frameworks' own positional ones removed."""
+        return sorted(str(tag) for tag in (tags or []) if not str(tag).startswith(cls._FRAMEWORK_TAG_PREFIXES))
+
+    @classmethod
+    def _sampling_params(cls, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The parts of ``invocation_params`` that describe how the model was asked to sample.
+
+        Temperature and the rest change what the model does, so two calls that differ only in sampling are
+        genuinely different computations and must not share a Model asset.
+        """
+        return {
+            key: value
+            for key, value in (params or {}).items()
+            if key not in cls._NON_SAMPLING_PARAMS and not cls._is_secret_param(key)
+        }
+
     @classmethod
     def _caller_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The metadata the caller attached, with the frameworks' own run-scoped keys removed."""
@@ -380,8 +417,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         config = self._caller_metadata(metadata)
         if config:
             identity["config"] = _to_jsonable(config)
-        if tags:
-            identity["tags"] = sorted(str(t) for t in tags)
+        retriever_tags = self._caller_tags(tags)
+        if retriever_tags:
+            identity["tags"] = retriever_tags
 
         return identity
 
@@ -719,8 +757,19 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             ),
         )
 
+        model_payload: Dict[str, Any] = {"model": model_name, "provider": provider}
+        sampling = self._sampling_params(params)
+        if sampling:
+            model_payload["params"] = _to_jsonable(sampling)
+        model_config = self._caller_metadata(metadata)
+        if model_config:
+            model_payload["config"] = _to_jsonable(model_config)
+        model_tags = self._caller_tags(tags)
+        if model_tags:
+            model_payload["tags"] = model_tags
+
         model = Model.from_object(
-            {"model": model_name, "provider": provider},
+            model_payload,
             name=model_name,
             **self._verbose_metadata(
                 {
@@ -804,12 +853,32 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         logger.debug(run_id)
         tool_name = (serialized or {}).get("name", "tool")
 
-        if tool_name not in self._tool_cids:
-            # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
-            # an undecorated tool falls back to a name/description stub
-            source = _registered_tool_sources.get(tool_name)
+        # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
+        # an undecorated tool falls back to a name/description stub. Either way, configuration the caller
+        # attached with `with_config` identifies *this* tool as opposed to another of the same name, so it
+        # is folded in -- and the payload becomes a mapping, since a bare source string has nowhere to put
+        # it. A tool with nothing attached keeps the source-as-payload shape it has always had.
+        source = _registered_tool_sources.get(tool_name)
+        tool_config = self._caller_metadata(metadata)
+        tool_tags = self._caller_tags(tags)
+
+        if tool_config or tool_tags:
+            tool_payload: Any = {"tool": tool_name}
+            if source is not None:
+                tool_payload["source"] = source
+            if tool_config:
+                tool_payload["config"] = _to_jsonable(tool_config)
+            if tool_tags:
+                tool_payload["tags"] = tool_tags
+        else:
+            tool_payload = source if source is not None else {"name": tool_name}
+
+        # keyed on the payload, so one name configured two ways registers as two assets
+        tool_key = json.dumps(tool_payload, sort_keys=True, default=str)
+
+        if tool_key not in self._tool_cids:
             tool_asset = Tool.from_object(
-                source if source is not None else {"name": tool_name},
+                tool_payload,
                 name=tool_name,
                 description=(serialized or {}).get("description", ""),
                 **self._verbose_metadata(
@@ -823,7 +892,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                     }
                 ),
             )
-            self._tool_cids[tool_name] = tool_asset.cid
+            self._tool_cids[tool_key] = tool_asset.cid
 
         tool_input, carried, created = self._register_state(
             inputs if inputs is not None else input_str,
@@ -839,7 +908,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             },
         )
 
-        input_cids = [self._tool_cids[tool_name], tool_input.cid, *carried, *created]
+        input_cids = [self._tool_cids[tool_key], tool_input.cid, *carried, *created]
 
         node = self._enclosing_node(parent_run_id)
         if node is not None:

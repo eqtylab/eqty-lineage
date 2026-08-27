@@ -69,6 +69,34 @@ Notes:
 `examples/langchain/diff_demo.py` registers its tools against whichever handler module it is about to run,
 rather than decorating them once at import time
 
+## What identifies a model, a tool, a retriever
+
+Each is content-addressed to what identifies it, not merely to its name — otherwise two things that behave
+differently share one asset.
+
+**Models** carry their sampling parameters from `invocation_params`, so a call at `temperature=1.9` is a
+different asset from one at `temperature=0.0`. Bound tool schemas are excluded (the tool belt is the agent's
+shape, and each tool is its own asset already), as is anything whose name reads as credential material —
+matched on whole words, so `max_completion_tokens` survives and `auth_token` does not.
+
+**Tools** keep the source-as-payload shape when nothing is attached. Attach configuration and the payload
+becomes a mapping carrying the source alongside it, so one tool name pointed at staging and at production is
+two assets.
+
+**Retrievers** fold in whatever you attach, because a class name alone cannot tell two corpora apart.
+
+For all three, anything you attach with `with_config` is folded in:
+
+```python
+retriever.with_config(run_name="legal-index", metadata={"index": "pinecone://legal-v3"})
+model.with_config(tags=["prod"], metadata={"deployment": "eu-west"})
+```
+
+The frameworks' own run-scoped keys are excluded, since folding them in would mint a new asset on every call
+rather than identify the thing invoked: `langgraph_*`, `ls_*`, `lc_*` and `checkpoint_ns` in metadata, and
+`seq:step:N`, `graph:step:N`, `map:key:*`, `langsmith:*` in tags — those last encode a *position*, so keeping
+them would give the same tool a different asset depending on where in the graph it was called.
+
 ## What lands on each computation
 
 Every computation statement carries a `framework` tag, read from the run's own metadata rather than assumed:
