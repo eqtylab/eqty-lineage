@@ -115,3 +115,21 @@ def test_wide_fan_out(recording_handler, branches):
     end_in = set(recording_handler.inputs_of("end"))
     for i in range(branches):
         assert set(recording_handler.outputs_of(f"n{i}")) <= end_in, f"branch n{i} was dropped"
+
+
+def test_untracked_chain_runs_do_not_accumulate(recording_handler):
+    """Every chain run gets an _agent_names entry at start; most chain runs are never tracked.
+
+    LangGraph emits far more internal runs (channel reads, task wrappers) than nodes, so releasing this
+    only on the tracked path left the dict growing for the length of the session.
+    """
+    from langchain_core.runnables import RunnableLambda
+
+    # a deliberately nested chain, so plenty of runs start and are never tracked
+    chain = RunnableLambda(lambda x: x + 1) | RunnableLambda(lambda x: x * 2) | RunnableLambda(str)
+    for _ in range(5):
+        chain.invoke(1, config={"callbacks": [recording_handler]})
+
+    assert recording_handler._agent_names == {}, recording_handler._agent_names
+    assert recording_handler._runs == {}
+    assert recording_handler._parents == {}

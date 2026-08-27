@@ -29,16 +29,16 @@ clean:
 test *ARGS:
   uv run --no-sync pytest {{ARGS}}
 
-# Compare the lineage the handler produces now against a released one (default: newest release tag)
-demo REF="":
+# Compare the LangChain lineage the handler produces now against a released one (default: newest tag)
+langchain-diff-demo REF="":
   #!/usr/bin/env bash
   set -euo pipefail
   # three processes: eqty_sdk.init() is process-global and raises on a second call, so the two runs
   # cannot share one, and the comparison reads both summaries from stdin rather than from disk
-  before=$(uv run --no-sync python examples/lineage_diff_demo.py --baseline {{REF}})
-  after=$(uv run --no-sync python examples/lineage_diff_demo.py)
+  before=$(uv run --no-sync python examples/langchain/diff_demo.py --baseline {{REF}})
+  after=$(uv run --no-sync python examples/langchain/diff_demo.py)
   printf '%s\n%s\n' "$before" "$after" \
-    | uv run --no-sync python examples/lineage_diff_demo.py --compare
+    | uv run --no-sync python examples/langchain/diff_demo.py --compare
 
 # Format all Python code in the repo
 fmt:

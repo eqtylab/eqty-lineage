@@ -5,8 +5,8 @@ replies are byte-identical between the two runs -- the model is scripted rather 
 difference in the exported manifest is attributable to the handler and nothing else. A live model would
 make the two runs incomparable, which is exactly what a before/after demo must not do.
 
-    just demo                       # working tree vs. the most recent release tag
-    just demo eqty-lineage-langchain@0.0.1   # ...or any ref you name
+    just langchain-diff-demo        # working tree vs. the most recent release tag
+    just langchain-diff-demo eqty-lineage-langchain@0.0.1   # ...or any ref you name
 
 writes ``manifests/before.json`` and ``manifests/after.json``, then prints the comparison. Load the two
 manifests side by side in the graph explorer to see the topology differ.
@@ -17,13 +17,18 @@ comparison against whichever version happened to be current the day it was writt
 
 The graph is a document-review agent that exercises five of the ten defects at once::
 
-    START -> draft -> checkpoint -> {verify_a, verify_b} -> revise -> publish -> END
+    START -> research -> draft -> checkpoint -> {verify_a, verify_b} -> consult -> revise -> publish -> END
 
 - ``draft`` writes report.md, ``revise`` rewrites it, ``publish`` reads it   (D10)
 - ``checkpoint`` returns None, the way LangChain middleware signals no update (D1)
 - ``verify_a`` and ``verify_b`` run in one superstep, in parallel            (D9)
 - ``verify_a`` calls a model from inside a tool                              (D2)
 - ``verify_b`` calls a tool that raises                                      (D7)
+- ``research`` retrieves from a fixed corpus                                 (D6)
+- ``consult`` delegates to a subagent through a tool, as `task` does         (D3)
+
+Every tool is registered with ``eqty_tool``, so its Tool asset is content-addressed to its own source
+rather than to a name stub -- edit a tool here and its asset CID changes on the next run.
 """
 
 import argparse
@@ -38,8 +43,10 @@ from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 from eqty_sdk import Context, Signer, init, set_active_signer
+from langchain_core.documents import Document as LCDocument
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.retrievers import BaseRetriever
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 
@@ -61,21 +68,26 @@ def latest_release_ref() -> str:
     if not tags:
         raise DemoError(
             "no eqty-lineage-langchain@* tag found to use as a baseline. Fetch tags with "
-            "`git fetch --tags`, or name a ref explicitly: just demo <ref>"
+            "`git fetch --tags`, or name a ref explicitly: just langchain-diff-demo <ref>"
         )
     return tags[0]
 
 
 def load_handler(ref: str | None):
-    """Import the handler under test: the working tree's, or the one at ``ref``.
+    """Import the handler module under test: the working tree's, or the one at ``ref``.
 
     Read out of git and loaded from a file rather than by swapping the checkout, so one command can run
     both and the baseline is whatever was released rather than whatever is lying around locally.
+
+    Returns the whole module, not just the class, because ``eqty_tool`` records tool sources in
+    module-level state. A separately-loaded baseline gets its own copy of that registry, so the tools have
+    to be registered against whichever module is about to observe them -- decorating them once at import
+    time would instrument only the working-tree run and invent a difference the handler never caused.
     """
     if ref is None:
-        from eqty_lineage.langchain import EqtyCallbackHandler
+        import eqty_lineage.langchain as module
 
-        return EqtyCallbackHandler
+        return module
 
     result = subprocess.run(
         ["git", "show", f"{ref}:{HANDLER_PATH}"],
@@ -96,7 +108,7 @@ def load_handler(ref: str | None):
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.EqtyCallbackHandler
+        return module
     except Exception as exc:
         raise DemoError(
             f"the handler at '{ref}' no longer imports against the installed dependencies "
@@ -121,12 +133,49 @@ def check_links(text: str) -> str:
     raise RuntimeError("link checker unavailable")
 
 
+class SourceLibrary(BaseRetriever):
+    """A fixed corpus, so the retrieved documents are the same on every run."""
+
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        return [
+            LCDocument(page_content="CIDs are self-describing hashes.", metadata={"source": "cid.md"}),
+            LCDocument(page_content="Lineage links inputs to outputs.", metadata={"source": "lineage.md"}),
+        ]
+
+
+def _specialist_graph():
+    """A second agent, invoked through a tool the way DeepAgents' `task` invokes a subagent."""
+
+    class SpecialistState(TypedDict):
+        findings: Annotated[list, lambda a, b: a + b]
+
+    graph = StateGraph(SpecialistState)
+    graph.add_node("assess", lambda state: {"findings": ["specialist: the sources check out"]})
+    graph.add_edge(START, "assess")
+    graph.add_edge("assess", END)
+    return graph.compile()
+
+
+SPECIALIST = _specialist_graph()
+
+
+@tool
+def consult_specialist(question: str) -> str:
+    """Delegate to a specialist subagent, the way DeepAgents' `task` tool does."""
+    out = SPECIALIST.invoke({"findings": []}, config={"metadata": {"lc_agent_name": "specialist"}})
+    return f"consulted -> {'; '.join(out['findings'])}"
+
+
 class ReviewState(TypedDict):
     notes: Annotated[list, lambda a, b: a + b]
     report: Path
 
 
 def build_graph(report: Path):
+    def research(state: ReviewState) -> dict:
+        docs = SourceLibrary().invoke("what is lineage")
+        return {"notes": [f"researched {len(docs)} sources"], "report": report}
+
     def draft(state: ReviewState) -> dict:
         report.write_text("# Report\n\nInitial draft.\n")
         return {"notes": ["drafted"], "report": report}
@@ -147,6 +196,9 @@ def build_graph(report: Path):
             return {"notes": [f"link check failed: {exc}"]}
         return {"notes": ["links ok"]}
 
+    def consult(state: ReviewState) -> dict:
+        return {"notes": [consult_specialist.invoke({"question": "are the sources sound?"})]}
+
     def revise(state: ReviewState) -> dict:
         report.write_text("# Report\n\nRevised draft, now with sources.\n")
         return {"notes": ["revised"], "report": report}
@@ -156,21 +208,25 @@ def build_graph(report: Path):
 
     graph = StateGraph(ReviewState)
     for name, fn in (
+        ("research", research),
         ("draft", draft),
         ("checkpoint", checkpoint),
         ("verify_a", verify_a),
         ("verify_b", verify_b),
+        ("consult", consult),
         ("revise", revise),
         ("publish", publish),
     ):
         graph.add_node(name, fn)
 
-    graph.add_edge(START, "draft")
+    graph.add_edge(START, "research")
+    graph.add_edge("research", "draft")
     graph.add_edge("draft", "checkpoint")
     graph.add_edge("checkpoint", "verify_a")
     graph.add_edge("checkpoint", "verify_b")
-    graph.add_edge("verify_a", "revise")
-    graph.add_edge("verify_b", "revise")
+    graph.add_edge("verify_a", "consult")
+    graph.add_edge("verify_b", "consult")
+    graph.add_edge("consult", "revise")
     graph.add_edge("revise", "publish")
     graph.add_edge("publish", END)
     return graph.compile()
@@ -180,7 +236,14 @@ def build_graph(report: Path):
 
 
 def run(ref: str | None, out: Path) -> dict:
-    handler_cls = load_handler(ref)
+    handler_module = load_handler(ref)
+    handler_cls = handler_module.EqtyCallbackHandler
+
+    # Content-address each Tool asset to its implementation rather than a name stub, so editing a tool
+    # shows up in the lineage as a changed asset. Applied here rather than as an import-time decorator;
+    # see load_handler.
+    for tool_obj in (critique, check_links, consult_specialist):
+        handler_module.eqty_tool(tool_obj)
     # a release tag reads as its version; anything else (a sha, a branch) is shown abbreviated
     shown = ref.split("@")[-1] if ref else ""
     label = f"baseline ({shown[:12]})" if ref else "working tree"
@@ -268,6 +331,9 @@ def run(ref: str | None, out: Path) -> dict:
         "orphaned_outputs": [name for name, _ in orphans],
         "file_versions_registered": tracked,
         "swallowed_exceptions": sorted(set(swallowed)),
+        "retrievals": sum(1 for c in recorded if c["kind"] == "retriever"),
+        "documents_registered": sum(len(c["outputs"]) for c in recorded if c["kind"] == "retriever"),
+        "subagents": sorted(c["name"] for c in recorded if c["kind"] == "agent"),
         "publish_linked_to_current_bytes": current_content in publish_inputs,
     }
     return summary
@@ -288,6 +354,9 @@ def compare(stream) -> None:
             "; ".join(a["swallowed_exceptions"]) or "none",
         ),
         ("computations recorded", b["computations"], a["computations"]),
+        ("retrievals recorded", b["retrievals"], a["retrievals"]),
+        ("documents registered", b["documents_registered"], a["documents_registered"]),
+        ("subagents recorded", ", ".join(b["subagents"]) or "none", ", ".join(a["subagents"]) or "none"),
         ("graph nodes present", ", ".join(b["node_names"]) or "-", ", ".join(a["node_names"]) or "-"),
         ("computation kinds", ", ".join(b["kinds"]), ", ".join(a["kinds"])),
         (

@@ -17,7 +17,7 @@ registered EQTY assets.
 
 Requires OPENAI_API_KEY.
 
-    uv run python examples/multi_tool_example.py "your question" [--debug]
+    uv run python examples/langchain/travel_agent.py "your question" [--debug]
 """
 
 import argparse

@@ -14,14 +14,21 @@ The handler listens to the runs LangGraph emits and turns them into EQTY lineage
 ``pathlib.Path`` values in graph state get special treatment: if the path exists on disk, the file or directory it
 points to is registered as its own Dataset asset via ``Dataset.from_path`` (CIDing the full directory contents), and
 that asset is linked into the computation that carried the path.
+
+That treatment is one :class:`StateExtractor` -- :class:`PathExtractor` -- and more can be registered with
+``add_extractor``. An extractor claims part of a state, registers whatever assets represent it, and replaces it in the
+bulk state blob, which is how a framework package teaches this handler about its own state without this package
+having to know the framework exists.
+
+The module is split by concern: ``_serialize`` turns LangChain values into plain JSON, ``_tools`` captures tool
+source at definition time, ``extractors`` holds the extension point, and this file holds the handler itself.
 """
 
 import functools
-import inspect
 import json
 import logging
+import re
 import threading
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -29,81 +36,15 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Dataset, Model, Prompt, Reasoning, Tool, get_cid_for_path
+from eqty_sdk import CID, Dataset, Document, Model, Prompt, Reasoning, Tool
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
 
+from eqty_lineage.langchain._serialize import UNCLAIMED, _to_jsonable
+from eqty_lineage.langchain._tools import _registered_tool_sources, eqty_tool
+from eqty_lineage.langchain.extractors import AssetSink, PathExtractor, StateExtractor
+
 logger = logging.getLogger("eqty.langgraph")
-
-
-def _to_jsonable(obj: Any, on_path: Optional[Callable[[Path], None]] = None) -> Any:
-    """Convert LangChain/LangGraph values into plain JSON-serializable data.
-
-    ``on_path`` is invoked for every existing ``pathlib.Path`` encountered, so the caller can register the
-    file/directory as its own EQTY asset.
-    """
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, Path):
-        if on_path is not None and obj.exists():
-            on_path(obj)
-        return str(obj)
-    if isinstance(obj, BaseMessage):
-        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content, on_path)}
-        tool_calls = getattr(obj, "tool_calls", None)
-        if tool_calls:
-            data["tool_calls"] = _to_jsonable(tool_calls, on_path)
-        usage = getattr(obj, "usage_metadata", None)
-        if usage:
-            data["usage"] = _to_jsonable(usage, on_path)
-        return data
-    if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v, on_path) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_jsonable(item, on_path) for item in obj]
-    if type(obj).__name__ == "Command":
-        # A LangGraph Command carries the state update a tool applied -- which is the whole payload of
-        # DeepAgents' `task` tool, including any files the subagent wrote. Falling through to str() below
-        # would record it as an opaque blob. Duck-typed on the class name because this package depends on
-        # langchain-core alone and must not import langgraph.
-        command = {
-            field: _to_jsonable(getattr(obj, field), on_path)
-            for field in ("update", "goto", "graph", "resume")
-            if getattr(obj, field, None) is not None
-        }
-        if command:
-            return {"command": command}
-    if hasattr(obj, "model_dump"):
-        try:
-            return _to_jsonable(obj.model_dump(), on_path)
-        except Exception:  # noqa: BLE001 - best-effort serialization
-            pass
-    return str(obj)
-
-
-# tool name -> Python source captured by @eqty_tool, read by every EqtyCallbackHandler instance
-_registered_tool_sources: Dict[str, str] = {}
-
-
-def eqty_tool(obj: Any) -> Any:
-    """Capture a tool function's source code so ``EqtyCallbackHandler`` registers the Tool asset from it.
-
-    Callbacks only receive a tool's *name* at runtime, so the source must be recorded at definition time.
-    Returns ``obj`` unchanged and works on either side of LangChain's ``@tool`` decorator::
-
-        @tool
-        @eqty_tool
-        def search(query: str) -> str: ...
-    """
-    # when stacked outside @tool, obj is a StructuredTool holding the original fn in .func/.coroutine
-    fn = getattr(obj, "func", None) or getattr(obj, "coroutine", None) or obj
-    name = getattr(obj, "name", None) or getattr(fn, "__name__", None)
-    if name is not None:
-        try:
-            _registered_tool_sources[name] = inspect.getsource(fn)
-        except (OSError, TypeError):
-            logger.debug("no source available for tool '%s'", name)
-    return obj
 
 
 def _synchronized(method: Callable) -> Callable:
@@ -144,16 +85,23 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._sibling_outputs: Dict[Optional[UUID], Dict[int, List[CID]]] = {}
         # parent run id -> synthetic step counter, for runs LangGraph gives no langgraph_step
         self._fallback_steps: Dict[Optional[UUID], int] = {}
+        # run_id -> the agent that run belongs to, inherited from its parent when it names none of its own.
+        # A nested run that names a *different* agent is a subagent boundary; see _agent_boundary.
+        self._agent_names: Dict[UUID, Optional[str]] = {}
         # which harness produced this run, resolved from run metadata rather than assumed
         self._framework: Optional[str] = None
-        # tool name -> Tool asset CID, so each tool is registered once
+        # tool identity (JSON) -> Tool asset CID, so one tool configuration is registered once
         self._tool_cids: Dict[str, CID] = {}
+        # retriever identity (JSON) -> Tool asset CID, so one retriever config is registered once
+        self._retriever_cids: Dict[str, CID] = {}
         # (resolved path, content CID) -> Dataset CID. Keyed on the *contents* as well as the path: the same
         # bytes at the same path are one entity, but rewritten bytes are a new version, and keying on the path
         # alone would attest the previous content for every computation that ran after the change.
         self._path_versions: Dict[Tuple[str, str], CID] = {}
         # resolved path -> Dataset CID of its most recent version, so a rewrite can be linked to what it replaced
         self._path_latest: Dict[str, CID] = {}
+        # consulted in order for every value in a state; see add_extractor
+        self._extractors: List[StateExtractor] = [PathExtractor(self)]
 
     ##################################################   Helpers   #################################################
     # kwargs the SDK asset constructors claim for themselves; verbose metadata must not shadow them
@@ -174,7 +122,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if not self.verbose:
             return {}
         out: Dict[str, Any] = {}
-        for key, value in fields.items():
+        # verbose mode attaches raw callback kwargs, which is the third path a credential can take
+        for key, value in self._redact(fields).items():
             safe_key = key
             while safe_key in self._RESERVED_SDK_KWARGS or safe_key in out:
                 safe_key = f"LC-{safe_key}"
@@ -182,24 +131,25 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             out[safe_key] = jsonable if isinstance(jsonable, (str, int, float, bool)) else json.dumps(jsonable)
         return out
 
+    def add_extractor(self, extractor: StateExtractor) -> None:
+        """Teach the handler to lift something out of graph state into assets of its own.
+
+        Extractors are consulted newest-first -- each is inserted at the front -- and the first to claim a
+        value wins, so a subclass's own extractor takes precedence over the built-in :class:`PathExtractor`.
+        """
+        with self._lock:
+            self._extractors.insert(0, extractor)
+
     def _register_state(
         self, obj: Any, name: str, description: str, extra: Optional[Dict[str, Any]] = None
     ) -> Tuple[Dataset, List[CID], List[CID]]:
-        """Register ``obj`` as a Dataset; existing Paths inside it become their own assets.
+        """Register ``obj`` as a Dataset, after the extractors have taken what they own.
 
-        Returns ``(state_asset, carried_path_cids, created_path_cids)``. A path whose contents this run has not
-        seen before is a new version *created* by the current computation; a path whose exact bytes are already
-        registered is merely *carried* through the state and must be linked as an input, never re-emitted as an
-        output (which would create a cycle in the lineage graph).
-
-        Versions are keyed on ``(path, content CID)``, not on the path alone. A file that is rewritten between two
-        nodes is a genuinely different entity, and reusing the first sighting's asset would attest content that the
-        later computation never saw. The cost is re-hashing each path per sighting, which is what
-        ``Dataset.from_path`` would do anyway on a miss.
+        Returns ``(state_asset, carried_cids, created_cids)``. Carried assets already existed and are
+        linked as inputs; created ones were produced here and become outputs. Never both: re-emitting a
+        carried asset as an output puts a cycle in the graph.
         """
-        carried: List[CID] = []
-        created: List[CID] = []
-        extra = self._verbose_metadata(extra or {})
+        sink = AssetSink(self._verbose_metadata(extra or {}))
 
         if obj is None:
             # LangChain middleware nodes return None to mean "no state update", and the SDK cannot hash
@@ -207,42 +157,133 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             # single shared empty sentinel would make unrelated nodes converge on one entity in the graph.
             obj = {"state_update": None, "produced_by": name}
 
-        def collect(path: Path) -> None:
-            key = str(path.resolve())
-            try:
-                content_cid = str(get_cid_for_path(path))
-            except Exception:  # noqa: BLE001 - an unreadable path must not take down the run being observed
-                logger.debug("could not compute a content CID for '%s'; skipping", path)
-                return
+        def dispatch(key_path: Tuple[str, ...], value: Any) -> Any:
+            for extractor in self._extractors:
+                try:
+                    claimed = extractor.extract(key_path, value, sink)
+                except Exception:  # noqa: BLE001 - a broken extractor must not take down the run
+                    logger.debug("extractor %s failed at %s", type(extractor).__name__, key_path)
+                    continue
+                if claimed is not UNCLAIMED:
+                    return claimed
+            return UNCLAIMED
 
-            known = self._path_versions.get((key, content_cid))
-            if known is not None:
-                if known not in carried and known not in created:
-                    carried.append(known)
-                return
+        payload = _to_jsonable(obj, on_value=dispatch)
+        asset = Dataset.from_object(payload, name=name, description=description, **sink.metadata)
 
-            asset = Dataset.from_path(
-                path,
-                name=path.name,
-                description=f"Filesystem asset referenced by LangGraph state: '{path}'.",
-                **extra,
-            )
-            self._path_versions[(key, content_cid)] = asset.cid
+        return asset, sink.carried, sink.created
 
-            # the version this one replaced is an input to whatever produced it, which is what makes the
-            # successive versions of a file a chain in the graph rather than unrelated assets
-            previous = self._path_latest.get(key)
-            if previous is not None and previous not in carried and previous not in created:
-                carried.append(previous)
-            self._path_latest[key] = asset.cid
+    #: metadata the frameworks stamp on every run; scoped to one invocation, so including it in an asset
+    #: payload would mint a new asset on each call rather than identifying the thing being invoked
+    _RUN_SCOPED_METADATA_PREFIXES = ("langgraph_", "ls_", "lc_")
+    _RUN_SCOPED_METADATA_KEYS = frozenset({"checkpoint_ns", "thread_id", "run_id", "run_name"})
 
-            if asset.cid not in created:
-                created.append(asset.cid)
+    #: invocation_params entries that do not describe how the model was asked to sample. The bound tool
+    #: belt is the agent's shape rather than the model's -- and each of those tools is already registered
+    #: as its own asset, so folding their schemas in here would bloat the Model asset and change it every
+    #: time the tool belt does.
+    _NON_SAMPLING_PARAMS = frozenset({"tools", "functions", "model", "model_name", "_type"})
+    #: Words that mark a parameter as credential material. Matched as whole words, because
+    #: `max_completion_tokens` is a sampling knob and not a credential -- "tokens" is not "token".
+    _SECRET_PARAM_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "passwd", "pwd", "auth", "bearer"})
+    #: Stems for which no ordinary parameter shares the prefix, so a prefix match is safe and catches the
+    #: inflections whole-word matching misses -- `authorization` is the standard header name for a
+    #: credential, and is not the word "auth". Deliberately excludes anything that would swallow "author".
+    _SECRET_PARAM_STEMS = ("secret", "password", "credential", "authoriz", "apikey", "privatekey")
+    #: tags the frameworks generate themselves. `seq:step:N` and `graph:step:N` encode a position in a
+    #: sequence or a superstep, so treating them as caller intent would mint a new asset for the same
+    #: thing invoked at a different point in the graph.
+    _FRAMEWORK_TAG_PREFIXES = ("seq:step:", "graph:step:", "map:key:", "langsmith:")
 
-        payload = _to_jsonable(obj, on_path=collect)
-        asset = Dataset.from_object(payload, name=name, description=description, **extra)
+    #: stands in for a redacted value, so a manifest records that a credential was configured without
+    #: recording the credential. Constant on purpose: two runs differing only in their key are the same
+    #: computation, and folding the key into the CID would both leak it and split the asset.
+    _REDACTED = "[redacted]"
 
-        return asset, carried, created
+    @classmethod
+    def _is_secret_param(cls, key: str) -> bool:
+        """Whether a parameter name reads as credential material.
+
+        Two rules, because neither alone is right. Whole-word matching keeps `max_completion_tokens` --
+        "tokens" is not "token" -- but misses `authorization`, which is not the word "auth". Prefix matching
+        catches that, but only for stems no ordinary parameter shares, so `author` is not mistaken for one.
+        """
+        words = re.split(r"[^a-z0-9]+", key.lower())
+        if any(word in cls._SECRET_PARAM_WORDS for word in words):
+            return True
+        return any(word.startswith(cls._SECRET_PARAM_STEMS) for word in words)
+
+    @classmethod
+    def _redact(cls, value: Any, key: Optional[str] = None) -> Any:
+        """Replace credential-named values anywhere inside ``value``.
+
+        Applied to everything that can reach an asset payload, and applied *recursively*: a caller can nest
+        configuration arbitrarily -- ``extra_body={"api_key": ...}`` is the obvious one -- so checking only
+        the keys at the top of a mapping lets the interesting cases through. Asset payloads are stored as
+        blobs, so a leak here is a credential written to disk and content-addressed.
+        """
+        if key is not None and cls._is_secret_param(key):
+            return cls._REDACTED
+        if isinstance(value, dict):
+            return {k: cls._redact(v, str(k)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._redact(item) for item in value]
+        return value
+
+    @classmethod
+    def _caller_tags(cls, tags: Optional[List[str]]) -> List[str]:
+        """The tags the caller attached, with the frameworks' own positional ones removed."""
+        return sorted(str(tag) for tag in (tags or []) if not str(tag).startswith(cls._FRAMEWORK_TAG_PREFIXES))
+
+    @classmethod
+    def _sampling_params(cls, params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The parts of ``invocation_params`` that describe how the model was asked to sample.
+
+        Temperature and the rest change what the model does, so two calls that differ only in sampling are
+        genuinely different computations and must not share a Model asset.
+        """
+        # redacted rather than dropped: a nested `extra_body` may hold both a credential and real
+        # configuration, so the structure has to survive with the secret removed from inside it
+        return cls._redact({key: value for key, value in (params or {}).items() if key not in cls._NON_SAMPLING_PARAMS})
+
+    @classmethod
+    def _caller_metadata(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The metadata the caller attached, with the frameworks' own run-scoped keys removed."""
+        return cls._redact(
+            {
+                key: value
+                for key, value in (metadata or {}).items()
+                if not key.startswith(cls._RUN_SCOPED_METADATA_PREFIXES) and key not in cls._RUN_SCOPED_METADATA_KEYS
+            }
+        )
+
+    def _retriever_identity(
+        self, name: str, metadata: Optional[Dict[str, Any]], tags: Optional[List[str]]
+    ) -> Dict[str, Any]:
+        """What identifies this retriever, as opposed to what it returned.
+
+        A retriever is a class pointed at a corpus, and the class name alone cannot tell two of them
+        apart -- the same wrapper aimed at a different index looks identical. Whatever the caller attached
+        via ``with_config`` is therefore folded in, so a manifest records *which* corpus was consulted and
+        not merely that something was.
+
+        ``ls_retriever_name`` is the class, stable even when ``run_name`` renames the run; ``name`` is what
+        this run called it. Both are kept rather than guessing which is which.
+        """
+        identity: Dict[str, Any] = {"retriever": name}
+
+        class_name = (metadata or {}).get("ls_retriever_name")
+        if class_name:
+            identity["class"] = str(class_name)
+
+        config = self._caller_metadata(metadata)
+        if config:
+            identity["config"] = _to_jsonable(config)
+        retriever_tags = self._caller_tags(tags)
+        if retriever_tags:
+            identity["tags"] = retriever_tags
+
+        return identity
 
     def _note_framework(self, metadata: Optional[Dict[str, Any]]) -> None:
         """Record which harness produced this run, the first time a run says so.
@@ -297,6 +338,23 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         Metadata(name=name, computation_type=kind, framework=self._framework or "langchain").create_statement(
             statement_ids[0], None, None
         )
+
+    def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
+        """Record a failed activity and link it to whatever was waiting on it.
+
+        Every ``on_*_error`` funnels through here, so all four behave alike. The enclosing activity observed
+        the failure whether or not it recovered from one: LangGraph's ``ToolNode`` re-raises by default and
+        the node dies with it, but a ``ToolInvocationError``, a configured ``handle_tool_errors``, or a retry
+        middleware all leave the caller alive and holding the error. When the caller does die, its own error
+        computation is built from its inputs and the link simply goes unused -- so linking is right in the
+        first case and harmless in the second.
+        """
+        if run is None:
+            return
+        failure = self._finalize_error(run, error)
+        enclosing = run.get("node")
+        if failure is not None and enclosing is not None:
+            enclosing.setdefault("child_outputs", []).append(failure)
 
     def _finalize_error(self, run: Dict[str, Any], error: BaseException) -> Optional[CID]:
         """Record a failed activity instead of erasing it.
@@ -353,6 +411,31 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         """Drop the per-parent bookkeeping a finished run owned, so a long session does not accumulate it."""
         self._sibling_outputs.pop(run_id, None)
         self._fallback_steps.pop(run_id, None)
+        self._agent_names.pop(run_id, None)
+
+    def _agent_boundary(
+        self, run_id: UUID, parent_run_id: Optional[UUID], metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Return this run's agent name if it starts a *new* agent, else None.
+
+        This is LangChain's own rule, from ``langchain.agents._subagent_transformer``: a subagent boundary
+        is a nested run whose ``lc_agent_name`` is set and differs from its parent's. Plain subgraphs
+        inherit the parent's name and are excluded, which is what keeps every internal LangGraph run from
+        being mistaken for an agent.
+
+        Without this a DeepAgents subagent is invisible: its root run carries the subagent's name but
+        inherits ``langgraph_node`` from the ``task`` tool that spawned it, so it matches neither the node
+        rule nor the root rule, and its internal work is never linked to the call that asked for it.
+        """
+        own = (metadata or {}).get("lc_agent_name")
+        inherited = self._agent_names.get(parent_run_id) if parent_run_id is not None else None
+        self._agent_names[run_id] = own or inherited
+
+        if not isinstance(own, str) or not own:
+            return None
+        if parent_run_id is None:
+            return None  # the trace root is handled as the graph itself
+        return own if own != inherited else None
 
     def _enclosing_node(self, parent_run_id: Optional[UUID]) -> Optional[Dict[str, Any]]:
         """Walk up the run tree to the nearest tracked node (or graph) run to get a node so we can link the graph."""
@@ -397,13 +480,20 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         name = kwargs.get("name") or (serialized or {}).get("name")
         is_node = node is not None and name == node
         is_graph = parent_run_id is None
+        subagent = self._agent_boundary(run_id, parent_run_id, metadata)
 
-        if not (is_node or is_graph):
-            logger.info("is_node and is_graph are None")
+        if not (is_node or is_graph or subagent):
+            logger.debug("untracked chain run %s (%s)", run_id, name)
             return
 
-        # an unnamed graph reports itself as "LangGraph"; lc_agent_name is the agent's own name when set
-        label = node if is_node else ((metadata or {}).get("lc_agent_name") or name or "graph")
+        # a subagent names itself; an unnamed graph reports itself as "LangGraph", and lc_agent_name is
+        # the agent's own name when it has one
+        if subagent:
+            label = subagent
+        elif is_node:
+            label = node
+        else:
+            label = (metadata or {}).get("lc_agent_name") or name or "graph"
 
         state_in, carried, created = self._register_state(
             inputs,
@@ -429,9 +519,16 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             if prev != state_in.cid and prev not in input_cids:
                 input_cids.append(prev)
 
+        if subagent:
+            kind = "agent"
+        elif is_graph:
+            kind = "graph"
+        else:
+            kind = "graph_node"
+
         self._runs[run_id] = {
             "name": label,
-            "kind": "graph" if is_graph else "graph_node",
+            "kind": kind,
             "parent": parent_run_id,
             "step": step,
             "state_in": state_in.cid,
@@ -444,6 +541,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         logger.debug(run_id)
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
+        # released before the early return: every chain run gets an _agent_names entry at start, tracked or
+        # not, and LangGraph emits far more untracked runs than tracked ones. Releasing this only on the
+        # tracked path left the dict growing for the whole session.
+        self._forget_run(run_id)
 
         if run is None:
             return
@@ -460,7 +561,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         # nested LLM/tool outputs are inputs to the node's final state
         input_cids = run["inputs"] + run["child_outputs"]
 
-        if run["kind"] == "graph":
+        if run["kind"] in ("graph", "agent"):
             # the final state is derived from the last node that ran inside it
             last = run.get("last_child_output")
             if last is not None and last not in input_cids:
@@ -481,11 +582,15 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             self._sibling_outputs.pop(None, None)
             self._fallback_steps.pop(None, None)
 
-        self._forget_run(run_id)
         enclosing = self._enclosing_node(run["parent"])
 
         if enclosing is not None:
             enclosing["last_child_output"] = state_out.cid
+            if run["kind"] == "agent":
+                # the enclosing run is the tool that spawned this subagent -- DeepAgents' `task`. Its
+                # result *is* the subagent's final state, so without this edge the whole delegated run
+                # hangs off nothing and the graph has a hole exactly where the work was handed over.
+                enclosing.setdefault("child_outputs", []).append(state_out.cid)
 
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
@@ -493,9 +598,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
-
-        if run is not None:
-            self._finalize_error(run, error)
+        self._record_failure(run, error)
 
     ################################################## Chain Calls #################################################
 
@@ -534,8 +637,19 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             ),
         )
 
+        model_payload: Dict[str, Any] = {"model": model_name, "provider": provider}
+        sampling = self._sampling_params(params)
+        if sampling:
+            model_payload["params"] = _to_jsonable(sampling)
+        model_config = self._caller_metadata(metadata)
+        if model_config:
+            model_payload["config"] = _to_jsonable(model_config)
+        model_tags = self._caller_tags(tags)
+        if model_tags:
+            model_payload["tags"] = model_tags
+
         model = Model.from_object(
-            {"model": model_name, "provider": provider},
+            model_payload,
             name=model_name,
             **self._verbose_metadata(
                 {
@@ -595,10 +709,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning("%s run %s failed: %s: %s", "llm", run_id, type(error).__name__, error)
-        run = self._runs.pop(run_id, None)
-
-        if run is not None:
-            self._finalize_error(run, error)
+        self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## LLM Calls ###################################################
 
@@ -619,12 +730,32 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         logger.debug(run_id)
         tool_name = (serialized or {}).get("name", "tool")
 
-        if tool_name not in self._tool_cids:
-            # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
-            # an undecorated tool falls back to a name/description stub
-            source = _registered_tool_sources.get(tool_name)
+        # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
+        # an undecorated tool falls back to a name/description stub. Either way, configuration the caller
+        # attached with `with_config` identifies *this* tool as opposed to another of the same name, so it
+        # is folded in -- and the payload becomes a mapping, since a bare source string has nowhere to put
+        # it. A tool with nothing attached keeps the source-as-payload shape it has always had.
+        source = _registered_tool_sources.get(tool_name)
+        tool_config = self._caller_metadata(metadata)
+        tool_tags = self._caller_tags(tags)
+
+        if tool_config or tool_tags:
+            tool_payload: Any = {"tool": tool_name}
+            if source is not None:
+                tool_payload["source"] = source
+            if tool_config:
+                tool_payload["config"] = _to_jsonable(tool_config)
+            if tool_tags:
+                tool_payload["tags"] = tool_tags
+        else:
+            tool_payload = source if source is not None else {"name": tool_name}
+
+        # keyed on the payload, so one name configured two ways registers as two assets
+        tool_key = json.dumps(tool_payload, sort_keys=True, default=str)
+
+        if tool_key not in self._tool_cids:
             tool_asset = Tool.from_object(
-                source if source is not None else {"name": tool_name},
+                tool_payload,
                 name=tool_name,
                 description=(serialized or {}).get("description", ""),
                 **self._verbose_metadata(
@@ -638,7 +769,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                     }
                 ),
             )
-            self._tool_cids[tool_name] = tool_asset.cid
+            self._tool_cids[tool_key] = tool_asset.cid
 
         tool_input, carried, created = self._register_state(
             inputs if inputs is not None else input_str,
@@ -654,7 +785,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             },
         )
 
-        input_cids = [self._tool_cids[tool_name], tool_input.cid, *carried, *created]
+        input_cids = [self._tool_cids[tool_key], tool_input.cid, *carried, *created]
 
         node = self._enclosing_node(parent_run_id)
         if node is not None:
@@ -702,19 +833,141 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     @_synchronized
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning("%s run %s failed: %s: %s", "tool", run_id, type(error).__name__, error)
+        self._record_failure(self._runs.pop(run_id, None), error)
+
+    ################################################## Tool Calls ##################################################
+
+    ################################################## Retrievers ##################################################
+    @_synchronized
+    def on_retriever_start(
+        self,
+        serialized: Dict[str, Any],
+        query: str,
+        *,
+        run_id: UUID,
+        parent_run_id: Optional[UUID] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Register a retrieval as its own computation.
+
+        For a RAG chain the retrieved documents are the provenance that matters most -- they are where
+        the answer's content actually came from -- and they were leaving no trace at all. The retriever
+        itself is registered as a Tool, because that is what it is from the graph's point of view: a named
+        capability the run invoked.
+
+        Its asset is content-addressed to its identity, which includes whatever the caller attached with
+        ``with_config`` -- so pointing the same class at a different index produces a different asset,
+        and the manifest records which corpus was consulted rather than only that one was.
+        """
+        logger.debug(run_id)
+        self._note_framework(metadata)
+        name = kwargs.get("name") or (serialized or {}).get("name") or "retriever"
+        identity = self._retriever_identity(name, metadata, tags)
+        # keyed on the identity rather than the name, so the same class aimed at two different corpora
+        # registers as two assets instead of silently collapsing into one
+        key = json.dumps(identity, sort_keys=True)
+
+        if key not in self._retriever_cids:
+            asset = Tool.from_object(
+                identity,
+                name=name,
+                description=(serialized or {}).get("description", ""),
+                **self._verbose_metadata(
+                    {
+                        "callback": "on_retriever_start",
+                        "serialized": serialized,
+                        "run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                        "tags": tags,
+                        "metadata": metadata,
+                        **kwargs,
+                    }
+                ),
+            )
+            self._retriever_cids[key] = asset.cid
+
+        query_asset = Prompt.from_object(
+            _to_jsonable(query),
+            name=f"{name}: query",
+            description=f"Query issued to retriever '{name}'.",
+            **self._verbose_metadata(
+                {
+                    "callback": "on_retriever_start",
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                    "tags": tags,
+                    "metadata": metadata,
+                    **kwargs,
+                }
+            ),
+        )
+
+        input_cids = [self._retriever_cids[key], query_asset.cid]
+        node = self._enclosing_node(parent_run_id)
+        if node is not None:
+            enclosing_input = node.get("state_in")
+            if enclosing_input is not None:
+                input_cids.append(enclosing_input)
+
+        self._runs[run_id] = {
+            "name": name,
+            "kind": "retriever",
+            "state_in": query_asset.cid,
+            "inputs": input_cids,
+            "child_outputs": [],
+            "node": node,
+        }
+
+    @_synchronized
+    def on_retriever_end(self, documents: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        """Each retrieved document becomes its own Document asset.
+
+        One asset per document rather than one per result set: the same document retrieved by two
+        different queries is the same entity, and content-addressing makes that identity automatic. A
+        single blob of "the results" would hide it.
+        """
+        logger.debug(run_id)
         run = self._runs.pop(run_id, None)
 
         if run is None:
             return
 
-        failure = self._finalize_error(run, error)
+        output_cids: List[CID] = []
+        for index, document in enumerate(documents or []):
+            payload = _to_jsonable(document)
+            source = None
+            if isinstance(payload, dict):
+                source = (payload.get("metadata") or {}).get("source")
+            asset = Document.from_object(
+                payload,
+                name=str(source) if source else f"{run['name']}: document {index + 1}",
+                description=f"Document retrieved by '{run['name']}'.",
+                **self._verbose_metadata({"callback": "on_retriever_end", "run_id": run_id, **kwargs}),
+            )
+            if asset.cid not in output_cids:
+                output_cids.append(asset.cid)
 
-        # the error message goes back to the model as a ToolMessage, so the enclosing node's output state
-        # is derived from the failure just as it would be from a successful result
-        if failure is not None and run["node"] is not None:
-            run["node"].setdefault("child_outputs", []).append(failure)
+        self._finalize(run["name"], run["kind"], run["inputs"], output_cids)
+
+        # the documents are what the enclosing node's output was built from
+        if run["node"] is not None:
+            run["node"].setdefault("child_outputs", []).extend(output_cids)
+
+    @_synchronized
+    def on_retriever_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        logger.warning("retriever run %s failed: %s: %s", run_id, type(error).__name__, error)
+        self._record_failure(self._runs.pop(run_id, None), error)
+
+    ################################################## Retrievers ##################################################
 
 
-################################################## Tool Calls ##################################################
-
-__all__ = ["EqtyCallbackHandler", "eqty_tool"]
+__all__ = [
+    "UNCLAIMED",
+    "AssetSink",
+    "EqtyCallbackHandler",
+    "PathExtractor",
+    "StateExtractor",
+    "eqty_tool",
+]

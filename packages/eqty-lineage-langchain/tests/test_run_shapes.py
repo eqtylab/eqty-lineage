@@ -150,16 +150,24 @@ def test_command_tool_output_keeps_its_state_update(recording_handler):
 
 
 def test_command_paths_are_still_collected(tmp_path):
-    """Paths nested inside a Command's update must reach the path collector."""
-    from eqty_lineage.langchain import _to_jsonable
+    """Paths nested inside a Command's update must reach the extractor hook, key path intact."""
+    from pathlib import Path
+
+    from eqty_lineage.langchain import UNCLAIMED, _to_jsonable
     from langgraph.types import Command
 
     target = tmp_path / "written.md"
     target.write_text("content")
 
     seen: list[Any] = []
-    _to_jsonable(Command(update={"report": target}), on_path=seen.append)
-    assert seen == [target]
+
+    def collect(key_path, value):
+        if isinstance(value, Path):
+            seen.append((key_path, value))
+        return UNCLAIMED
+
+    _to_jsonable(Command(update={"report": target}), on_value=collect)
+    assert seen == [(("update", "report"), target)]
 
 
 # ----------------------------------------------------- model identity ----
@@ -211,3 +219,40 @@ def test_a_model_call_does_not_rename_the_framework(recording_handler):
     RunnableLambda(lambda _: model.invoke("x")).invoke(1, config={"callbacks": [recording_handler]})
 
     assert set(recording_handler.frameworks) == {"langchain"}
+
+
+# ------------------------------------------- error handler consistency ----
+def test_every_error_handler_links_the_failure_the_same_way(recording_handler):
+    """All four on_*_error paths funnel through one shape, so none is special-cased silently."""
+    import inspect
+
+    from eqty_lineage.langchain import EqtyCallbackHandler
+
+    for name in ("on_chain_error", "on_llm_error", "on_tool_error", "on_retriever_error"):
+        src = inspect.getsource(getattr(EqtyCallbackHandler, name))
+        assert "_record_failure" in src, f"{name} does not go through the shared path"
+    assert recording_handler is not None
+
+
+def test_a_failure_reaches_the_activity_that_was_waiting_on_it(recording_handler):
+    """A tool that raises inside a node: the node's record derives from the failure."""
+    from langchain_core.tools import tool
+
+    @tool
+    def explode(x: str) -> str:
+        """Always fails."""
+        raise RuntimeError("boom")
+
+    def worker(state: S) -> dict:
+        try:
+            explode.invoke({"x": "1"})
+        except RuntimeError:
+            pass
+        return {"trail": ["recovered"]}
+
+    _single_node_graph(worker).invoke({"trail": []}, config={"callbacks": [recording_handler]})
+
+    failures = {o for name, kind, _, outs in recording_handler.computations if kind.endswith("_error") for o in outs}
+    consumed = {i for _, _, ins, _ in recording_handler.computations for i in ins}
+    assert failures, "no failure recorded"
+    assert failures & consumed, "the failure was recorded but linked to nothing"
