@@ -145,3 +145,63 @@ distinct entity from the one registered earlier:
 
 Keying on the path alone would resolve every later sighting to the first one's asset, so any computation running after a
 rewrite would be attested against content it never saw.
+
+## Demo: what the lineage looks like before and after
+
+```bash
+just langchain-diff-demo                                 # working tree vs. the newest release tag
+just langchain-diff-demo eqty-lineage-langchain@0.0.1    # ...or any ref you name
+```
+
+Runs one identical document-review agent twice — once through the handler at the baseline ref, once through
+the working tree — and writes `manifests/before.json` and `manifests/after.json`. The model is scripted rather
+than live, so the two runs are byte-identical and every difference in the manifest is attributable to the
+handler alone.
+
+The baseline defaults to the newest `eqty-lineage-langchain@*` tag, so this keeps answering "what changed
+since the last release" as releases are cut, rather than freezing into a comparison against one fixed version.
+Rows that differ are marked `*`; a run against an unchanged baseline marks nothing.
+
+Every row is a property of the lineage and is stable run to run. The manifest's raw statement and asset
+counts are deliberately not reported: assets are content-addressed, so two state payloads that happen to
+coincide collapse into one registration and the totals move by one between otherwise identical runs.
+
+Because the baseline tracks the newest tag, the table changes as releases are cut. Against `0.0.2` it shows
+what the coverage work added — subagents, retrievals, and the last orphaned output:
+
+| | before (0.0.2) | after |
+| --- | --- | --- |
+| computations recorded | 14 | 16 |
+| retrievals recorded | 0 | 1 |
+| documents registered | 0 | 2 |
+| subagents recorded | none | `specialist` |
+| computation kinds | `chat_model`, `graph`, `graph_node`, `tool`, `tool_error` | plus `agent`, `retriever` |
+| orphaned node outputs | `assess` | none |
+
+Rows fixed in an earlier release are unmarked, because both sides now agree on them. Reaching further back
+shows the correctness work instead:
+
+```bash
+just langchain-diff-demo eqty-lineage-langchain@0.0.1
+```
+
+| | before (0.0.1) | after |
+| --- | --- | --- |
+| exceptions swallowed by LangChain | `KeyError('state_in')`, `TypeError(... NoneType)` | none |
+| computations recorded | 11 | 16 |
+| graph nodes present | `checkpoint` missing | all nine |
+| orphaned node outputs | `verify_b`, `assess` | none |
+| `report.md` versions tracked | 1 | 2 |
+| `publish` linked to the bytes it read | **no** | yes |
+
+In the graph explorer, that `0.0.1` comparison looks like this. (The screenshots predate the retrieval and
+subagent steps, so they show the earlier, smaller graph.)
+
+Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:
+
+![lineage before](../../docs/images/lineage-before.png)
+
+After — `Prompt`, `Model` and `Reasoning` appear on the left (the model call that was being dropped), a
+second tool wrench for the tool that fails, and both parallel branches feeding the next node:
+
+![lineage after](../../docs/images/lineage-after.png)

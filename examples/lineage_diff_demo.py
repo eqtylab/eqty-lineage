@@ -5,8 +5,8 @@ replies are byte-identical between the two runs -- the model is scripted rather 
 difference in the exported manifest is attributable to the handler and nothing else. A live model would
 make the two runs incomparable, which is exactly what a before/after demo must not do.
 
-    just demo                       # working tree vs. the most recent release tag
-    just demo eqty-lineage-langchain@0.0.1   # ...or any ref you name
+    just langchain-diff-demo        # working tree vs. the most recent release tag
+    just langchain-diff-demo eqty-lineage-langchain@0.0.1   # ...or any ref you name
 
 writes ``manifests/before.json`` and ``manifests/after.json``, then prints the comparison. Load the two
 manifests side by side in the graph explorer to see the topology differ.
@@ -65,7 +65,7 @@ def latest_release_ref() -> str:
     if not tags:
         raise DemoError(
             "no eqty-lineage-langchain@* tag found to use as a baseline. Fetch tags with "
-            "`git fetch --tags`, or name a ref explicitly: just demo <ref>"
+            "`git fetch --tags`, or name a ref explicitly: just langchain-diff-demo <ref>"
         )
     return tags[0]
 
