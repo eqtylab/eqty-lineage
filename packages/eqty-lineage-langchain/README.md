@@ -216,10 +216,10 @@ Every row is a property of the lineage and is stable run to run. The manifest's 
 counts are deliberately not reported: assets are content-addressed, so two state payloads that happen to
 coincide collapse into one registration and the totals move by one between otherwise identical runs.
 
-Because the baseline tracks the newest tag, the table changes as releases are cut. Against `0.0.2` it shows
-what the coverage work added — subagents, retrievals, and the last orphaned output:
+Rows that differ are marked `*`. Because the baseline tracks the newest tag, the table shows what has changed
+since the last release — against `0.0.2`:
 
-| | before (0.0.2) | after |
+| | before | after |
 | --- | --- | --- |
 | computations recorded | 14 | 16 |
 | retrievals recorded | 0 | 1 |
@@ -228,30 +228,9 @@ what the coverage work added — subagents, retrievals, and the last orphaned ou
 | computation kinds | `chat_model`, `graph`, `graph_node`, `tool`, `tool_error` | plus `agent`, `retriever` |
 | orphaned node outputs | `assess` | none |
 
-Rows fixed in an earlier release are unmarked, because both sides now agree on them. Reaching further back
-shows the correctness work instead:
-
-```bash
-just langchain-diff-demo eqty-lineage-langchain@0.0.1
-```
-
-| | before (0.0.1) | after |
-| --- | --- | --- |
-| exceptions swallowed by LangChain | `KeyError('state_in')`, `TypeError(... NoneType)` | none |
-| computations recorded | 11 | 16 |
-| graph nodes present | `checkpoint` missing | all nine |
-| orphaned node outputs | `verify_b`, `assess` | none |
-| `report.md` versions tracked | 1 | 2 |
-| `publish` linked to the bytes it read | **no** | yes |
-
-In the graph explorer, that `0.0.1` comparison looks like this. (The screenshots predate the retrieval and
-subagent steps, so they show the earlier, smaller graph.)
-
-Before — only `Dataset` and `Tool` assets, one red tool wrench, and `verify_b`'s output going nowhere:
+Name any ref to compare further back — `just langchain-diff-demo eqty-lineage-langchain@0.0.1` reaches the
+release before the correctness work, which is what these screenshots show:
 
 ![lineage before](../../docs/images/lineage-before.png)
-
-After — `Prompt`, `Model` and `Reasoning` appear on the left (the model call that was being dropped), a
-second tool wrench for the tool that fails, and both parallel branches feeding the next node:
 
 ![lineage after](../../docs/images/lineage-after.png)

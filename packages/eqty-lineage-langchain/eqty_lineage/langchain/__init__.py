@@ -19,15 +19,16 @@ That treatment is one :class:`StateExtractor` -- :class:`PathExtractor` -- and m
 ``add_extractor``. An extractor claims part of a state, registers whatever assets represent it, and replaces it in the
 bulk state blob, which is how a framework package teaches this handler about its own state without this package
 having to know the framework exists.
+
+The module is split by concern: ``_serialize`` turns LangChain values into plain JSON, ``_tools`` captures tool
+source at definition time, ``extractors`` holds the extension point, and this file holds the handler itself.
 """
 
 import functools
-import inspect
 import json
 import logging
 import re
 import threading
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -35,189 +36,15 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Dataset, Document, Model, Prompt, Reasoning, Tool, get_cid_for_path
+from eqty_sdk import CID, Dataset, Document, Model, Prompt, Reasoning, Tool
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
 
+from eqty_lineage.langchain._serialize import UNCLAIMED, _to_jsonable
+from eqty_lineage.langchain._tools import _registered_tool_sources, eqty_tool
+from eqty_lineage.langchain.extractors import AssetSink, PathExtractor, StateExtractor
+
 logger = logging.getLogger("eqty.langgraph")
-
-
-#: Returned by a claim hook that does not want the value; a plain None cannot serve, because None is
-#: itself a legitimate replacement.
-UNCLAIMED = object()
-
-
-def _to_jsonable(
-    obj: Any,
-    on_value: Optional[Callable[[Tuple[str, ...], Any], Any]] = None,
-    _key_path: Tuple[str, ...] = (),
-) -> Any:
-    """Convert LangChain/LangGraph values into plain JSON-serializable data.
-
-    ``on_value`` is offered every value encountered, with the sequence of dict keys that led to it. It
-    returns ``UNCLAIMED`` to decline, or a replacement to substitute into the payload -- which is how a
-    :class:`StateExtractor` lifts something out of the bulk state blob and into an asset of its own.
-    """
-    if on_value is not None:
-        claimed = on_value(_key_path, obj)
-        if claimed is not UNCLAIMED:
-            return claimed
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, BaseMessage):
-        data: Dict[str, Any] = {"role": obj.type, "content": _to_jsonable(obj.content, on_value, _key_path)}
-        tool_calls = getattr(obj, "tool_calls", None)
-        if tool_calls:
-            data["tool_calls"] = _to_jsonable(tool_calls, on_value, _key_path)
-        usage = getattr(obj, "usage_metadata", None)
-        if usage:
-            data["usage"] = _to_jsonable(usage, on_value, _key_path)
-        return data
-    if isinstance(obj, dict):
-        return {str(k): _to_jsonable(v, on_value, (*_key_path, str(k))) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        # the index is not part of the key path: an extractor claims a state key, not a position in a list
-        return [_to_jsonable(item, on_value, _key_path) for item in obj]
-    if type(obj).__name__ == "Command":
-        # A LangGraph Command carries the state update a tool applied -- which is the whole payload of
-        # DeepAgents' `task` tool, including any files the subagent wrote. Falling through to str() below
-        # would record it as an opaque blob. Duck-typed on the class name because this package depends on
-        # langchain-core alone and must not import langgraph.
-        command = {
-            field: _to_jsonable(getattr(obj, field), on_value, (*_key_path, field))
-            for field in ("update", "goto", "graph", "resume")
-            if getattr(obj, field, None) is not None
-        }
-        if command:
-            return {"command": command}
-    if hasattr(obj, "model_dump"):
-        try:
-            return _to_jsonable(obj.model_dump(), on_value, _key_path)
-        except Exception:  # noqa: BLE001 - best-effort serialization
-            pass
-    return str(obj)
-
-
-# tool name -> Python source captured by @eqty_tool, read by every EqtyCallbackHandler instance
-_registered_tool_sources: Dict[str, str] = {}
-
-
-def eqty_tool(obj: Any) -> Any:
-    """Capture a tool function's source code so ``EqtyCallbackHandler`` registers the Tool asset from it.
-
-    Callbacks only receive a tool's *name* at runtime, so the source must be recorded at definition time.
-    Returns ``obj`` unchanged and works on either side of LangChain's ``@tool`` decorator::
-
-        @tool
-        @eqty_tool
-        def search(query: str) -> str: ...
-    """
-    # when stacked outside @tool, obj is a StructuredTool holding the original fn in .func/.coroutine
-    fn = getattr(obj, "func", None) or getattr(obj, "coroutine", None) or obj
-    name = getattr(obj, "name", None) or getattr(fn, "__name__", None)
-    if name is not None:
-        try:
-            _registered_tool_sources[name] = inspect.getsource(fn)
-        except (OSError, TypeError):
-            logger.debug("no source available for tool '%s'", name)
-    return obj
-
-
-class AssetSink:
-    """Where an extractor records the assets it produced, and why each one is there.
-
-    *Carried* means the entity already existed and this computation merely handled it, so it is an input.
-    *Created* means this computation produced it, so it is an output. Getting the distinction wrong is how
-    a lineage graph grows a cycle.
-    """
-
-    def __init__(self, metadata: Dict[str, Any]) -> None:
-        #: sanitized verbose metadata, ready to unpack into an SDK asset constructor
-        self.metadata = metadata
-        self.carried: List[CID] = []
-        self.created: List[CID] = []
-
-    def carry(self, cid: CID) -> None:
-        if cid not in self.carried and cid not in self.created:
-            self.carried.append(cid)
-
-    def create(self, cid: CID) -> None:
-        if cid not in self.created and cid not in self.carried:
-            self.created.append(cid)
-
-
-class StateExtractor:
-    """Lifts part of a graph state into assets of its own, and out of the bulk state blob.
-
-    Without this, everything a node's state contains is re-serialized into that node's state Dataset,
-    every time -- so a filesystem carried in state is embedded once per node, and no file is ever an
-    entity in its own right. An extractor claims a value, registers whatever assets represent it, and
-    returns what should stand in its place in the payload.
-
-    Subclass and register with ``EqtyCallbackHandler.add_extractor`` to teach the handler about a
-    framework's own state. The DeepAgents package uses this to turn its virtual filesystem into real
-    file assets without this package ever importing ``deepagents``.
-    """
-
-    def extract(self, key_path: Tuple[str, ...], value: Any, sink: AssetSink) -> Any:
-        """Claim ``value`` and return its replacement, or ``UNCLAIMED`` to decline.
-
-        ``key_path`` is the sequence of dict keys that led here, so an extractor can claim a particular
-        state key (``("files",)``) rather than guessing from the value's shape.
-        """
-        raise NotImplementedError
-
-
-class PathExtractor(StateExtractor):
-    """Registers an existing ``pathlib.Path`` in state as a Dataset of its own.
-
-    Versions are keyed on ``(path, content CID)``, not on the path alone. A file rewritten between two
-    nodes is a genuinely different entity, and reusing the first sighting's asset would attest content the
-    later computation never saw. The version a rewrite replaced is carried as an input, which is what
-    makes successive edits a chain rather than unrelated assets.
-
-    The cost is re-hashing each path per sighting, which is what ``Dataset.from_path`` would do anyway on
-    a miss.
-    """
-
-    def __init__(self, handler: "EqtyCallbackHandler") -> None:
-        self._handler = handler
-
-    def extract(self, key_path: Tuple[str, ...], value: Any, sink: AssetSink) -> Any:
-        if not isinstance(value, Path):
-            return UNCLAIMED
-        if not value.exists():
-            return str(value)
-
-        key = str(value.resolve())
-        try:
-            content_cid = str(get_cid_for_path(value))
-        except Exception:  # noqa: BLE001 - an unreadable path must not take down the run being observed
-            logger.debug("could not compute a content CID for '%s'; skipping", value)
-            return str(value)
-
-        known = self._handler._path_versions.get((key, content_cid))
-        if known is not None:
-            sink.carry(known)
-            return str(value)
-
-        asset = Dataset.from_path(
-            value,
-            name=value.name,
-            description=f"Filesystem asset referenced by LangGraph state: '{value}'.",
-            **sink.metadata,
-        )
-        self._handler._path_versions[(key, content_cid)] = asset.cid
-
-        previous = self._handler._path_latest.get(key)
-        if previous is not None:
-            sink.carry(previous)
-        self._handler._path_latest[key] = asset.cid
-
-        sink.create(asset.cid)
-        return str(value)
 
 
 def _synchronized(method: Callable) -> Callable:
@@ -307,8 +134,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def add_extractor(self, extractor: StateExtractor) -> None:
         """Teach the handler to lift something out of graph state into assets of its own.
 
-        Extractors are consulted in registration order, and the first to claim a value wins, so a
-        subclass registering its own takes precedence over the built-in :class:`PathExtractor`.
+        Extractors are consulted newest-first -- each is inserted at the front -- and the first to claim a
+        value wins, so a subclass's own extractor takes precedence over the built-in :class:`PathExtractor`.
         """
         with self._lock:
             self._extractors.insert(0, extractor)
