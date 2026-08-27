@@ -512,6 +512,23 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             statement_ids[0], None, None
         )
 
+    def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
+        """Record a failed activity and link it to whatever was waiting on it.
+
+        Every ``on_*_error`` funnels through here, so all four behave alike. The enclosing activity observed
+        the failure whether or not it recovered from one: LangGraph's ``ToolNode`` re-raises by default and
+        the node dies with it, but a ``ToolInvocationError``, a configured ``handle_tool_errors``, or a retry
+        middleware all leave the caller alive and holding the error. When the caller does die, its own error
+        computation is built from its inputs and the link simply goes unused -- so linking is right in the
+        first case and harmless in the second.
+        """
+        if run is None:
+            return
+        failure = self._finalize_error(run, error)
+        enclosing = run.get("node")
+        if failure is not None and enclosing is not None:
+            enclosing.setdefault("child_outputs", []).append(failure)
+
     def _finalize_error(self, run: Dict[str, Any], error: BaseException) -> Optional[CID]:
         """Record a failed activity instead of erasing it.
 
@@ -697,6 +714,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         logger.debug(run_id)
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
+        # released before the early return: every chain run gets an _agent_names entry at start, tracked or
+        # not, and LangGraph emits far more untracked runs than tracked ones. Releasing this only on the
+        # tracked path left the dict growing for the whole session.
+        self._forget_run(run_id)
 
         if run is None:
             return
@@ -734,7 +755,6 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             self._sibling_outputs.pop(None, None)
             self._fallback_steps.pop(None, None)
 
-        self._forget_run(run_id)
         enclosing = self._enclosing_node(run["parent"])
 
         if enclosing is not None:
@@ -751,9 +771,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
-
-        if run is not None:
-            self._finalize_error(run, error)
+        self._record_failure(run, error)
 
     ################################################## Chain Calls #################################################
 
@@ -864,10 +882,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning("%s run %s failed: %s: %s", "llm", run_id, type(error).__name__, error)
-        run = self._runs.pop(run_id, None)
-
-        if run is not None:
-            self._finalize_error(run, error)
+        self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## LLM Calls ###################################################
 
@@ -991,17 +1006,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     @_synchronized
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning("%s run %s failed: %s: %s", "tool", run_id, type(error).__name__, error)
-        run = self._runs.pop(run_id, None)
-
-        if run is None:
-            return
-
-        failure = self._finalize_error(run, error)
-
-        # the error message goes back to the model as a ToolMessage, so the enclosing node's output state
-        # is derived from the failure just as it would be from a successful result
-        if failure is not None and run["node"] is not None:
-            run["node"].setdefault("child_outputs", []).append(failure)
+        self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## Tool Calls ##################################################
 
@@ -1126,10 +1131,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     @_synchronized
     def on_retriever_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         logger.warning("retriever run %s failed: %s: %s", run_id, type(error).__name__, error)
-        run = self._runs.pop(run_id, None)
-
-        if run is not None:
-            self._finalize_error(run, error)
+        self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## Retrievers ##################################################
 
