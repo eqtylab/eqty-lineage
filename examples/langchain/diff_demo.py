@@ -26,6 +26,9 @@ The graph is a document-review agent that exercises five of the ten defects at o
 - ``verify_b`` calls a tool that raises                                      (D7)
 - ``research`` retrieves from a fixed corpus                                 (D6)
 - ``consult`` delegates to a subagent through a tool, as `task` does         (D3)
+
+Every tool is registered with ``eqty_tool``, so its Tool asset is content-addressed to its own source
+rather than to a name stub -- edit a tool here and its asset CID changes on the next run.
 """
 
 import argparse
@@ -71,15 +74,20 @@ def latest_release_ref() -> str:
 
 
 def load_handler(ref: str | None):
-    """Import the handler under test: the working tree's, or the one at ``ref``.
+    """Import the handler module under test: the working tree's, or the one at ``ref``.
 
     Read out of git and loaded from a file rather than by swapping the checkout, so one command can run
     both and the baseline is whatever was released rather than whatever is lying around locally.
+
+    Returns the whole module, not just the class, because ``eqty_tool`` records tool sources in
+    module-level state. A separately-loaded baseline gets its own copy of that registry, so the tools have
+    to be registered against whichever module is about to observe them -- decorating them once at import
+    time would instrument only the working-tree run and invent a difference the handler never caused.
     """
     if ref is None:
-        from eqty_lineage.langchain import EqtyCallbackHandler
+        import eqty_lineage.langchain as module
 
-        return EqtyCallbackHandler
+        return module
 
     result = subprocess.run(
         ["git", "show", f"{ref}:{HANDLER_PATH}"],
@@ -100,7 +108,7 @@ def load_handler(ref: str | None):
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-        return module.EqtyCallbackHandler
+        return module
     except Exception as exc:
         raise DemoError(
             f"the handler at '{ref}' no longer imports against the installed dependencies "
@@ -228,7 +236,14 @@ def build_graph(report: Path):
 
 
 def run(ref: str | None, out: Path) -> dict:
-    handler_cls = load_handler(ref)
+    handler_module = load_handler(ref)
+    handler_cls = handler_module.EqtyCallbackHandler
+
+    # Content-address each Tool asset to its implementation rather than a name stub, so editing a tool
+    # shows up in the lineage as a changed asset. Applied here rather than as an import-time decorator;
+    # see load_handler.
+    for tool_obj in (critique, check_links, consult_specialist):
+        handler_module.eqty_tool(tool_obj)
     # a release tag reads as its version; anything else (a sha, a branch) is shown abbreviated
     shown = ref.split("@")[-1] if ref else ""
     label = f"baseline ({shown[:12]})" if ref else "working tree"

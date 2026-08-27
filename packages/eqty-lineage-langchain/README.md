@@ -65,6 +65,9 @@ Notes:
 - tools without the decorator still get a Tool asset, registered from a name/description stub instead of source
 - source capture uses `inspect.getsource`, so it only works for functions defined in real files
 (not a REPL or `exec`'d code); the tool's registered source includes its decorator lines
+- the registry is module-level state, so a handler imported as a separate module object has its own copy —
+`examples/langchain/diff_demo.py` registers its tools against whichever handler module it is about to run,
+rather than decorating them once at import time
 
 ## What lands on each computation
 
