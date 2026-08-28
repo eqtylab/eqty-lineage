@@ -8,10 +8,14 @@ version = "0.0.0"
 description = "EQTY lineage callback handler for DeepAgents."
 readme = "README.md"
 requires-python = ">=3.11"
+# deepagents is deliberately absent: this package never imports it. It reads a run from the callback
+# stream and from graph state, so it neither needs the library installed nor should pin a consumer's
+# langchain/langgraph versions to whatever it resolves. The tests and the example do import it, and get
+# it from the workspace `dev` group.
 dependencies = [
     "eqty-sdk",
     "eqty-lineage-langchain>=0.1.0",
-    "deepagents",
+    "langchain-core>=0.3",
 ]
 
 [tool.uv.sources]

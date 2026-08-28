@@ -3,8 +3,8 @@ revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and sys_platform != 'emscripten'",
+    "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
     "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
 ]
 
@@ -403,16 +403,16 @@ name = "eqty-lineage-deepagents"
 version = "0.0.0"
 source = { editable = "packages/eqty-lineage-deepagents" }
 dependencies = [
-    { name = "deepagents" },
     { name = "eqty-lineage-langchain" },
     { name = "eqty-sdk" },
+    { name = "langchain-core" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "deepagents" },
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
     { name = "eqty-sdk", index = "https://pypi.eqtylab.io/simple/" },
+    { name = "langchain-core", specifier = ">=0.3" },
 ]
 
 [[package]]

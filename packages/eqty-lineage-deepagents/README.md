@@ -16,8 +16,10 @@ from eqty_lineage.deepagents import EqtyDeepAgentsHandler
 agent.invoke({"messages": [...]}, config={"callbacks": [EqtyDeepAgentsHandler()]})
 ```
 
-Use one handler instance per invocation. `deepagents` itself is never imported — everything is read from the callback
-stream and from graph state, so the handler works against whatever version of DeepAgents produced the run.
+Use one handler instance per invocation. `deepagents` itself is never imported, and is **not** a dependency of this
+package — everything is read from the callback stream and from graph state, so the handler works against whatever
+version of DeepAgents produced the run, and installing it does not pin your `langchain`/`langgraph` versions.
+`langchain-core` is the only framework requirement.
 
 ```bash
 just deepagents-demo          # scripted model, no API key; writes manifests/deep-agent.json
