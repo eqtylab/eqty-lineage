@@ -1,8 +1,15 @@
 """A DeepAgents research agent instrumented with the eqty_sdk through callbacks.
 
-The agent plans with ``write_todos``, delegates to a ``librarian`` subagent through ``task``, writes and
-revises files in the virtual filesystem, and reads them back. All EQTY registration happens through one
-``EqtyDeepAgentsHandler`` passed in the callbacks config -- no node, tool or subagent is decorated.
+The agent plans with ``write_todos``, delegates to a ``librarian`` subagent through ``task``, looks a term
+up in a local knowledge base, and writes, revises and reads files in the virtual filesystem. All EQTY
+registration happens through one ``EqtyDeepAgentsHandler`` passed in the callbacks config -- no node or
+subagent is decorated.
+
+Tools are the exception, because a callback only ever carries a tool's *name*. ``search_knowledge_base`` is
+decorated with ``@eqty_tool`` at definition time; the built-in belt -- ``write_file``, ``edit_file``,
+``task`` and the rest, which DeepAgents' middleware builds rather than us -- is passed through the same
+function once the agent is compiled (see ``register_tool_sources``). Every Tool asset in the manifest is
+then content-addressed to the code that ran, not to a name stub.
 
     uv run python examples/deepagents/research_agent.py            # scripted model, no API key needed
     uv run python examples/deepagents/research_agent.py --live "your question"
@@ -30,8 +37,10 @@ from eqty_sdk import Context, Signer, init, set_active_signer
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import tool
 
-from eqty_lineage.deepagents import EqtyDeepAgentsHandler
+from eqty_lineage.deepagents import EqtyDeepAgentsHandler, eqty_tool
+from eqty_lineage.langchain._tools import _registered_tool_sources
 
 MANIFEST = Path("./manifests/deep-agent.json")
 
@@ -45,6 +54,29 @@ LIBRARIAN = {
     "description": "Looks up a topic and writes what it found to a file.",
     "system_prompt": "You look things up and write concise notes to /notes.md. Do not editorialise.",
 }
+
+KNOWLEDGE_BASE = {
+    "cid": (
+        "A CID (content identifier) is a self-describing hash that names content rather than a location, "
+        "so the same bytes have the same name wherever they are stored."
+    ),
+    "lineage": (
+        "Data lineage links inputs, computations and outputs. EQTY records it as signed statements: data "
+        "statements register assets by CID, computation statements link input CIDs to output CIDs."
+    ),
+}
+
+
+@tool
+@eqty_tool
+def search_knowledge_base(query: str) -> str:
+    """Search the local knowledge base for entries matching the query."""
+    words = {w.strip("?.,!").lower() for w in query.split()}
+    matches = {key: text for key, text in KNOWLEDGE_BASE.items() if key in words}
+    if not matches:
+        return f"No entries for '{query}'. Available: {', '.join(KNOWLEDGE_BASE)}."
+    return "\n\n".join(f"[{key}] {text}" for key, text in matches.items())
+
 
 NOTES = (
     "A CID is a self-describing hash: it names content rather than a location, so the same bytes have\n"
@@ -69,7 +101,8 @@ SCRIPT: List[AIMessage] = [
     ),
     _call("task", "p2", description="Look up what a CID is.", subagent_type="librarian"),
     # the librarian's own turns
-    _call("write_file", "s1", file_path="/notes.md", content=NOTES),
+    _call("search_knowledge_base", "s1", query="cid"),
+    _call("write_file", "s2", file_path="/notes.md", content=NOTES),
     AIMessage(content="Notes are in /notes.md."),
     # back in the research agent
     _call(
@@ -116,16 +149,40 @@ def build_agent(live: bool) -> Any:
     else:
         model = ScriptedModel(messages=iter(SCRIPT))
 
-    return create_deep_agent(
+    agent = create_deep_agent(
         model=model,
+        tools=[search_knowledge_base],
         system_prompt=SYSTEM_PROMPT,
         subagents=[LIBRARIAN],
         middleware=[TodoListMiddleware()],
         name="research-agent",
     )
+    register_tool_sources(agent)
+    return agent
 
 
-def summarize(handler: EqtyDeepAgentsHandler, result: Dict[str, Any]) -> str:
+def register_tool_sources(agent: Any) -> List[str]:
+    """Content-address the built-in tools to their implementations, the way ``@eqty_tool`` does ours.
+
+    ``search_knowledge_base`` is decorated at definition time, which is the ordinary way to do this. The
+    tools that do the interesting work here are not ours to decorate: ``write_file``, ``edit_file`` and
+    ``task`` are built by DeepAgents' own middleware, and without their source each registers from a
+    name/description stub -- so the manifest would record *that* a file was written but not by what code.
+    Their source is perfectly readable, so the same function the decorator calls is applied to the belt
+    the compiled agent assembled. Upgrade DeepAgents and these assets change, which is the point.
+
+    Reaching into the compiled graph for the belt is the demo's own liberty, not something the handler
+    does: it is the only place the assembled tools exist before the first call, and a name whose source
+    cannot be read is simply left to fall back to its stub.
+    """
+    tools_node = getattr(agent.nodes.get("tools"), "bound", None)
+    belt = getattr(tools_node, "tools_by_name", None) or {}
+    for tool_obj in belt.values():
+        eqty_tool(tool_obj)
+    return sorted(name for name in belt if name in _registered_tool_sources)
+
+
+def summarize(handler: EqtyDeepAgentsHandler, result: Dict[str, Any], sources: List[str]) -> str:
     files = sorted(result.get("files") or {})
     versions: Dict[str, int] = {}
     for path, _digest in handler._file_versions:
@@ -138,6 +195,7 @@ def summarize(handler: EqtyDeepAgentsHandler, result: Dict[str, Any]) -> str:
         f"agents:           {', '.join(sorted(name for name, _ in handler._agent_cids)) or 'none'}",
         f"skills:           {', '.join(sorted(name for name, _ in handler._skill_cids)) or 'none'}",
         f"system prompts:   {len(handler._system_prompt_cids)}",
+        f"tool sources:     {len(sources)} ({', '.join(sources) or 'none'})",
     ]
     return "\n".join(lines)
 
@@ -177,15 +235,18 @@ def main() -> None:
     manifest = MANIFEST.resolve()
     cfg = init_sdk(fresh=not args.in_place)
 
+    agent = build_agent(args.live)
+    sources = sorted(name for name in _registered_tool_sources)
+
     handler = EqtyDeepAgentsHandler(verbose=True)
-    result = build_agent(args.live).invoke(
+    result = agent.invoke(
         {"messages": [HumanMessage(args.question)]},
         config={"callbacks": [handler], "recursion_limit": 80},
     )
 
     print(result["messages"][-1].content)
     print()
-    print(summarize(handler, result))
+    print(summarize(handler, result, sources))
 
     manifest.parent.mkdir(parents=True, exist_ok=True)
     cfg.get_default_context().export(manifest)

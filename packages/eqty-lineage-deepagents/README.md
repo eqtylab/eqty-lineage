@@ -144,12 +144,34 @@ type; it is being raised with the SDK team separately.
 
 Compaction only fires on long runs, so shorter runs are unaffected.
 
-## Verbose metadata and `@eqty_tool`
+## `@eqty_tool` and the built-in tool belt
 
-Both work exactly as in the LangChain package, and `eqty_tool` is re-exported here:
+`eqty_tool` is re-exported here and works as it does in the LangChain package: decorate your own tool and
+its `Tool` asset is content-addressed to its source rather than to a name/description stub.
+
+The tools that do a deep agent's most interesting work, though, are not yours to decorate — `write_file`,
+`edit_file` and `task` are built by DeepAgents' own middleware. Without their source, the manifest records
+*that* a file was written but not by what code. Their source is perfectly readable, so the same function the
+decorator calls can be applied to the belt the compiled agent assembled:
+
+```python
+agent = create_deep_agent(...)
+
+for tool in agent.nodes["tools"].bound.tools_by_name.values():
+    eqty_tool(tool)
+```
+
+Upgrade DeepAgents and those assets change, which is the point. `examples/deepagents/research_agent.py`
+does exactly this; its manifest carries six Tool assets, each holding the source of the function that ran.
+The handler does not do it for you — reaching into a compiled graph for the belt is a caller's liberty, not
+something a callback handler should assume — and a tool whose source cannot be read simply falls back to
+its stub.
+
+## Verbose metadata
 
 ```python
 EqtyDeepAgentsHandler(verbose=True)
 ```
 
-See the [LangChain package README](../eqty-lineage-langchain/README.md#verbose--extra-metadata-on-assets).
+Works exactly as in the LangChain package; see
+[its README](../eqty-lineage-langchain/README.md#verbose--extra-metadata-on-assets).
