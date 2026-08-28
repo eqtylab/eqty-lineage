@@ -12,7 +12,7 @@ carried-versus-created decision and the version chain -- and returns a compact s
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from eqty_lineage.langchain import UNCLAIMED, AssetSink, StateExtractor
 
@@ -20,6 +20,21 @@ if TYPE_CHECKING:
     from eqty_lineage.deepagents import EqtyDeepAgentsHandler
 
 logger = logging.getLogger("eqty.deepagents")
+
+
+def _file_content(data: Any) -> Optional[str]:
+    """The text of one entry in the ``files`` state, or None if it has none to read.
+
+    DeepAgents still accepts a legacy ``list[str]`` content and joins it on newlines in
+    ``file_data_to_string``; a checkpoint written by an older version replays that shape. Reading only
+    ``str`` would drop the whole filesystem of a resumed run out of the manifest.
+    """
+    content = data.get("content") if isinstance(data, dict) else data
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(isinstance(line, str) for line in content):
+        return "\n".join(content)
+    return None
 
 
 def _state_paths(key: str) -> frozenset:
@@ -70,8 +85,12 @@ class VirtualFileExtractor(_HandlerExtractor):
 
         replacement: Dict[str, str] = {}
         for path, data in sorted(value.items(), key=lambda item: str(item[0])):
-            content = data.get("content") if isinstance(data, dict) else data
-            if not isinstance(content, str):
+            if data is None:
+                # the backend queues a None into the files channel to mark a deletion
+                replacement[str(path)] = "<deleted>"
+                continue
+            content = _file_content(data)
+            if content is None:
                 # a binary file whose content the backend has not decoded, or a shape this version of
                 # DeepAgents does not use; recorded as present rather than guessed at
                 logger.debug("no readable content for virtual file '%s'", path)
@@ -146,10 +165,14 @@ class SkillExtractor(_HandlerExtractor):
         if not self._claims(key_path) or not isinstance(value, list):
             return UNCLAIMED
 
+        # validated in full before anything is registered: declining halfway would leave the skills seen
+        # so far linked as carried inputs *and* re-embed the whole catalogue in the state blob, which is
+        # both of the things this extractor exists to avoid
+        if not all(isinstance(entry, dict) for entry in value):
+            return UNCLAIMED
+
         names: List[str] = []
         for entry in value:
-            if not isinstance(entry, dict):
-                return UNCLAIMED
             cid = self._handler.register_skill(entry, sink.metadata)
             if cid is not None:
                 sink.carry(cid)

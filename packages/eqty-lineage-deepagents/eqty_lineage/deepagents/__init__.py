@@ -23,6 +23,7 @@ the handler works against whatever version of DeepAgents produced the run.
 import hashlib
 import json
 import logging
+import posixpath
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -42,7 +43,22 @@ logger = logging.getLogger("eqty.deepagents")
 #: result never carries the file -- these are the names that say which file a call was about.
 _WRITE_TOOL = "write_file"
 _EDIT_TOOL = "edit_file"
-_FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, "read_file", "delete"})
+_DELETE_TOOL = "delete"
+_FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, _DELETE_TOOL, "read_file"})
+
+
+def _normalize_path(path: str) -> str:
+    """A virtual path in the form the filesystem actually keys it under.
+
+    DeepAgents' tools put every path through ``validate_path`` before the backend sees it, which forces a
+    leading slash and collapses ``.`` and ``//`` -- so a model that asks to write ``report.md`` creates
+    ``/report.md`` in state. Keying the tool's raw argument would make those two sightings two files: the
+    write would land on one entity and every later read on another, and the file the run produced would be
+    an output of nothing. Live models omit the leading slash routinely.
+    """
+    # leading slashes are stripped before one is put back: POSIX gives "//x" a meaning of its own and
+    # normpath preserves exactly two of them, so normalizing "/notes.md" naively yields "//notes.md"
+    return posixpath.normpath("/" + path.replace("\\", "/").lstrip("/"))
 
 
 def _digest(value: Any) -> str:
@@ -103,22 +119,27 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     ) -> Tuple[Optional[CID], bool, Optional[CID]]:
         """Register one version of a virtual file, or return the version already registered.
 
-        Returns ``(cid, created, replaced)``: ``created`` says whether this call minted the version, and
-        ``replaced`` is the version it supersedes, which the caller links as an input so successive edits
-        form a chain rather than unrelated assets.
+        Returns ``(cid, created, replaced)``. ``created`` says whether this call minted a new asset;
+        ``replaced`` is the version this one supersedes at that path, which the caller links as an input so
+        successive edits form a chain rather than unrelated assets. The two are independent: a file
+        *reverted* to bytes seen earlier mints nothing but still replaces something, and a caller that
+        keyed on ``created`` alone would record the revert nowhere and leave the manifest asserting that
+        the superseded content was still current.
 
         The path is part of the payload, so the same bytes written to two paths are two files rather than
         one entity wearing whichever name happened to be registered first.
         """
+        path = _normalize_path(path)
         key = (path, _digest(content))
         self._file_contents[path] = content
+        previous = self._file_latest.get(path)
 
         known = self._file_versions.get(key)
         if known is not None:
             # a sighting always shows the file as it is now, so this is the current version even when the
-            # bytes are ones seen before -- a revert chains from what it reverted, not from its ancestor
+            # bytes are ones seen before
             self._file_latest[path] = known
-            return known, False, None
+            return known, False, previous if previous is not None and previous != known else None
 
         try:
             asset = Document.from_object(
@@ -132,9 +153,8 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             return None, False, None
 
         self._file_versions[key] = asset.cid
-        replaced = self._file_latest.get(path)
         self._file_latest[path] = asset.cid
-        return asset.cid, True, replaced
+        return asset.cid, True, previous
 
     def register_todos(
         self, todos: List[Dict[str, Any]], metadata: Dict[str, Any]
@@ -240,7 +260,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         if system is None:
             return None
 
-        payload = _to_jsonable(system.content)
+        # redacted like every other payload that reaches an asset: a middleware is free to interpolate
+        # configured credentials into the prompt it assembles, and these are stored as blobs on disk
+        payload = self._redact(_to_jsonable(system.content))
         key = _digest(payload)
         known = self._system_prompt_cids.get(key)
         if known is not None:
@@ -251,6 +273,7 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
                 payload,
                 name=f"{model_name}: system prompt",
                 description="System prompt the deep agent's middleware stack assembled for this turn.",
+                **self._verbose_metadata({"callback": "on_chat_model_start", "model": model_name}),
             )
         except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
             logger.debug("could not register the system prompt for '%s'", model_name)
@@ -273,7 +296,13 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         """
         if self._pending_outputs:
             pending, self._pending_outputs = self._pending_outputs, []
-            output_cids = [*output_cids, *(cid for cid in pending if cid not in output_cids)]
+            # excluded from the inputs as well as the outputs: a backend that echoes its write back in a
+            # ``Command`` update has the extractor carry that version in as an input, and adding it as an
+            # output too would make the computation its own ancestor
+            output_cids = [
+                *output_cids,
+                *(cid for cid in pending if cid not in output_cids and cid not in input_cids),
+            ]
         return super()._finalize(name, kind, input_cids, output_cids)
 
     ################################################## Chain Calls #################################################
@@ -317,10 +346,14 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
 
             if run["kind"] == "agent":
                 # the subagent spec is also an input to the `task` call that asked for it, which would
-                # otherwise show a subagent's whole run appearing from a tool call that named nothing
+                # otherwise show a subagent's whole run appearing from a tool call that named nothing.
+                # Only when the enclosing run is a tool: `_enclosing_node` returns the nearest tracked run
+                # of any kind, so a subagent reached other than through a tool -- a subgraph wired in
+                # directly -- would otherwise attach its identity to a node that never invoked it.
                 spawning_tool = self._enclosing_node(parent_run_id)
-                if spawning_tool is not None and agent_cid not in spawning_tool["inputs"]:
-                    spawning_tool["inputs"].append(agent_cid)
+                if spawning_tool is not None and spawning_tool.get("kind") == "tool":
+                    if agent_cid not in spawning_tool["inputs"]:
+                        spawning_tool["inputs"].append(agent_cid)
 
     ################################################## Chain Calls #################################################
 
@@ -396,9 +429,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         tool_name = (serialized or {}).get("name", "tool")
         if tool_name not in _FILE_TOOLS or not isinstance(inputs, dict):
             return
-        path = inputs.get("file_path")
-        if not isinstance(path, str) or not path:
+        raw_path = inputs.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path:
             return
+        path = _normalize_path(raw_path)
 
         with self._lock:
             run = self._runs.get(run_id)
@@ -409,7 +443,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             if current is not None and current not in run["inputs"]:
                 run["inputs"].append(current)
 
-            if tool_name == _WRITE_TOOL and isinstance(inputs.get("content"), str):
+            if tool_name == _DELETE_TOOL:
+                self._pending_writes[run_id] = {"path": path, "deleted": True}
+            elif tool_name == _WRITE_TOOL and isinstance(inputs.get("content"), str):
                 self._pending_writes[run_id] = {"path": path, "content": inputs["content"]}
             elif tool_name == _EDIT_TOOL and isinstance(inputs.get("old_string"), str):
                 self._pending_writes[run_id] = {
@@ -444,11 +480,18 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         super().on_tool_error(error, run_id=run_id, **kwargs)
 
     def _record_write(self, run_id: UUID, pending: Dict[str, Any], output: Any) -> None:
-        """Register the new version of a written file and hand it to the finalize that follows."""
+        """Register what a successful filesystem call did, and hand it to the finalize that follows."""
         if _is_tool_error(output):
             return
 
         path = pending["path"]
+        if pending.get("deleted"):
+            # the file is gone; keeping its last version as "current" would chain a later write to
+            # content that no longer existed, and link a later read to a version it could not have read
+            self._file_latest.pop(path, None)
+            self._file_contents.pop(path, None)
+            return
+
         if "content" in pending:
             content = pending["content"]
         else:
@@ -456,8 +499,17 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             if content is None:
                 return
 
-        cid, created, replaced = self.register_virtual_file(path, content, self._verbose_metadata({}))
-        if cid is None or not created:
+        cid, created, replaced = self.register_virtual_file(
+            path,
+            content,
+            self._verbose_metadata({"callback": "on_tool_end", "run_id": run_id, "file_path": path}),
+        )
+        if cid is None:
+            return
+        # `created` alone is not the test: a file reverted to bytes seen earlier mints no new asset but
+        # is still a write, and skipping it would leave the manifest asserting that the version it
+        # replaced was still the current one
+        if not created and replaced is None:
             return
 
         run = self._runs.get(run_id)
@@ -490,8 +542,17 @@ def _is_tool_error(output: Any) -> bool:
     """Whether a filesystem tool reported a failure in its result rather than by raising.
 
     DeepAgents' filesystem tools return their errors as ordinary text -- a missing string, an ambiguous
-    match -- so a call that "succeeded" as far as the callbacks are concerned may have changed nothing.
+    match, a backend that was unreachable -- so a call that "succeeded" as far as the callbacks are
+    concerned may have changed nothing.
+
+    ``status`` is the reliable signal and is checked first: the wording is the backend's own, and only
+    some of them say "Error" (the store, LangSmith and sandbox backends variously report "Failed to write
+    file ..." or the remote's message verbatim). Reading the text alone would take those for successes and
+    attest a file version that was never written. The prefix is still honoured, for a result that carries
+    no status at all.
     """
+    if getattr(output, "status", None) == "error":
+        return True
     content = getattr(output, "content", output)
     return isinstance(content, str) and content.lstrip().startswith("Error")
 

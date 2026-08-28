@@ -48,7 +48,13 @@ Versions are keyed on `(path, content)`, the same rule `PathExtractor` applies t
 
 - **new content at a known path** — a new `Document`, recorded as an *output* of the call that wrote it, with the
   version it replaced linked as an *input*. Successive edits form a chain.
-- **content already registered** — carried through as an *input*, never re-emitted as an output.
+- **content already registered** — carried through as an *input*, never re-emitted as an output. A *write* that
+  restores earlier bytes is the exception: it mints no new asset, but it is still that call's output, because the
+  version it replaced has stopped being current.
+
+Paths are normalized the way DeepAgents normalizes them. `validate_path` forces a leading slash and collapses `.`
+and `//`, so a model that asks to write `report.md` creates `/report.md` in state; keying the raw argument would put
+the write on one entity and every later read on another, and live models omit the leading slash routinely.
 
 The path is part of the asset's payload, so the same bytes written to two paths are two files rather than one entity
 wearing whichever name happened to be registered first.
@@ -67,7 +73,11 @@ So the handler reconstructs the write from the call's own arguments:
   a plain string replacement, with the backend's own occurrence rules re-checked before it is trusted. If any check
   fails, **nothing is registered**: the file then appears at its next sighting in state, as an input, which
   understates its provenance rather than misstating it.
-- a call whose result begins with `Error` changed nothing, and registers nothing.
+- `delete` drops the path's current version, so a later write chains to nothing rather than to content that no
+  longer existed, and a later read is not linked to a version it could not have read.
+- a call that failed registers nothing. Failure is read from the result's `status` rather than its wording: only
+  some backends say "Error", while the store, LangSmith and sandbox backends report "Failed to write file …" or the
+  remote's own message verbatim, and a prefix match would take those for successes.
 
 ## The plan
 

@@ -141,7 +141,7 @@ class ScriptedModel(GenericFakeChatModel):
         return self
 
 
-def build_agent(live: bool) -> Any:
+def build_agent(live: bool) -> "tuple[Any, List[str]]":
     if live:
         from langchain_openai import ChatOpenAI
 
@@ -157,8 +157,7 @@ def build_agent(live: bool) -> Any:
         middleware=[TodoListMiddleware()],
         name="research-agent",
     )
-    register_tool_sources(agent)
-    return agent
+    return agent, register_tool_sources(agent)
 
 
 def register_tool_sources(agent: Any) -> List[str]:
@@ -235,8 +234,9 @@ def main() -> None:
     manifest = MANIFEST.resolve()
     cfg = init_sdk(fresh=not args.in_place)
 
-    agent = build_agent(args.live)
-    sources = sorted(name for name in _registered_tool_sources)
+    # the belt this agent assembled, not the process-global registry: that dict is never cleared, so
+    # reading it would credit this run with sources some other handler registered
+    agent, sources = build_agent(args.live)
 
     handler = EqtyDeepAgentsHandler(verbose=True)
     result = agent.invoke(
