@@ -90,6 +90,67 @@ def test_normalization_matches_the_backend(path):
         assert _normalize_path(path) == expected
 
 
+#: (content, old_string, new_string, replace_all) -- edits the backend applies, and edits it refuses.
+#: Which of the two happens is part of the agreement, so both kinds are in one table.
+EDIT_CASES = [
+    ("draft one\n", "draft one", "draft two", False),
+    # the same string twice: refused without replace_all, applied to both with it
+    ("a\na\n", "a", "b", False),
+    ("a\na\n", "a", "b", True),
+    ("a\na\na\n", "a", "b", True),
+    # not present at all
+    ("hello\n", "goodbye", "x", False),
+    # the EOF-newline case the backend detects specially: old_string carries a trailing newline the
+    # file lacks at that position. It errors today, but it is one upstream change from succeeding.
+    ("hello", "hello\n", "x\n", False),
+    ("one\ntwo", "two\n", "three\n", False),
+    # deletion, and a no-op replacement
+    ("keep\nthis\n", "this\n", "", False),
+    ("same\n", "same", "same", False),
+    # a substring that also occurs inside a longer word
+    ("cat catalog\n", "cat", "dog", True),
+    ("cat catalog\n", "cat", "dog", False),
+    # multi-line old_string
+    ("a\nb\nc\n", "a\nb", "z", False),
+    ("", "x", "y", False),
+]
+
+
+@pytest.mark.parametrize(("content", "old", "new", "replace_all"), EDIT_CASES)
+def test_edit_reconstruction_matches_the_backend(recording_handler, content, old, new, replace_all):
+    """`_apply_edit` must agree with DeepAgents' `perform_string_replacement` exactly.
+
+    `edit_file` reports only that it succeeded, so the resulting content is derived from the version the
+    edit was made against -- which means this package carries a copy of the backend's occurrence rules.
+    A copy that drifts is worse than no copy: too permissive and it mints a version the file never held;
+    too strict and the edit silently records nothing. Asserted against the real function, so upstream
+    changing its rules fails here rather than going unnoticed. `deepagents` is imported in the tests and
+    nowhere in the shipped package.
+    """
+    from deepagents.backends.utils import perform_string_replacement
+
+    path = "/subject.md"
+    recording_handler._file_contents[path] = content
+    pending = {"path": path, "old_string": old, "new_string": new, "replace_all": replace_all}
+
+    result = perform_string_replacement(content, old, new, replace_all=replace_all)
+    reconstructed = recording_handler._apply_edit(path, pending)
+
+    if isinstance(result, str):
+        # the backend refused the edit; nothing was written, so nothing may be registered
+        assert reconstructed is None, f"backend refused ({result[:40]}...) but a version was reconstructed"
+    else:
+        expected, _occurrences = result
+        assert reconstructed == expected
+
+
+def test_an_edit_against_unseen_content_reconstructs_nothing(recording_handler):
+    """Without the version the edit was made against there is nothing to derive the result from, and a
+    guess would be a file version the run never had."""
+    pending = {"path": "/never-seen.md", "old_string": "a", "new_string": "b", "replace_all": False}
+    assert recording_handler._apply_edit("/never-seen.md", pending) is None
+
+
 def test_a_refused_path_records_nothing(recording_handler):
     """A path the backend refuses never reaches it, so the call touched no file."""
     _run(

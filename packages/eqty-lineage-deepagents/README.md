@@ -83,7 +83,9 @@ So the handler reconstructs the write from the call's own arguments:
 - `edit_file` reports only that it succeeded, so the result is derived from the version the edit was made against —
   a plain string replacement, with the backend's own occurrence rules re-checked before it is trusted. If any check
   fails, **nothing is registered**: the file then appears at its next sighting in state, as an input, which
-  understates its provenance rather than misstating it.
+  understates its provenance rather than misstating it. Those re-checked rules are a copy of the backend's, so the
+  tests assert them against the real `perform_string_replacement` over a table of edits it applies *and* edits it
+  refuses — a copy that drifts is worse than no copy, in either direction.
 - `delete` drops the path's current version, so a later write chains to nothing rather than to content that no
   longer existed, and a later read is not linked to a version it could not have read.
 - a call that failed registers nothing. Failure is read from the result's `status` rather than its wording: only
