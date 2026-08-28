@@ -86,3 +86,66 @@ jobs:
       - name: Fail if a check failed
         if: always() && (steps.format.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.build.outcome == 'failure' || steps.test.outcome == 'failure')
         run: exit 1
+
+  # Guards each distribution's declared `requires-python` floor. The `checks` job above runs on the one
+  # interpreter the nix devShell provides (3.11), so a package that claims to support something older is
+  # taken at its word -- an `import tomllib` added to eqty-lineage-langchain would sail through it and
+  # break every 3.10 consumer on the next release.
+  #
+  # This cannot be a matrix over the `checks` job itself: `just sync` resolves the whole workspace, whose
+  # root requires >=3.11, so a 3.10 job could not even install. Each entry therefore builds one package,
+  # installs that wheel alone into a venv on its floor interpreter, and runs that package's tests against
+  # the installed copy -- which is also the only way to prove the floor a *consumer* would actually get.
+  #
+  # The interpreter comes from uv's managed downloads rather than nixpkgs, so adding a version here needs
+  # no flake change and does not depend on nixpkgs still shipping an older Python.
+  #
+  # One entry today. Add a row when a package lowers its floor; a package whose floor equals the version
+  # `checks` already runs needs no row.
+  python-floor:
+    name: floor (${{ matrix.package }} @ py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: eqty-lineage-langchain
+            python: "3.10"
+            test-deps: pytest langgraph
+
+    env:
+      UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
+      UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
+
+    steps:
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
+        with:
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
+
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+
+      - name: Build ${{ matrix.package }}
+        run: just build-package ${{ matrix.package }}
+
+      - name: Install it alone on Python ${{ matrix.python }}
+        # the index is named, not embedded with credentials: uv reads UV_INDEX_EQTY_USERNAME/PASSWORD for
+        # an index called `eqty`, so the secrets never reach a command line
+        run: |
+          uv venv .venv-floor --python "${{ matrix.python }}" --managed-python
+          VIRTUAL_ENV=.venv-floor uv pip install \
+            --index-strategy unsafe-best-match \
+            --index "eqty=https://pypi.eqtylab.io/simple/" \
+            dist/${{ matrix.package }}/*.whl ${{ matrix.test-deps }}
+
+      - name: Test against the installed copy
+        run: .venv-floor/bin/python -m pytest packages/${{ matrix.package }}/tests -q
