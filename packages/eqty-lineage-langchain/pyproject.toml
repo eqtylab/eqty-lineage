@@ -7,7 +7,10 @@ name = "eqty-lineage-langchain"
 version = "0.0.0"
 description = "EQTY lineage callback handler for LangChain and LangGraph."
 readme = "README.md"
-requires-python = ">=3.11"
+# 3.10, one floor below the workspace's own: this package imports nothing newer, and both its
+# dependencies (eqty-sdk, langchain-core) support 3.10, so there is no reason to make a consumer still
+# on 3.10 upgrade in order to record lineage. Verified against a real 3.10 interpreter, not just declared.
+requires-python = ">=3.10"
 dependencies = [
     "eqty-sdk",
     "langchain-core>=0.3",

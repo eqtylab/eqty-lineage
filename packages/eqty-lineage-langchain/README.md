@@ -18,7 +18,7 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 ```
 
 Only `langchain-core` is required at runtime, so the handler works with plain LangChain runnables as well as LangGraph
-graphs. Use one handler instance per invocation.
+graphs. Use one handler instance per invocation. Python 3.10 or newer.
 
 ## `verbose` — extra metadata on assets
 

@@ -12,6 +12,10 @@ Future integrations (e.g. `eqty-lineage-mcp`, `eqty-lineage-llamaindex`) follow
 the same pattern. Because `eqty_lineage` is an implicit namespace package, no
 package may ship an `eqty_lineage/__init__.py`.
 
+Each package sets its own Python floor rather than inheriting the workspace's:
+`eqty-lineage-langchain` supports 3.10, while the workspace itself is 3.11 since
+it builds and tests every member.
+
 ## Usage
 
 ```python
