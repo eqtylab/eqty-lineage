@@ -5,6 +5,7 @@ is worse than a gap: a manifest that omits a write is incomplete, but one that r
 never held, or splits a file in two, is wrong in a way a reader cannot detect.
 """
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from scripted import call, deep_agent
@@ -44,11 +45,63 @@ def test_an_un_normalized_path_is_the_same_file(recording_handler):
     assert version in recording_handler.inputs_of("read_file")
 
 
-def test_normalization_matches_the_backend():
-    assert _normalize_path("report.md") == "/report.md"
-    # the naive "/" + path yields "//notes.md": POSIX gives two leading slashes a meaning of their own
-    assert _normalize_path("/notes.md") == "/notes.md"
-    assert _normalize_path("/./foo//bar") == "/foo/bar"
+#: paths the backend normalizes, and paths it refuses. Kept together so one test can assert that this
+#: package agrees with DeepAgents on both -- which of the two happens is itself part of the agreement.
+NORMALIZATION_CASES = [
+    "report.md",
+    "/report.md",
+    # POSIX gives a doubled leading slash a meaning of its own and `normpath` preserves exactly two, so
+    # this is a *different file* from /report.md. Collapsing it merged one file with its neighbour, and a
+    # write to one was then attested as a rewrite of the other.
+    "//report.md",
+    "///report.md",
+    "/./foo//bar",
+    "//a/b",
+    "/a/",
+    "/",
+    ".",
+    "a/b/c.txt",
+    "/dir/../file.md",
+    "../etc/passwd",
+    "~/secrets",
+    "C:/Users/file.txt",
+    "d:\\data\\file.txt",
+    ".\\x",
+    "/a\\b",
+]
+
+
+@pytest.mark.parametrize("path", NORMALIZATION_CASES)
+def test_normalization_matches_the_backend(path):
+    """`_normalize_path` must agree with DeepAgents' `validate_path` exactly, not approximately.
+
+    Near agreement is the worst outcome available: two paths the backend keeps apart but this folds
+    together are two real files recorded as one asset. Asserted against the real function rather than
+    against a table of expected strings, so the day upstream changes its rules this fails instead of
+    drifting silently. `deepagents` is imported here and nowhere in the shipped package.
+    """
+    from deepagents.backends.utils import validate_path
+
+    try:
+        expected = validate_path(path)
+    except ValueError:
+        assert _normalize_path(path) is None, f"'{path}' is refused by the backend and must not be keyed"
+    else:
+        assert _normalize_path(path) == expected
+
+
+def test_a_refused_path_records_nothing(recording_handler):
+    """A path the backend refuses never reaches it, so the call touched no file."""
+    _run(
+        recording_handler,
+        [
+            call("write_file", "a", file_path="../outside.md", content="nope\n"),
+            AIMessage(content="done"),
+        ],
+    )
+
+    assert recording_handler._file_versions == {}
+    assert recording_handler._file_latest == {}
 
 
 def test_a_backend_failure_that_does_not_say_error_registers_nothing(recording_handler):

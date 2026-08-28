@@ -54,9 +54,18 @@ Versions are keyed on `(path, content)`, the same rule `PathExtractor` applies t
   restores earlier bytes is the exception: it mints no new asset, but it is still that call's output, because the
   version it replaced has stopped being current.
 
-Paths are normalized the way DeepAgents normalizes them. `validate_path` forces a leading slash and collapses `.`
-and `//`, so a model that asks to write `report.md` creates `/report.md` in state; keying the raw argument would put
-the write on one entity and every later read on another, and live models omit the leading slash routinely.
+Paths are normalized the way DeepAgents normalizes them — mirroring `validate_path` step for step, not
+approximating it. It forces a leading slash and collapses `.` and interior `//`, so a model that asks to write
+`report.md` creates `/report.md` in state; keying the raw argument would put the write on one entity and every later
+read on another, and live models omit the leading slash routinely.
+
+*Near* agreement would be worse than none: two paths the backend keeps apart but this folds together are two real
+files recorded as one asset, so a write to one is attested as a rewrite of the other. A **leading** `//` is exactly
+that case — POSIX gives it a meaning of its own and `normpath` preserves exactly two slashes, so `//report.md` is a
+different file from `/report.md`. A path `validate_path` *refuses* (a `..` component, a leading `~`, a Windows drive
+letter) never reaches the backend, so nothing is recorded for it rather than it being rewritten into a plausible
+path the call never touched. A test asserts this agreement against the real `validate_path` rather than against a
+table of expected strings, so it fails rather than drifts if upstream changes its rules.
 
 The path is part of the asset's payload, so the same bytes written to two paths are two files rather than one entity
 wearing whichever name happened to be registered first.

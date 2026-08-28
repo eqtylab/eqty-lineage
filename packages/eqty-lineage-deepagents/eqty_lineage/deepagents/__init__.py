@@ -24,6 +24,8 @@ import hashlib
 import json
 import logging
 import posixpath
+import re
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -47,18 +49,42 @@ _DELETE_TOOL = "delete"
 _FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, _DELETE_TOOL, "read_file"})
 
 
-def _normalize_path(path: str) -> str:
-    """A virtual path in the form the filesystem actually keys it under.
+#: a Windows drive prefix, which the backend refuses rather than normalizes
+_DRIVE_PREFIX = re.compile(r"^[a-zA-Z]:")
 
-    DeepAgents' tools put every path through ``validate_path`` before the backend sees it, which forces a
-    leading slash and collapses ``.`` and ``//`` -- so a model that asks to write ``report.md`` creates
-    ``/report.md`` in state. Keying the tool's raw argument would make those two sightings two files: the
-    write would land on one entity and every later read on another, and the file the run produced would be
-    an output of nothing. Live models omit the leading slash routinely.
+
+def _normalize_path(path: str) -> Optional[str]:
+    """A virtual path in the form the filesystem actually keys it under, or None if it has no such form.
+
+    DeepAgents puts every path through ``validate_path`` before the backend sees it, so the key in state
+    is the normalized form -- a model that asks to write ``report.md`` creates ``/report.md``. Keying the
+    tool's raw argument would make those two sightings two files: the write would land on one entity and
+    every later read on another, and the file the run produced would be an output of nothing. Live models
+    omit the leading slash routinely.
+
+    This mirrors ``validate_path`` step for step rather than approximating it, because *near* agreement is
+    the worst outcome available: two paths that the backend keeps apart but this folds together are two
+    real files recorded as one asset, so a write to one is attested as a rewrite of the other. ``//x`` is
+    exactly that case -- POSIX gives a doubled leading slash a meaning of its own and ``normpath``
+    preserves exactly two, so normalizing it away merges a file with its neighbour. The order matters too:
+    ``normpath`` runs *before* backslashes are rewritten, since on POSIX a backslash is an ordinary
+    filename character until that rewrite.
+
+    Where ``validate_path`` raises -- a ``..`` component, a leading ``~``, a Windows drive letter -- this
+    returns None. Such a call never reaches the backend, so there is nothing to record; rewriting the path
+    into something plausible instead would key the call against a file it never touched.
     """
-    # leading slashes are stripped before one is put back: POSIX gives "//x" a meaning of its own and
-    # normpath preserves exactly two of them, so normalizing "/notes.md" naively yields "//notes.md"
-    return posixpath.normpath("/" + path.replace("\\", "/").lstrip("/"))
+    if ".." in PurePosixPath(path.replace("\\", "/")).parts or path.startswith("~"):
+        return None
+    if _DRIVE_PREFIX.match(path):
+        return None
+
+    normalized = posixpath.normpath(path).replace("\\", "/")
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if ".." in normalized.split("/"):
+        return None
+    return normalized
 
 
 def _digest(value: Any) -> str:
@@ -129,7 +155,12 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         The path is part of the payload, so the same bytes written to two paths are two files rather than
         one entity wearing whichever name happened to be registered first.
         """
-        path = _normalize_path(path)
+        normalized = _normalize_path(path)
+        if normalized is None:
+            # the backend would have refused this path, so there is no file at it to record
+            logger.debug("refusing to register virtual file at an invalid path '%s'", path)
+            return None, False, None
+        path = normalized
         key = (path, _digest(content))
         self._file_contents[path] = content
         previous = self._file_latest.get(path)
@@ -433,6 +464,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         if not isinstance(raw_path, str) or not raw_path:
             return
         path = _normalize_path(raw_path)
+        if path is None:
+            # a path the backend refuses never reaches it, so the call touches no file: linking one here
+            # would put an edge to a file this call never read or replaced
+            return
 
         with self._lock:
             run = self._runs.get(run_id)
