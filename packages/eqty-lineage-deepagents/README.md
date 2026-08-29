@@ -16,14 +16,48 @@ from eqty_lineage.deepagents import EqtyDeepAgentsHandler
 agent.invoke({"messages": [...]}, config={"callbacks": [EqtyDeepAgentsHandler()]})
 ```
 
-Use one handler instance per invocation. `deepagents` itself is never imported, and is **not** a dependency of this
-package — everything is read from the callback stream and from graph state, so the handler works against whatever
+Use one handler per conversation — see [Handler lifetime](#handler-lifetime). `deepagents` itself is never imported,
+and is **not** a dependency of this package — everything is read from the callback stream and from graph state, so the handler works against whatever
 version of DeepAgents produced the run, and installing it does not pin your `langchain`/`langgraph` versions.
 `langchain-core` is the only framework requirement.
 
 ```bash
 just deepagents-demo          # scripted model, no API key; writes manifests/deep-agent.json
 ```
+
+## Handler lifetime
+
+**One handler per conversation, never one shared between conversations running at once.**
+
+Reusing a handler *sequentially* is deliberate and useful: across the turns of one checkpointed thread it is what
+chains a file written in the first turn to an edit in the third, rather than leaving two unrelated entities.
+
+Sharing one between **concurrent** runs is a bug. File and plan versions are keyed by path — or, for the plan, by
+nothing at all — because they describe a single run's filesystem. Two runs in flight on one handler collide on those
+keys, and the second run's write of `/report.md` is recorded as a revision of the first run's file, between runs that
+share nothing but the handler. The graph still looks well-formed; it is simply wrong.
+
+Because that failure is quiet, the handler warns when it sees a second run open while another is still running:
+
+```
+EqtyDeepAgentsHandler is observing 2 runs at once. File and plan versions are keyed per run, so
+concurrent runs will be linked to each other's assets. Use one handler per invocation ...
+```
+
+A server that fans out concurrent runs over one shared agent should build the handler per run — the agent holds no
+lineage state and can stay shared:
+
+```python
+async def execute_run(user_message: str) -> None:
+    with graph_context(ctx):
+        await agent.ainvoke(
+            {"messages": [HumanMessage(user_message)]},
+            config={"callbacks": [EqtyDeepAgentsHandler()]},  # one per run
+        )
+```
+
+`eqty_sdk.init()` is process-global and raises on a second call, so initialise it once at startup rather than per
+run. `graph_context` is backed by a `ContextVar`, so entering it inside each task is safe under `asyncio`.
 
 ## What it records
 

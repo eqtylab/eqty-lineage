@@ -123,6 +123,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         self._system_prompt_cids: Dict[str, CID] = {}
         # tool run id -> the filesystem mutation its arguments describe, applied when the call succeeds
         self._pending_writes: Dict[UUID, Dict[str, Any]] = {}
+        # root runs currently open on this handler; see _note_root
+        self._open_roots: List[UUID] = []
+        self._warned_about_sharing = False
         # one-shot outputs for the computation being finalized right now; see _finalize
         self._pending_outputs: List[CID] = []
         # True while a tool's arguments are being registered; see registering_tool_arguments
@@ -131,6 +134,38 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         self.add_extractor(SkillExtractor(self))
         self.add_extractor(TodoListExtractor(self))
         self.add_extractor(VirtualFileExtractor(self))
+
+    def _note_root(self, run_id: UUID) -> None:
+        """Warn once if this handler is observing two runs at the same time.
+
+        The path and plan registries are keyed by path, or by nothing at all, because they describe one
+        run's filesystem. Point a single handler at two concurrent runs and those keys collide: the second
+        run's write of ``/report.md`` chains off the first run's version, and the manifest asserts that one
+        run revised the other's file when they share nothing but a handler. It is a quiet failure -- the
+        graph looks well-formed, it is simply wrong -- which is why it is worth a warning.
+
+        Reusing a handler *sequentially* is not the same thing and is not flagged: across the turns of one
+        conversation it is what makes a file written in the first turn and edited in the third chain
+        properly, rather than appearing as two unrelated entities. The rule is one handler per
+        conversation, never one shared between conversations running at once.
+
+        Warned once per handler, since a run whose callbacks never complete would otherwise leave this
+        reporting a collision on every run that follows.
+        """
+        if self._open_roots and not self._warned_about_sharing:
+            self._warned_about_sharing = True
+            logger.warning(
+                "EqtyDeepAgentsHandler is observing %d runs at once. File and plan versions are keyed per "
+                "run, so concurrent runs will be linked to each other's assets. Use one handler per "
+                "invocation (sequential reuse across turns of one conversation is fine).",
+                len(self._open_roots) + 1,
+            )
+        if run_id not in self._open_roots:
+            self._open_roots.append(run_id)
+
+    def _forget_root(self, run_id: UUID) -> None:
+        if run_id in self._open_roots:
+            self._open_roots.remove(run_id)
 
     @property
     def registering_tool_arguments(self) -> bool:
@@ -368,6 +403,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         )
 
         with self._lock:
+            if parent_run_id is None:
+                self._note_root(run_id)
+
             run = self._runs.get(run_id)
             if run is None or run["kind"] not in ("graph", "agent"):
                 return
@@ -389,6 +427,16 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
                 if spawning_tool is not None and spawning_tool.get("kind") == "tool":
                     if agent_cid not in spawning_tool["inputs"]:
                         spawning_tool["inputs"].append(agent_cid)
+
+    def on_chain_end(self, outputs: Any, *, run_id: UUID, **kwargs: Any) -> None:
+        with self._lock:
+            self._forget_root(run_id)
+            super().on_chain_end(outputs, run_id=run_id, **kwargs)
+
+    def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
+        with self._lock:
+            self._forget_root(run_id)
+            super().on_chain_error(error, run_id=run_id, **kwargs)
 
     ################################################## Chain Calls #################################################
 
