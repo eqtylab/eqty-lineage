@@ -24,7 +24,9 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 Each package documents its own usage and demos. For LangChain and LangGraph, see
 [`packages/eqty-lineage-langchain`](packages/eqty-lineage-langchain/README.md), which includes a
 before/after lineage comparison you can run with `just langchain-diff-demo`. For DeepAgents, see
-[`packages/eqty-lineage-deepagents`](packages/eqty-lineage-deepagents/README.md) and `just deepagents-demo`.
+[`packages/eqty-lineage-deepagents`](packages/eqty-lineage-deepagents/README.md) and `just deepagents-demo`,
+plus [a survey of the upstream DeepAgents examples](packages/eqty-lineage-deepagents/EXAMPLES.md) showing how to
+instrument each one.
 
 ## Develop
 

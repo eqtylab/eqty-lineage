@@ -25,6 +25,9 @@ version of DeepAgents produced the run, and installing it does not pin your `lan
 just deepagents-demo          # scripted model, no API key; writes manifests/deep-agent.json
 ```
 
+For a worked survey of the fifteen examples upstream DeepAgents ships — which eight can be instrumented, the
+exact edit each needs, and why the other seven cannot — see [EXAMPLES.md](EXAMPLES.md).
+
 ## Handler lifetime
 
 **One handler per conversation, never one shared between conversations running at once.**
@@ -56,8 +59,9 @@ async def execute_run(user_message: str) -> None:
         )
 ```
 
-`eqty_sdk.init()` is process-global and raises on a second call, so initialise it once at startup rather than per
-run. `graph_context` is backed by a `ContextVar`, so entering it inside each task is safe under `asyncio`.
+`eqty_sdk.init()` is process-global, and a second call does not raise — it logs `Config already initialized` and
+returns, leaving the first store in place. So initialise it once at startup: a per-run `init()` is silently ignored
+and every run writes into the store the first one created. `graph_context` is backed by a `ContextVar`, so entering it inside each task is safe under `asyncio`.
 
 ## What it records
 
