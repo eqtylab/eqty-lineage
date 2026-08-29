@@ -46,7 +46,8 @@ logger = logging.getLogger("eqty.deepagents")
 _WRITE_TOOL = "write_file"
 _EDIT_TOOL = "edit_file"
 _DELETE_TOOL = "delete"
-_FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, _DELETE_TOOL, "read_file"})
+_READ_TOOL = "read_file"
+_FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, _DELETE_TOOL, _READ_TOOL})
 
 
 #: a Windows drive prefix, which the backend refuses rather than normalizes
@@ -111,6 +112,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         # plan digest -> Dataset CID, and the CID of the most recent revision
         self._todo_versions: Dict[str, CID] = {}
         self._todo_latest: Optional[CID] = None
+        # (path, rendering digest) -> Document CID for a file the run only ever read; kept apart from
+        # _file_versions because a read is not the file's bytes. See _record_read.
+        self._read_cids: Dict[Tuple[str, str], CID] = {}
         # (name, identity digest) -> CID, so one skill or agent is registered once per run and two
         # things wearing the same name but configured differently stay two assets
         self._skill_cids: Dict[Tuple[str, str], CID] = {}
@@ -478,7 +482,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             if current is not None and current not in run["inputs"]:
                 run["inputs"].append(current)
 
-            if tool_name == _DELETE_TOOL:
+            if tool_name == _READ_TOOL:
+                self._pending_writes[run_id] = {"path": path, "read": True}
+            elif tool_name == _DELETE_TOOL:
                 self._pending_writes[run_id] = {"path": path, "deleted": True}
             elif tool_name == _WRITE_TOOL and isinstance(inputs.get("content"), str):
                 self._pending_writes[run_id] = {"path": path, "content": inputs["content"]}
@@ -520,6 +526,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             return
 
         path = pending["path"]
+        if pending.get("read"):
+            self._record_read(run_id, path, output)
+            return
+
         if pending.get("deleted"):
             # the file is gone; keeping its last version as "current" would chain a later write to
             # content that no longer existed, and link a later read to a version it could not have read
@@ -551,6 +561,57 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         if run is not None and replaced is not None and replaced not in run["inputs"]:
             run["inputs"].append(replaced)
         self._pending_outputs.append(cid)
+
+    def _record_read(self, run_id: UUID, path: str, output: Any) -> None:
+        """Give a file the run only ever *read* a place in the graph.
+
+        A file the agent writes is registered from the write's arguments, and one carried in graph state
+        is registered by the extractor. Neither reaches a file that already existed and is never written --
+        which is every source file an agent reads under a filesystem, store or sandbox backend, since those
+        keep the filesystem out of state entirely. Left alone, the model's answer derives from a `read_file`
+        computation that consumed nothing, and the file it was actually built from is absent.
+
+        What is recorded is what the tool returned, and it is labelled as such rather than as the file: the
+        result is a *rendering* -- line-numbered, chunked at long lines, truncated when large -- and it is
+        lossy in a way that cannot be undone. A file ending in a newline renders identically to one that
+        does not, so reconstructing the bytes is impossible, not merely fragile. Recording the rendering
+        under the file's own identity would therefore assert a content hash the file never had.
+
+        Kept out of `_file_versions` and `_file_contents` for the same reason: a rendering must never
+        become the version a later `edit_file` is reconstructed against, nor the version a later read is
+        linked to. It is an *input* -- the run consumed it and did not produce it -- and only ever when the
+        path has no real version already, so a file the run wrote is never shadowed by how it was read.
+        """
+        if self._file_latest.get(path) is not None:
+            return  # on_tool_start already linked the version this read saw
+
+        content = getattr(output, "content", output)
+        if not isinstance(content, str) or not content:
+            return
+
+        key = (path, _digest(content))
+        cid = self._read_cids.get(key)
+        if cid is None:
+            try:
+                asset = Document.from_object(
+                    {"path": path, "read": content},
+                    name=path,
+                    description=(
+                        f"File '{path}', as the deep agent read it. The tool's rendering of the file "
+                        f"rather than its bytes: the run never wrote this path, so its content was never "
+                        f"observable exactly."
+                    ),
+                    **self._verbose_metadata({"callback": "on_tool_end", "run_id": run_id, "file_path": path}),
+                )
+            except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
+                logger.debug("could not register the read of '%s'", path)
+                return
+            self._read_cids[key] = asset.cid
+            cid = asset.cid
+
+        run = self._runs.get(run_id)
+        if run is not None and cid not in run["inputs"]:
+            run["inputs"].append(cid)
 
     def _apply_edit(self, path: str, pending: Dict[str, Any]) -> Optional[str]:
         """The content ``edit_file`` produced, or ``None`` when that cannot be known exactly.

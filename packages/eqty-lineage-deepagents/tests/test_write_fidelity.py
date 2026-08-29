@@ -276,3 +276,115 @@ def test_a_credential_in_the_system_prompt_is_redacted(recording_handler, monkey
     assert payloads, "the prompt should have been registered"
     assert secret not in str(payloads[0])
     assert "You are an agent." in str(payloads[0]), "only the credential is removed"
+
+
+# ------------------------------------------------------------------ files the run only reads ----
+#
+# A filesystem, store or sandbox backend keeps the virtual filesystem out of graph state entirely, so
+# neither the extractor nor the write path ever sees a file that already existed and is never written --
+# which is every source file such an agent reads. These cover that case, and the ways recording it could
+# go wrong.
+
+
+def _fs_agent(script, root):
+    from deepagents import create_deep_agent
+    from deepagents.backends import FilesystemBackend
+
+    from scripted import ScriptedModel
+
+    return create_deep_agent(
+        model=ScriptedModel(messages=iter(script)),
+        backend=FilesystemBackend(root_dir=str(root)),
+        name="fs-agent",
+    )
+
+
+def _fs_run(handler, script, root):
+    return _fs_agent(script, root).invoke(
+        {"messages": [HumanMessage("go")]},
+        config={"callbacks": [handler], "recursion_limit": 60},
+    )
+
+
+def test_a_file_only_ever_read_still_becomes_an_entity(recording_handler, tmp_path):
+    """Without this the model's answer derives from a `read_file` that consumed nothing, and the file it
+    was actually built from is absent from the graph."""
+    (tmp_path / "seed.md").write_text("pre-existing content\n")
+
+    result = _fs_run(
+        recording_handler,
+        [call("read_file", "a", file_path="/seed.md"), AIMessage(content="done")],
+        tmp_path,
+    )
+
+    assert "files" not in result, "the filesystem backend keeps files off the state"
+    assert len(recording_handler._read_cids) == 1
+    (path, _digest_of_rendering), cid = next(iter(recording_handler._read_cids.items()))
+    assert path == "/seed.md"
+    assert str(cid) in recording_handler.inputs_of("read_file"), "the run consumed it"
+    assert str(cid) not in recording_handler.outputs_of("read_file"), "the run did not produce it"
+
+
+def test_a_read_rendering_never_stands_in_for_a_file_the_run_wrote(recording_handler, tmp_path):
+    """A file the run wrote has exact bytes; reading it back must link those, not how it was rendered."""
+    _fs_run(
+        recording_handler,
+        [
+            call("write_file", "a", file_path="/r.md", content="exact bytes\n"),
+            call("read_file", "b", file_path="/r.md"),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    )
+
+    assert recording_handler._read_cids == {}, "no rendering asset for a path with real bytes"
+    written = str(recording_handler._file_versions[("/r.md", _digest("exact bytes\n"))])
+    assert written in recording_handler.inputs_of("read_file")
+
+
+def test_a_rendering_is_never_edited_against(recording_handler, tmp_path):
+    """The safety property. The tool's result is line-numbered and drops a trailing newline, so it is
+    lossy in a way that cannot be undone -- letting it become the version an `edit_file` reconstructs
+    against would mint content the file never held."""
+    (tmp_path / "seed.md").write_text("alpha\nbeta\n")
+
+    _fs_run(
+        recording_handler,
+        [
+            call("read_file", "a", file_path="/seed.md"),
+            call("edit_file", "b", file_path="/seed.md", old_string="alpha", new_string="omega"),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    )
+
+    assert "/seed.md" not in recording_handler._file_contents, "a rendering must not be cached as content"
+    assert recording_handler._file_versions == {}, "the edit had no exact base, so it minted no version"
+    # the edit really did happen on disk -- the handler declined to guess at it, rather than missing it
+    assert (tmp_path / "seed.md").read_text() == "omega\nbeta\n"
+
+
+def test_the_same_file_read_twice_is_one_entity(recording_handler, tmp_path):
+    (tmp_path / "seed.md").write_text("stable\n")
+
+    _fs_run(
+        recording_handler,
+        [
+            call("read_file", "a", file_path="/seed.md"),
+            call("read_file", "b", file_path="/seed.md"),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    )
+
+    assert len(recording_handler._read_cids) == 1
+
+
+def test_a_failed_read_registers_nothing(recording_handler, tmp_path):
+    _fs_run(
+        recording_handler,
+        [call("read_file", "a", file_path="/missing.md"), AIMessage(content="done")],
+        tmp_path,
+    )
+
+    assert recording_handler._read_cids == {}

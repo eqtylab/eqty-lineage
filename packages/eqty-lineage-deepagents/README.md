@@ -33,6 +33,7 @@ just deepagents-demo          # scripted model, no API key; writes manifests/dee
 | a subagent | `Agent` | input to its own `agent` computation **and** to the `task` call that spawned it |
 | a subagent's execution | — | an `agent` computation (from the base handler) |
 | a virtual file | `Document` | output of the call that wrote it; input to every call that reads it |
+| a file the run only reads | `Document` | input to the `read_file` call — the tool's rendering, not the file's bytes |
 | a revision of the todo list | `Dataset` | output of the `write_todos` call that wrote it, chained to the one it replaced |
 | a loaded skill | `Skill` | input to the model turn whose state held the catalogue |
 | a model turn's system prompt | `SystemPrompt` | input to that `chat_model` computation |
@@ -91,6 +92,23 @@ So the handler reconstructs the write from the call's own arguments:
 - a call that failed registers nothing. Failure is read from the result's `status` rather than its wording: only
   some backends say "Error", while the store, LangSmith and sandbox backends report "Failed to write file …" or the
   remote's own message verbatim, and a prefix match would take those for successes.
+
+### Files the run only reads
+
+The above covers files the agent *writes*, and the extractor covers files carried in state. Neither reaches a file
+that already existed and is never written — which is every source file an agent reads under a **filesystem, store or
+sandbox backend**, since those keep the filesystem out of graph state entirely. Left alone, the model's answer
+derives from a `read_file` computation that consumed nothing.
+
+So a successful `read_file` on a path with no known version registers what the tool returned, as an **input** to that
+call. It is labelled as a rendering rather than as the file, because that is what it is: the result is line-numbered,
+chunked at long lines and truncated when large, and the loss cannot be undone — a file ending in a newline renders
+identically to one that does not, so the bytes cannot be recovered. Recording it under the file's own identity would
+assert a content hash the file never had.
+
+That asset is therefore kept apart from the version chain: a rendering never becomes the version a later `edit_file`
+is reconstructed against, never satisfies a later read, and is only registered when the path has no real version
+already — so a file the run wrote is never shadowed by how it was read.
 
 ## The plan
 
