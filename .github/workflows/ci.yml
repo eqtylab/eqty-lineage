@@ -49,10 +49,12 @@ jobs:
       - name: Install dependencies
         run: just sync
 
+      # `just fmt-check`, not `just fmt`: the latter rewrites the files and then exits 0, so formatting
+      # drift passed CI silently -- the step could only fail if ruff itself crashed.
       - name: Format
         id: format
         continue-on-error: true
-        run: just fmt
+        run: just fmt-check
 
       - name: Lint
         id: lint
