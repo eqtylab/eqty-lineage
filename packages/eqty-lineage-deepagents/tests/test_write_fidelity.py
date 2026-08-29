@@ -388,3 +388,181 @@ def test_a_failed_read_registers_nothing(recording_handler, tmp_path):
     )
 
     assert recording_handler._read_cids == {}
+
+
+# ------------------------------------------------------------------ deleting a directory ----
+#
+# `delete` removes a whole subtree, not one key: the backend drops `key == base` and everything under
+# `base + "/"`. A handler that forgets only the exact path keeps every nested file as current, which is
+# the same drift `test_a_delete_stops_the_file_being_current` guards for a single file.
+
+
+def test_deleting_a_directory_forgets_every_file_under_it(recording_handler):
+    """Asserted against the state the backend actually produced, so the subtree rule cannot drift.
+
+    `/dirx.md` is the case a prefix match gets wrong: it starts with `/dir` but is not under it.
+    """
+    result = _run(
+        recording_handler,
+        [
+            call("write_file", "a", file_path="/dir/a.md", content="A\n"),
+            call("write_file", "b", file_path="/dir/nested/b.md", content="B\n"),
+            call("write_file", "c", file_path="/dirx.md", content="X\n"),
+            call("delete", "d", file_path="/dir"),
+            AIMessage(content="done"),
+        ],
+    )
+
+    surviving = set(result["files"])
+    assert surviving == {"/dirx.md"}, "the backend removed the subtree and kept the sibling"
+    assert set(recording_handler._file_latest) == surviving
+    assert set(recording_handler._file_contents) == surviving
+
+
+def test_deleting_a_directory_leaves_a_sibling_with_a_shared_prefix_alone(recording_handler):
+    """`/dirx.md` starts with `/dir` but is not under it, so the prefix needs its trailing slash.
+
+    Driven straight at `_record_write` rather than through a run: under the state backend the extractor
+    re-registers whatever survived in state on the very next node, which heals a too-greedy delete before
+    anything can observe it. Under a filesystem or sandbox backend nothing heals it, and the sibling's
+    version chain is simply lost.
+    """
+    from uuid import uuid4
+
+    recording_handler._file_latest = {"/dir/a.md": "cid-a", "/dir/nested/b.md": "cid-b", "/dirx.md": "cid-x"}
+    recording_handler._file_contents = {"/dir/a.md": "A\n", "/dir/nested/b.md": "B\n", "/dirx.md": "X\n"}
+
+    recording_handler._record_write(
+        uuid4(),
+        {"path": "/dir", "deleted": True},
+        ToolMessage(content="Deleted directory /dir", tool_call_id="t"),
+    )
+
+    assert set(recording_handler._file_latest) == {"/dirx.md"}
+    assert set(recording_handler._file_contents) == {"/dirx.md"}
+
+
+def test_a_write_under_a_deleted_directory_replaces_nothing(recording_handler):
+    """A nested file kept as current chains the next write to content that no longer existed."""
+    _run(
+        recording_handler,
+        [
+            call("write_file", "a", file_path="/dir/a.md", content="A\n"),
+            call("delete", "b", file_path="/dir"),
+            call("write_file", "c", file_path="/dir/a.md", content="C\n"),
+            AIMessage(content="done"),
+        ],
+    )
+
+    version_a = str(recording_handler._file_versions[("/dir/a.md", _digest("A\n"))])
+    second_write = [c for c in recording_handler.computations if c[0] == "write_file"][1]
+    assert version_a not in second_write[2], "a write after its directory was deleted replaces nothing"
+
+
+def test_an_edit_under_a_deleted_directory_reconstructs_nothing(recording_handler):
+    """Reconstructing against the deleted content mints a version the file never held."""
+    _run(
+        recording_handler,
+        [
+            call("write_file", "a", file_path="/dir/a.md", content="A\n"),
+            call("delete", "b", file_path="/dir"),
+            AIMessage(content="done"),
+        ],
+    )
+
+    pending = {"path": "/dir/a.md", "old_string": "A", "new_string": "B", "replace_all": False}
+    assert recording_handler._apply_edit("/dir/a.md", pending) is None
+
+
+# ------------------------------------------------------------------ reverts seen in state ----
+#
+# `register_virtual_file` returns `replaced` independently of `created` precisely so a revert is not
+# lost. Both extractors dropped it, which is the caller mistake that docstring warns about.
+
+
+def test_a_file_reverted_in_state_supersedes_the_version_it_replaced(recording_handler):
+    """State showing the file back at earlier bytes mints nothing, but it is still what this node left."""
+    from eqty_lineage.deepagents.extractors import VirtualFileExtractor
+    from eqty_lineage.langchain import AssetSink
+
+    version_a, _, _ = recording_handler.register_virtual_file("/r.md", "A\n", {})
+    version_b, _, _ = recording_handler.register_virtual_file("/r.md", "B\n", {})
+
+    sink = AssetSink({})
+    VirtualFileExtractor(recording_handler).extract(("files",), {"/r.md": {"content": "A\n"}}, sink)
+
+    assert version_a in sink.created, "the state shows A current, so this node produced it"
+    assert version_b in sink.carried, "and A supersedes B"
+
+
+def test_a_plan_reverted_in_state_supersedes_the_revision_it_replaced(recording_handler):
+    """The same rule for the plan: a revert that links nothing reverses the one edge that matters."""
+    from eqty_lineage.deepagents.extractors import TodoListExtractor
+    from eqty_lineage.langchain import AssetSink
+
+    plan_a = [{"content": "step one", "status": "pending"}]
+    plan_b = [{"content": "step two", "status": "pending"}]
+    revision_a, _, _ = recording_handler.register_todos(plan_a, {})
+    revision_b, _, _ = recording_handler.register_todos(plan_b, {})
+
+    sink = AssetSink({})
+    TodoListExtractor(recording_handler).extract(("todos",), plan_a, sink)
+
+    assert revision_a in sink.created
+    assert revision_b in sink.carried
+
+
+def test_a_plan_reverted_to_an_earlier_revision_is_recorded_as_a_write(recording_handler):
+    """End to end: `write_todos` back to an earlier plan is a write, not a read of what it wrote."""
+    _run(
+        recording_handler,
+        [
+            call("write_todos", "a", todos=[{"content": "one", "status": "pending"}]),
+            call("write_todos", "b", todos=[{"content": "two", "status": "pending"}]),
+            call("write_todos", "c", todos=[{"content": "one", "status": "pending"}]),
+            AIMessage(content="done"),
+        ],
+    )
+
+    revision_a = str(recording_handler._todo_versions[_digest([{"content": "one", "status": "pending"}])])
+    revision_b = str(recording_handler._todo_versions[_digest([{"content": "two", "status": "pending"}])])
+
+    writes = [c for c in recording_handler.computations if c[0] == "write_todos"]
+    assert len(writes) == 3
+    assert revision_a in writes[2][3], "the restored revision is what the third call produced"
+    assert revision_a not in writes[2][2], "not an input to the call that wrote it"
+    assert revision_b in writes[2][2], "and it replaced the revision that was current"
+
+
+# ------------------------------------------------------------------ skill payloads ----
+
+
+def test_a_credential_in_a_skill_is_redacted(recording_handler, monkeypatch):
+    """Redaction has to run on the *serialized* payload, the way the system prompt does it.
+
+    `_redact` only walks dicts and lists, so an object it cannot see into passes through untouched --
+    and `_to_jsonable` then expands it via `model_dump()` into a dict whose credential key is never
+    re-examined. Skills are content-addressed blobs on disk, so that is a secret written out.
+    """
+    import eqty_lineage.deepagents as handler_module
+
+    payloads = []
+    original = handler_module.Skill.from_object
+
+    def record(obj, *args, **kwargs):
+        payloads.append(obj)
+        return original(obj, *args, **kwargs)
+
+    monkeypatch.setattr(handler_module.Skill, "from_object", record)
+
+    class _Config:
+        """Anything `_redact` cannot walk but `_to_jsonable` can expand."""
+
+        def model_dump(self):
+            return {"api_key": "sk-live-should-not-appear", "endpoint": "https://example.test"}
+
+    recording_handler.register_skill({"name": "deploy", "description": "d", "config": _Config()}, {})
+
+    assert payloads, "the skill should have been registered"
+    assert "sk-live-should-not-appear" not in str(payloads[0])
+    assert "https://example.test" in str(payloads[0]), "only the credential is removed"

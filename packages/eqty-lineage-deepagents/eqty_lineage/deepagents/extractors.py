@@ -100,7 +100,10 @@ class VirtualFileExtractor(_HandlerExtractor):
             if cid is None:
                 replacement[str(path)] = "<unregistered>"
                 continue
-            if created:
+            if created or replaced is not None:
+                # `created` alone is not the test: state showing the file back at bytes seen earlier
+                # mints nothing, but it is still what this node left behind, and keying on `created`
+                # would record the revert nowhere -- the mistake `register_virtual_file` warns about
                 if replaced is not None:
                     sink.carry(replaced)
                 sink.create(cid)
@@ -137,7 +140,8 @@ class TodoListExtractor(_HandlerExtractor):
         cid, created, replaced = self._handler.register_todos(value, sink.metadata)
         if cid is None:
             return UNCLAIMED
-        if created:
+        if created or replaced is not None:
+            # see VirtualFileExtractor: a revert mints nothing but still supersedes a revision
             if replaced is not None:
                 sink.carry(replaced)
             sink.create(cid)

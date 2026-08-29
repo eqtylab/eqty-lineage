@@ -233,8 +233,11 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         key = _digest(todos)
         known = self._todo_versions.get(key)
         if known is not None:
+            # same rule as `register_virtual_file`: a plan reverted to a revision seen before mints
+            # nothing but still replaces what was current, and returning None here loses that edge
+            previous = self._todo_latest
             self._todo_latest = known
-            return known, False, None
+            return known, False, previous if previous is not None and previous != known else None
 
         try:
             asset = Dataset.from_object(
@@ -258,7 +261,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         Content-addressed to that metadata, so editing a skill's frontmatter produces a different asset and
         the manifest records which version of the skill the run was given.
         """
-        payload = _to_jsonable(self._redact(entry))
+        # redacted *after* serialization, like the system prompt: `_redact` walks only dicts and lists,
+        # so an object it cannot see into passes through untouched and `_to_jsonable` then expands it
+        # into a dict whose credential key would never be re-examined
+        payload = self._redact(_to_jsonable(entry))
         name = str(entry.get("name") or entry.get("path") or "skill")
         key = (name, _digest(payload))
         known = self._skill_cids.get(key)
@@ -580,9 +586,15 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
 
         if pending.get("deleted"):
             # the file is gone; keeping its last version as "current" would chain a later write to
-            # content that no longer existed, and link a later read to a version it could not have read
-            self._file_latest.pop(path, None)
-            self._file_contents.pop(path, None)
+            # content that no longer existed, and link a later read to a version it could not have read.
+            # `delete` takes a directory too: the backend drops the exact key and everything under
+            # `base + "/"`, so forgetting only `path` leaves every nested file current. The prefix needs
+            # that trailing slash -- `/dirx.md` starts with `/dir` but is not under it.
+            base = path.rstrip("/")
+            prefix = f"{base}/"
+            for known in [k for k in {*self._file_latest, *self._file_contents} if k == base or k.startswith(prefix)]:
+                self._file_latest.pop(known, None)
+                self._file_contents.pop(known, None)
             return
 
         if "content" in pending:
