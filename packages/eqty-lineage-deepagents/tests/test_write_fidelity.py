@@ -241,8 +241,13 @@ def test_a_written_file_is_never_both_input_and_output(recording_handler):
         assert not (set(inputs) & set(outputs)), f"'{name}' is its own ancestor"
 
 
-def test_a_partly_unreadable_skill_catalogue_is_still_claimed(recording_handler, monkeypatch):
-    """Declining halfway would link the skills seen so far *and* re-embed the whole catalogue."""
+def test_a_partly_unreadable_skill_catalogue_is_declined_whole(recording_handler):
+    """An unreadable entry anywhere makes the extractor decline the catalogue rather than claim part of it.
+
+    Declining costs the state blob the catalogue either way. What declining *upfront* avoids is doing that
+    while also having linked the skills seen so far as inputs -- a manifest claiming the turn was given
+    three skills when the state held five is worse than one that says nothing.
+    """
     from eqty_lineage.deepagents.extractors import SkillExtractor
     from eqty_lineage.langchain import UNCLAIMED, AssetSink
 

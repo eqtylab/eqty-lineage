@@ -1,3 +1,5 @@
+set positional-arguments
+
 _:
   @just --list
 
@@ -27,14 +29,15 @@ clean:
 
 # Run the test suite
 test *ARGS:
-  uv run --no-sync pytest {{ARGS}}
+  uv run --no-sync pytest "$@"
 
 # Compare the LangChain lineage the handler produces now against a released one (default: newest tag)
 langchain-diff-demo REF="":
   #!/usr/bin/env bash
   set -euo pipefail
-  # three processes: eqty_sdk.init() is process-global and raises on a second call, so the two runs
-  # cannot share one, and the comparison reads both summaries from stdin rather than from disk
+  # three processes: eqty_sdk.init() is process-global and a second call is ignored rather than
+  # refused, so two runs in one process would silently share the first one's store; the comparison
+  # reads both summaries from stdin rather than from disk
   before=$(uv run --no-sync python examples/langchain/diff_demo.py --baseline {{REF}})
   after=$(uv run --no-sync python examples/langchain/diff_demo.py)
   printf '%s\n%s\n' "$before" "$after" \
@@ -42,7 +45,7 @@ langchain-diff-demo REF="":
 
 # Run the DeepAgents research agent and export its lineage to manifests/deep-agent.json
 deepagents-demo *ARGS:
-  uv run --no-sync python examples/deepagents/research_agent.py {{ARGS}}
+  uv run --no-sync python examples/deepagents/research_agent.py "$@"
 
 # Format all Python code in the repo
 fmt:

@@ -169,9 +169,10 @@ class SkillExtractor(_HandlerExtractor):
         if not self._claims(key_path) or not isinstance(value, list):
             return UNCLAIMED
 
-        # validated in full before anything is registered: declining halfway would leave the skills seen
-        # so far linked as carried inputs *and* re-embed the whole catalogue in the state blob, which is
-        # both of the things this extractor exists to avoid
+        # validated in full before anything is registered. Declining re-embeds the catalogue in the state
+        # blob whichever point it happens at, so that is not what decides this; declining *halfway* also
+        # leaves the entries seen so far linked as carried inputs, and a turn recorded as having been
+        # given three of five skills reads as fact rather than as the gap it is
         if not all(isinstance(entry, dict) for entry in value):
             return UNCLAIMED
 
