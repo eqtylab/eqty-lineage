@@ -398,17 +398,19 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         The base handler already decides which runs are worth tracking and which of them are subagent
         boundaries, so this reads its decision back off the run rather than repeating the rule.
         """
-        super().on_chain_start(
-            serialized,
-            inputs,
-            run_id=run_id,
-            parent_run_id=parent_run_id,
-            tags=tags,
-            metadata=metadata,
-            **kwargs,
-        )
-
+        # held across the `super()` call for the same reason as `on_tool_start`: the run this reads back
+        # is the one that call created, and a concurrent sibling must not be able to act between them
         with self._lock:
+            super().on_chain_start(
+                serialized,
+                inputs,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                tags=tags,
+                metadata=metadata,
+                **kwargs,
+            )
+
             if parent_run_id is None:
                 self._note_root(run_id)
 
@@ -499,6 +501,11 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         visible in the tool's arguments as an asset -- the arguments name a path -- so the link is made
         from the version registry instead.
         """
+        # one critical section, not two: LangGraph runs the tool calls of a single AI message concurrently
+        # on a thread pool, even under plain `.invoke()`. Releasing the lock between registering the
+        # arguments and reading the version registry lets a sibling call's write land in between, and the
+        # read is then attested against content it never saw. The lock is reentrant, so the `super()` call
+        # taking it again is free.
         with self._lock:
             self._in_tool_arguments = True
             try:
@@ -515,19 +522,18 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             finally:
                 self._in_tool_arguments = False
 
-        tool_name = (serialized or {}).get("name", "tool")
-        if tool_name not in _FILE_TOOLS or not isinstance(inputs, dict):
-            return
-        raw_path = inputs.get("file_path")
-        if not isinstance(raw_path, str) or not raw_path:
-            return
-        path = _normalize_path(raw_path)
-        if path is None:
-            # a path the backend refuses never reaches it, so the call touches no file: linking one here
-            # would put an edge to a file this call never read or replaced
-            return
+            tool_name = (serialized or {}).get("name", "tool")
+            if tool_name not in _FILE_TOOLS or not isinstance(inputs, dict):
+                return
+            raw_path = inputs.get("file_path")
+            if not isinstance(raw_path, str) or not raw_path:
+                return
+            path = _normalize_path(raw_path)
+            if path is None:
+                # a path the backend refuses never reaches it, so the call touches no file: linking one
+                # here would put an edge to a file this call never read or replaced
+                return
 
-        with self._lock:
             run = self._runs.get(run_id)
             if run is None:
                 return

@@ -89,3 +89,51 @@ def test_a_failed_run_releases_its_root(recording_handler, caplog):
         _run(deep_agent(_script("A")), recording_handler)
 
     assert [r for r in caplog.records if "runs at once" in r.message] == []
+
+
+def test_on_tool_start_never_releases_the_lock_mid_call(recording_handler, monkeypatch):
+    """A sibling tool call must not be able to act between registering arguments and reading the registry.
+
+    LangGraph turns the tool calls of one AI message into concurrent tasks on a thread pool, in plain
+    `.invoke()` as well as under `ainvoke`. When this callback took the lock twice, a `write_file`
+    completing in the gap replaced `_file_latest` for the path, and the `read_file` that opened before it
+    linked the writer's version as what it had read -- attesting the model reasoned over bytes it never saw.
+
+    The race itself cannot be scheduled deterministically, so what is asserted is the invariant that
+    removes it: the lock is held for the whole body. `_normalize_path` runs in what used to be the gap, so
+    a probe there sees the lock free exactly when the bug is present. The probe runs on another thread
+    because the lock is reentrant and would always be acquirable from this one.
+    """
+    import threading
+    from uuid import uuid4
+
+    import eqty_lineage.deepagents as handler_module
+
+    original = handler_module._normalize_path
+    acquired_by_another_thread = []
+
+    def probe(path):
+        def attempt():
+            got = recording_handler._lock.acquire(blocking=False)
+            if got:
+                recording_handler._lock.release()
+            acquired_by_another_thread.append(got)
+
+        thread = threading.Thread(target=attempt)
+        thread.start()
+        thread.join(timeout=5)
+        return original(path)
+
+    monkeypatch.setattr(handler_module, "_normalize_path", probe)
+
+    recording_handler.on_tool_start(
+        {"name": "read_file"},
+        "",
+        run_id=uuid4(),
+        inputs={"file_path": "/r.md"},
+    )
+
+    assert acquired_by_another_thread == [False], (
+        "the lock was free while on_tool_start was between registering the call and reading the "
+        "version registry, which is the window a concurrent sibling write lands in"
+    )
