@@ -116,6 +116,37 @@ EDIT_CASES = [
 ]
 
 
+@pytest.mark.parametrize("path", NORMALIZATION_CASES)
+def test_normalization_matches_the_backend_on_windows(monkeypatch, path):
+    """The POSIX differential above cannot fail on a Windows-only disagreement.
+
+    `validate_path` normalizes with `os.path.normpath`, which is `ntpath` on Windows and `posixpath`
+    everywhere else -- so a handler hard-coding one of them agrees on every input CI can run and splits
+    `.\\x` in two on the other platform, keying `/./x` where the backend keys `/x`. One real file becomes
+    two assets, and the write lands on a different entity than every later read.
+
+    Windows is simulated by rebinding the `os` name in both modules, which is local to them: patching
+    `os.path` itself would hand `ntpath` to everything else running in this process.
+    """
+    import ntpath
+    import types
+
+    from deepagents.backends import utils as backend_utils
+
+    import eqty_lineage.deepagents as handler_module
+
+    windows = types.SimpleNamespace(path=ntpath)
+    monkeypatch.setattr(backend_utils, "os", windows)
+    monkeypatch.setattr(handler_module, "os", windows)
+
+    try:
+        expected = backend_utils.validate_path(path)
+    except ValueError:
+        expected = None
+
+    assert handler_module._normalize_path(path) == expected
+
+
 @pytest.mark.parametrize(("content", "old", "new", "replace_all"), EDIT_CASES)
 def test_edit_reconstruction_matches_the_backend(recording_handler, content, old, new, replace_all):
     """`_apply_edit` must agree with DeepAgents' `perform_string_replacement` exactly.
@@ -571,3 +602,129 @@ def test_a_credential_in_a_skill_is_redacted(recording_handler, monkeypatch):
     assert payloads, "the skill should have been registered"
     assert "sk-live-should-not-appear" not in str(payloads[0])
     assert "https://example.test" in str(payloads[0]), "only the credential is removed"
+
+
+def test_two_windows_of_one_file_are_told_apart(recording_handler, monkeypatch, tmp_path):
+    """`read_file` takes offset/limit, so one file can be read in slices.
+
+    Each slice is genuinely its own rendering, so two assets is right -- but both were named `/big.md` and
+    described as the file, leaving a reader two entities each claiming to be the whole thing. The window
+    belongs in the payload as well as the name: without it, two slices that happened to render alike would
+    also collapse into a single asset.
+    """
+    import eqty_lineage.deepagents as handler_module
+
+    registered = []
+    original = handler_module.Document.from_object
+
+    def record(obj, *args, **kwargs):
+        registered.append((kwargs.get("name"), kwargs.get("description"), obj))
+        return original(obj, *args, **kwargs)
+
+    monkeypatch.setattr(handler_module.Document, "from_object", record)
+
+    (tmp_path / "big.md").write_text("".join(f"line {i}\n" for i in range(1, 40)))
+    _fs_run(
+        recording_handler,
+        [
+            call("read_file", "r1", file_path="/big.md", offset=1, limit=5),
+            call("read_file", "r2", file_path="/big.md", offset=20, limit=5),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    )
+
+    reads = [(name, desc, obj) for name, desc, obj in registered if "read" in (obj or {})]
+    assert len(reads) == 2, "each window is its own rendering"
+
+    names = [name for name, _, _ in reads]
+    assert len(set(names)) == 2, f"both renderings were named the same: {names}"
+    assert all("offset" in (obj.get("window") or {}) for _, _, obj in reads), "the window is part of the payload"
+    assert all("/big.md" in name for name in names), "and each still names the file it came from"
+
+
+def test_a_whole_file_read_is_not_labelled_as_a_window(recording_handler, monkeypatch, tmp_path):
+    """A read with no offset or limit is the file as the agent saw it, and says nothing about slices."""
+    import eqty_lineage.deepagents as handler_module
+
+    registered = []
+    original = handler_module.Document.from_object
+
+    def record(obj, *args, **kwargs):
+        registered.append((kwargs.get("name"), kwargs.get("description"), obj))
+        return original(obj, *args, **kwargs)
+
+    monkeypatch.setattr(handler_module.Document, "from_object", record)
+
+    (tmp_path / "small.md").write_text("just this\n")
+    _fs_run(recording_handler, [call("read_file", "r", file_path="/small.md"), AIMessage(content="done")], tmp_path)
+
+    reads = [(name, desc, obj) for name, desc, obj in registered if "read" in (obj or {})]
+    assert len(reads) == 1
+    name, description, payload = reads[0]
+    assert name == "/small.md"
+    assert "window" not in payload
+    assert "offset" not in description and "limit" not in description
+
+
+# ------------------------------------------------------------------ the shell ----
+#
+# `execute` is in the default tool belt and runs a shell, which can write files without naming a path.
+# Only a sandbox or local-shell backend implements it; every other backend errors the call.
+
+
+def _shell_agent(script, root):
+    from deepagents import create_deep_agent
+    from deepagents.backends import LocalShellBackend
+
+    from scripted import ScriptedModel
+
+    return create_deep_agent(
+        model=ScriptedModel(messages=iter(script)),
+        backend=LocalShellBackend(root_dir=str(root)),
+        name="shell-agent",
+    )
+
+
+def test_a_shell_command_invalidates_what_was_reconstructed(recording_handler, tmp_path):
+    """After a shell runs, the recorded filesystem is no longer known to match the real one.
+
+    What `execute` did cannot be recovered from the command, so it is not recorded. What must not happen is
+    the handler carrying on as though nothing moved: reconstructing a later `edit_file` against the content
+    it remembers mints a version the file never held, which is the one failure this package will not make.
+    """
+    _shell_agent(
+        [
+            call("write_file", "w", file_path="/r.md", content="A\n"),
+            call("execute", "x", command="printf 'rewritten\\n' > r.md"),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    ).invoke(
+        {"messages": [HumanMessage("go")]},
+        config={"callbacks": [recording_handler], "recursion_limit": 60},
+    )
+
+    assert recording_handler._file_contents == {}, "the shell may have rewritten anything it can reach"
+    assert recording_handler._file_latest == {}
+
+    pending = {"path": "/r.md", "old_string": "A", "new_string": "B", "replace_all": False}
+    assert recording_handler._apply_edit("/r.md", pending) is None, (
+        "an edit after a shell ran must reconstruct nothing rather than a version the file never held"
+    )
+
+
+def test_a_refused_shell_command_invalidates_nothing(recording_handler, tmp_path):
+    """Backends that do not implement `execute` error the call, and an error changed no file."""
+    _fs_run(
+        recording_handler,
+        [
+            call("write_file", "w", file_path="/r.md", content="A\n"),
+            call("execute", "x", command="printf 'rewritten\\n' > r.md"),
+            AIMessage(content="done"),
+        ],
+        tmp_path,
+    )
+
+    assert recording_handler._file_contents.get("/r.md") == "A\n", "a refused call is not a filesystem change"
+    assert "/r.md" in recording_handler._file_latest

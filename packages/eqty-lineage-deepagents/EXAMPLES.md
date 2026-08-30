@@ -158,12 +158,13 @@ Both use a `CompositeBackend` routing some paths to a sandbox. File recording be
 tool arguments are the same whatever executes them. The addition is `execute`, which is recorded as an ordinary
 tool computation: command in, output out. That is the default path rather than anything sandbox-aware.
 
-**Know its limit.** `execute` runs a shell, and a shell can write files. The handler reconstructs file versions
-only from the file tools (`write_file`, `edit_file`, `delete`, `read_file`), so a file that `execute` creates or
-rewrites gets no version of its own. Under the default `StateBackend` such a change still surfaces through the
-`files` state key, but under exactly these sandbox and filesystem backends — which keep the filesystem out of
-state — it is recorded nowhere, and a later `edit_file` on that path is reconstructed against content that never
-saw the shell's change. Prefer the file tools over shell redirection when you want the writes attested.
+**Know its limit.** `execute` runs a shell, and a shell can write files without naming a path. What it did
+cannot be recovered from the command, so those writes get no version of their own — prefer the file tools over
+shell redirection when you want them attested. What the handler will not do is carry on as though nothing
+moved: a successful `execute` drops the reconstruction caches, so a later `edit_file` on a path the shell may
+have touched registers nothing rather than a version the file never held, and a later `read_file` registers
+the rendering it actually got. Under the default `StateBackend` the extractor re-registers the filesystem from
+the next state it sees, so the caches refill immediately and nothing is lost.
 
 `llm-wiki` (`helpers.py:622`) routes `/raw/`, `/wiki/`, `/log.md` and `/AGENTS.md` to a local
 `FilesystemBackend(virtual_mode=True)` and everything else to a LangSmith sandbox; attach at the `agent.invoke` on

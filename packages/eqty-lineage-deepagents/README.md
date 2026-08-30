@@ -148,6 +148,19 @@ That asset is therefore kept apart from the version chain: a rendering never bec
 is reconstructed against, never satisfies a later read, and is only registered when the path has no real version
 already — so a file the run wrote is never shadowed by how it was read.
 
+### When a shell runs
+
+`execute` is in the default tool belt, and a shell can create, rewrite or remove files without naming a
+path. What it did cannot be recovered from the command, so it is not recorded. What is avoided is
+*asserting* the filesystem it left behind: a successful `execute` drops the reconstruction caches, so a
+later `edit_file` reconstructs against nothing and registers nothing, and a later `read_file` registers the
+rendering it actually got rather than linking a version that may no longer exist. A gap where a shell ran,
+rather than a version the file never held.
+
+Only a sandbox or local-shell backend implements `execute`; every other backend errors the call, and an
+error changes nothing. Under the state backend the extractor re-registers the filesystem from the next
+state it sees, so nothing is lost there either.
+
 ## The plan
 
 `TodoListMiddleware` is **not** part of the default deep agent stack — it comes from `langchain` and has to be passed

@@ -23,7 +23,7 @@ the handler works against whatever version of DeepAgents produced the run.
 import hashlib
 import json
 import logging
-import posixpath
+import os.path
 import re
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,6 +48,8 @@ _EDIT_TOOL = "edit_file"
 _DELETE_TOOL = "delete"
 _READ_TOOL = "read_file"
 _FILE_TOOLS = frozenset({_WRITE_TOOL, _EDIT_TOOL, _DELETE_TOOL, _READ_TOOL})
+#: runs a shell, so it can change the filesystem without naming a path
+_EXECUTE_TOOL = "execute"
 
 
 #: a Windows drive prefix, which the backend refuses rather than normalizes
@@ -66,10 +68,15 @@ def _normalize_path(path: str) -> Optional[str]:
     This mirrors ``validate_path`` step for step rather than approximating it, because *near* agreement is
     the worst outcome available: two paths that the backend keeps apart but this folds together are two
     real files recorded as one asset, so a write to one is attested as a rewrite of the other. ``//x`` is
-    exactly that case -- POSIX gives a doubled leading slash a meaning of its own and ``normpath``
-    preserves exactly two, so normalizing it away merges a file with its neighbour. The order matters too:
+    exactly that case -- a doubled leading slash has a meaning of its own and ``normpath`` preserves
+    exactly two, so normalizing it away merges a file with its neighbour. The order matters too:
     ``normpath`` runs *before* backslashes are rewritten, since on POSIX a backslash is an ordinary
     filename character until that rewrite.
+
+    ``os.path.normpath`` for the same reason -- it is the one ``validate_path`` calls, so it is ``ntpath``
+    on Windows and ``posixpath`` everywhere else, exactly as the backend's is. Hard-coding ``posixpath``
+    agreed on every POSIX input and split ``.\\x`` in two on Windows, where the backend keys ``/x`` and
+    this keyed ``/./x``; no test could catch it, because on POSIX the two modules are the same one.
 
     Where ``validate_path`` raises -- a ``..`` component, a leading ``~``, a Windows drive letter -- this
     returns None. Such a call never reaches the backend, so there is nothing to record; rewriting the path
@@ -80,7 +87,7 @@ def _normalize_path(path: str) -> Optional[str]:
     if _DRIVE_PREFIX.match(path):
         return None
 
-    normalized = posixpath.normpath(path).replace("\\", "/")
+    normalized = os.path.normpath(path).replace("\\", "/")
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
     if ".." in normalized.split("/"):
@@ -372,9 +379,15 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         """
         if self._pending_outputs:
             pending, self._pending_outputs = self._pending_outputs, []
-            # excluded from the inputs as well as the outputs: a backend that echoes its write back in a
-            # ``Command`` update has the extractor carry that version in as an input, and adding it as an
-            # output too would make the computation its own ancestor
+            # A version already among the inputs is not added as an output, which would make the
+            # computation its own ancestor. No shipped backend reaches this: `write_file` returns a plain
+            # `ToolMessage`, not a `Command` carrying the new content, and a rewrite with unchanged bytes
+            # registers nothing to hand over. It guards a backend that echoes its write back.
+            #
+            # Note what it does *not* do: the collision is settled in favour of the input, so if this ever
+            # did fire the write's own product would stay an input to the write. For a backend that echoes,
+            # dropping it from the inputs and keeping it as an output is the truthful resolution -- worth
+            # revisiting with a backend in hand rather than guessing at one.
             output_cids = [
                 *output_cids,
                 *(cid for cid in pending if cid not in output_cids and cid not in input_cids),
@@ -523,6 +536,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
                 self._in_tool_arguments = False
 
             tool_name = (serialized or {}).get("name", "tool")
+            if tool_name == _EXECUTE_TOOL:
+                self._pending_writes[run_id] = {"executed": True}
+                return
             if tool_name not in _FILE_TOOLS or not isinstance(inputs, dict):
                 return
             raw_path = inputs.get("file_path")
@@ -543,7 +559,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
                 run["inputs"].append(current)
 
             if tool_name == _READ_TOOL:
-                self._pending_writes[run_id] = {"path": path, "read": True}
+                # `read_file` takes offset/limit, so two calls can return different windows of one file.
+                # Without the window in the payload they are two assets wearing the same name.
+                window = {k: inputs[k] for k in ("offset", "limit") if isinstance(inputs.get(k), int)}
+                self._pending_writes[run_id] = {"path": path, "read": True, "window": window}
             elif tool_name == _DELETE_TOOL:
                 self._pending_writes[run_id] = {"path": path, "deleted": True}
             elif tool_name == _WRITE_TOOL and isinstance(inputs.get("content"), str):
@@ -585,9 +604,26 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         if _is_tool_error(output):
             return
 
+        if pending.get("executed"):
+            # A shell can create, rewrite or remove files, and the command says nothing about which -- so
+            # what it did cannot be recorded. What can be avoided is *asserting* the filesystem it left
+            # behind: the reconstruction caches are dropped, so a later `edit_file` reconstructs against
+            # nothing and registers nothing, and a later `read_file` registers the rendering it actually
+            # got instead of linking a version that may no longer exist. A gap where a shell ran, rather
+            # than a version the file never held.
+            #
+            # `execute` only reaches here on success, and only a sandbox or local-shell backend implements
+            # it -- every other backend errors the call -- so this does not fire for the state and
+            # filesystem backends, where the shell and the agent's filesystem are not the same thing
+            # anyway. Under the state backend the extractor re-registers everything from the next state it
+            # sees, so nothing is lost there either.
+            self._file_latest.clear()
+            self._file_contents.clear()
+            return
+
         path = pending["path"]
         if pending.get("read"):
-            self._record_read(run_id, path, output)
+            self._record_read(run_id, path, output, pending.get("window") or {})
             return
 
         if pending.get("deleted"):
@@ -628,7 +664,7 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             run["inputs"].append(replaced)
         self._pending_outputs.append(cid)
 
-    def _record_read(self, run_id: UUID, path: str, output: Any) -> None:
+    def _record_read(self, run_id: UUID, path: str, output: Any, window: Dict[str, int]) -> None:
         """Give a file the run only ever *read* a place in the graph.
 
         A file the agent writes is registered from the write's arguments, and one carried in graph state
@@ -647,6 +683,11 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         become the version a later `edit_file` is reconstructed against, nor the version a later read is
         linked to. It is an *input* -- the run consumed it and did not produce it -- and only ever when the
         path has no real version already, so a file the run wrote is never shadowed by how it was read.
+
+        `read_file` takes `offset` and `limit`, so one file can be read in several windows. Each is its own
+        rendering, and the window is part of the payload and of the name: without it a manifest holds two
+        assets both called `/big.md` and both described as the file, with nothing saying either is a slice
+        of it -- and two windows that happened to render alike would collapse into one.
         """
         if self._file_latest.get(path) is not None:
             return  # on_tool_start already linked the version this read saw
@@ -655,17 +696,21 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
         if not isinstance(content, str) or not content:
             return
 
-        key = (path, _digest(content))
+        payload: Dict[str, Any] = {"path": path, "read": content}
+        if window:
+            payload["window"] = dict(sorted(window.items()))
+        slice_of = "".join(f", {name} {value}" for name, value in sorted(window.items()))
+        key = (path, _digest(payload))
         cid = self._read_cids.get(key)
         if cid is None:
             try:
                 asset = Document.from_object(
-                    {"path": path, "read": content},
-                    name=path,
+                    payload,
+                    name=f"{path} ({slice_of.lstrip(', ')})" if window else path,
                     description=(
-                        f"File '{path}', as the deep agent read it. The tool's rendering of the file "
-                        f"rather than its bytes: the run never wrote this path, so its content was never "
-                        f"observable exactly."
+                        f"File '{path}', as the deep agent read it{slice_of}. The tool's rendering of the "
+                        f"file rather than its bytes: the run never wrote this path, so its content was "
+                        f"never observable exactly."
                     ),
                     **self._verbose_metadata({"callback": "on_tool_end", "run_id": run_id, "file_path": path}),
                 )

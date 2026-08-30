@@ -86,7 +86,10 @@ class VirtualFileExtractor(_HandlerExtractor):
         replacement: Dict[str, str] = {}
         for path, data in sorted(value.items(), key=lambda item: str(item[0])):
             if data is None:
-                # the backend queues a None into the files channel to mark a deletion
+                # The backend queues a None into the files channel to mark a deletion, but the channel's
+                # reducer pops the key rather than storing the marker -- so the state handed to an
+                # extractor never carries one, and this has no effect on the registries by design. It
+                # covers a raw delta arriving in a `Command` update, and a reducer that stops popping.
                 replacement[str(path)] = "<deleted>"
                 continue
             content = _file_content(data)
