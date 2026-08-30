@@ -1,30 +1,10 @@
 """Fixtures for the LangChain handler tests.
 
-``eqty_sdk.init()`` is process-global and raises on a second call, so the SDK is initialised once per
-session rather than per test. It writes a ``.eqty_sdk`` store relative to the working directory, which is
-pointed at a temporary directory to keep runs from depositing state in the repository.
+The initialised SDK itself comes from the root ``conftest.py``: it has to be shared, because
+``eqty_sdk.init()`` is process-global and a second call is ignored rather than refused.
 """
 
-import os
-
 import pytest
-
-
-@pytest.fixture(scope="session")
-def sdk(tmp_path_factory):
-    """One initialised SDK context for the whole run, or skip if the SDK is not installed."""
-    eqty_sdk = pytest.importorskip("eqty_sdk", reason="eqty-sdk is not installed")
-
-    store = tmp_path_factory.mktemp("eqty-store")
-    previous = os.getcwd()
-    os.chdir(store)
-    try:
-        ctx = eqty_sdk.Context.new("eqty-lineage-langchain tests")
-        eqty_sdk.init(default_context=ctx).set_store_all_blobs(True)
-        eqty_sdk.set_active_signer(eqty_sdk.Signer.new(name="eqty-lineage-langchain-tests", _load_if_exists=True))
-        yield ctx
-    finally:
-        os.chdir(previous)
 
 
 @pytest.fixture

@@ -35,6 +35,11 @@ url = "https://pypi.eqtylab.io/simple/"
 publish-url = "https://pypi.eqtylab.io/"
 explicit = true
 
+[tool.pytest.ini_options]
+# Anchors rootdir at the workspace root, so the shared `sdk` fixture in the root conftest.py stays in
+# scope even when pytest is invoked from inside one package's directory.
+testpaths = ["packages/eqty-lineage-langchain/tests", "packages/eqty-lineage-deepagents/tests"]
+
 [tool.mypy]
 python_executable = ".venv/bin/python"
 
