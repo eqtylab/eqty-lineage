@@ -47,6 +47,22 @@ from eqty_lineage.langchain.extractors import AssetSink, PathExtractor, StateExt
 logger = logging.getLogger("eqty.langgraph")
 
 
+def _is_graph_control_flow(error: BaseException) -> bool:
+    """Whether LangGraph raised this to move the graph rather than to report a failure.
+
+    LangGraph signals control flow with exceptions. ``interrupt()`` unwinds the graph with a
+    ``GraphInterrupt`` so a human can approve a tool call; ``Command(goto=...)`` crossing a subgraph
+    boundary raises ``ParentCommand``; delegation raises ``GraphDelegate``. All of them subclass
+    ``GraphBubbleUp``, and all of them arrive at ``on_chain_error`` looking exactly like a crash.
+
+    They are not crashes. A run that paused for approval goes on to finish on resume, and recording an
+    ``*_error`` computation for it asserts a failure that never happened -- in a manifest whose whole
+    purpose is to say what did. Matched on the base class *name* because this package depends on
+    ``langchain-core`` alone and must not import ``langgraph``.
+    """
+    return any(cls.__name__ == "GraphBubbleUp" for cls in type(error).__mro__)
+
+
 def _synchronized(method: Callable) -> Callable:
     """Serialize a callback against the handler's lock.
 
@@ -62,6 +78,14 @@ def _synchronized(method: Callable) -> Callable:
             return method(self, *args, **kwargs)
 
     return wrapper
+
+
+def _log_run_ended(kind: str, run_id: UUID, error: BaseException) -> None:
+    """One place deciding how an ended run is announced, so a pause never reads as a crash in the logs."""
+    if _is_graph_control_flow(error):
+        logger.debug("%s run %s suspended: %s", kind, run_id, type(error).__name__)
+    else:
+        logger.warning("%s run %s failed: %s: %s", kind, run_id, type(error).__name__, error)
 
 
 class EqtyCallbackHandler(BaseCallbackHandler):
@@ -351,6 +375,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         """
         if run is None:
             return
+        if _is_graph_control_flow(error):
+            # the run did not fail, it suspended; the turn that resumes it records the node normally, so
+            # dropping it here loses nothing and inventing a failure would lose the truth
+            return
         failure = self._finalize_error(run, error)
         enclosing = run.get("node")
         if failure is not None and enclosing is not None:
@@ -594,7 +622,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning("%s run %s failed: %s: %s", "chain", run_id, type(error).__name__, error)
+        _log_run_ended("chain", run_id, error)
         self._parents.pop(run_id, None)
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
@@ -708,7 +736,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning("%s run %s failed: %s: %s", "llm", run_id, type(error).__name__, error)
+        _log_run_ended("llm", run_id, error)
         self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## LLM Calls ###################################################
@@ -832,7 +860,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_tool_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning("%s run %s failed: %s: %s", "tool", run_id, type(error).__name__, error)
+        _log_run_ended("tool", run_id, error)
         self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## Tool Calls ##################################################
@@ -957,7 +985,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
 
     @_synchronized
     def on_retriever_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
-        logger.warning("retriever run %s failed: %s: %s", run_id, type(error).__name__, error)
+        _log_run_ended("retriever", run_id, error)
         self._record_failure(self._runs.pop(run_id, None), error)
 
     ################################################## Retrievers ##################################################
