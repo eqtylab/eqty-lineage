@@ -1,0 +1,30 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "eqty-lineage-deepagents"
+version = "0.0.0"
+description = "EQTY lineage callback handler for DeepAgents."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "eqty-sdk",
+    "eqty-lineage-langchain>=0.1.0",
+    "langchain-core>=0.3",
+]
+
+[tool.uv.sources]
+eqty-sdk = { index = "eqty" }
+eqty-lineage-langchain = { workspace = true }
+
+[[tool.uv.index]]
+name = "eqty"
+url = "https://pypi.eqtylab.io/simple/"
+publish-url = "https://pypi.eqtylab.io/"
+explicit = true
+
+[tool.uv.build-backend]
+# flat layout (module dir at package root, no src/); dotted name = namespace package
+module-root = ""
+module-name = "eqty_lineage.deepagents"
