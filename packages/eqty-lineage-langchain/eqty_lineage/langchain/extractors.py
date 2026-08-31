@@ -48,14 +48,9 @@ class AssetSink:
 class StateExtractor:
     """Lifts part of a graph state into assets of its own, and out of the bulk state blob.
 
-    Without this, everything a node's state contains is re-serialized into that node's state Dataset,
-    every time -- so a filesystem carried in state is embedded once per node, and no file is ever an
-    entity in its own right. An extractor claims a value, registers whatever assets represent it, and
-    returns what should stand in its place in the payload.
-
-    Subclass and register with ``EqtyCallbackHandler.add_extractor`` to teach the handler about a
-    framework's own state. The DeepAgents package uses this to turn its virtual filesystem into real
-    file assets without this package ever importing ``deepagents``.
+    Claim a value, register the assets that represent it, return what should stand in its place. Subclass
+    and register with ``EqtyCallbackHandler.add_extractor`` to teach the handler about a framework's own
+    state without this package importing that framework.
     """
 
     def extract(self, key_path: Tuple[str, ...], value: Any, sink: AssetSink) -> Any:
@@ -70,13 +65,9 @@ class StateExtractor:
 class PathExtractor(StateExtractor):
     """Registers an existing ``pathlib.Path`` in state as a Dataset of its own.
 
-    Versions are keyed on ``(path, content CID)``, not on the path alone. A file rewritten between two
-    nodes is a genuinely different entity, and reusing the first sighting's asset would attest content the
-    later computation never saw. The version a rewrite replaced is carried as an input, which is what
-    makes successive edits a chain rather than unrelated assets.
-
-    The cost is re-hashing each path per sighting, which is what ``Dataset.from_path`` would do anyway on
-    a miss.
+    Keyed on ``(path, content CID)``, not the path alone: reusing the first sighting's asset would attest
+    content a later computation never saw. The version a rewrite replaced is carried as an input, which
+    makes successive edits a chain.
     """
 
     def __init__(self, handler: "EqtyCallbackHandler") -> None:

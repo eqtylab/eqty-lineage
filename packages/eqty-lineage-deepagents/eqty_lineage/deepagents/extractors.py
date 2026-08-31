@@ -38,13 +38,11 @@ def _file_content(data: Any) -> Optional[str]:
 
 
 def _state_paths(key: str) -> frozenset:
-    """Where a state key legitimately appears, as opposed to where it merely looks like it does.
+    """Where a state key legitimately appears: the top of a state, or a ``Command`` update.
 
-    A state key is claimed at the top of a state, and inside the ``update`` of a ``Command`` -- which is
-    how a tool applies one, and how ``task`` hands a subagent's work back. Claiming the key anywhere it
-    turns up would also claim it inside an assistant message's ``tool_calls``, where the same name is the
-    argument the model *asked* for rather than the state that resulted: the request would be attributed to
-    the model turn that made it, and the tool call that applied it would produce nothing.
+    Not anywhere it turns up -- inside an assistant message's ``tool_calls`` the same name is the argument
+    the model *asked* for, and claiming it there attributes the request to the model turn instead of the
+    tool call that applied it.
     """
     return frozenset({(key,), ("update", key)})
 
@@ -66,14 +64,9 @@ class _HandlerExtractor(StateExtractor):
 class VirtualFileExtractor(_HandlerExtractor):
     """Registers each file in the DeepAgents virtual filesystem as a ``Document`` of its own.
 
-    Claims the ``files`` state key -- the key the ``StateBackend`` writes to -- both at the top of a state
-    and inside the ``Command`` update that ``task`` returns from a subagent. Both are the same filesystem
-    seen from different places, so both are claimed: leaving the ``Command`` unclaimed would embed every
-    file the subagent touched in the ``task`` tool's output blob.
-
-    Versions are keyed on ``(path, content)``, exactly as :class:`~eqty_lineage.langchain.PathExtractor`
-    keys real paths on ``(path, content CID)``. Same bytes at the same path are one entity carried through;
-    new bytes are a new version, with the one it replaced linked as an input.
+    Claims the ``files`` key at the top of a state and inside the ``Command`` update ``task`` returns --
+    both are the same filesystem, and leaving the latter unclaimed embeds every file a subagent touched in
+    the ``task`` output blob. Versions are keyed on ``(path, content)``.
     """
 
     #: see _state_paths
@@ -122,13 +115,9 @@ class VirtualFileExtractor(_HandlerExtractor):
 class TodoListExtractor(_HandlerExtractor):
     """Registers each revision of the agent's plan as a ``Dataset`` of its own.
 
-    ``TodoListMiddleware`` is not part of the default deep agent stack -- it comes from ``langchain`` and
-    has to be passed explicitly -- so this claims the key only when it is actually there.
-
-    ``write_todos`` returns a ``Command`` whose update carries the new list, which is why a revision is
-    created as an output of the tool call that wrote it rather than merely appearing in the next node's
-    state. The revision it replaced is linked as an input, so a plan revised four times is four assets in
-    a chain rather than four unrelated ones.
+    The revision it replaced is linked as an input, so a plan revised four times is a chain of four rather
+    than four unrelated assets. ``TodoListMiddleware`` is not in the default deep agent stack, so the key
+    is claimed only when present.
     """
 
     #: see _state_paths

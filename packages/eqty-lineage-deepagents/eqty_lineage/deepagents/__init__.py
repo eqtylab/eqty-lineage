@@ -57,36 +57,23 @@ _DRIVE_PREFIX = re.compile(r"^[a-zA-Z]:")
 
 
 def _normalize_path(path: str) -> Optional[str]:
-    """A virtual path in the form the filesystem actually keys it under, or None if it has no such form.
+    """The form the filesystem keys this path under, or None if the backend would refuse it.
 
-    DeepAgents puts every path through ``validate_path`` before the backend sees it, so the key in state
-    is the normalized form -- a model that asks to write ``report.md`` creates ``/report.md``. Keying the
-    tool's raw argument would make those two sightings two files: the write would land on one entity and
-    every later read on another, and the file the run produced would be an output of nothing. Live models
-    omit the leading slash routinely.
-
-    This mirrors ``validate_path`` step for step rather than approximating it, because *near* agreement is
-    the worst outcome available: two paths that the backend keeps apart but this folds together are two
-    real files recorded as one asset, so a write to one is attested as a rewrite of the other. ``//x`` is
-    exactly that case -- a doubled leading slash has a meaning of its own and ``normpath`` preserves
-    exactly two, so normalizing it away merges a file with its neighbour. The order matters too:
-    ``normpath`` runs *before* backslashes are rewritten, since on POSIX a backslash is an ordinary
-    filename character until that rewrite.
-
-    ``os.path.normpath`` for the same reason -- it is the one ``validate_path`` calls, so it is ``ntpath``
-    on Windows and ``posixpath`` everywhere else, exactly as the backend's is. Hard-coding ``posixpath``
-    agreed on every POSIX input and split ``.\\x`` in two on Windows, where the backend keys ``/x`` and
-    this keyed ``/./x``; no test could catch it, because on POSIX the two modules are the same one.
-
-    Where ``validate_path`` raises -- a ``..`` component, a leading ``~``, a Windows drive letter -- this
-    returns None. Such a call never reaches the backend, so there is nothing to record; rewriting the path
-    into something plausible instead would key the call against a file it never touched.
+    Mirrors ``validate_path`` step for step: near agreement is worse than none, since two paths the
+    backend keeps apart but this folds together become one asset, and a write to one is then attested as
+    a rewrite of the other.
     """
     if ".." in PurePosixPath(path.replace("\\", "/")).parts or path.startswith("~"):
         return None
     if _DRIVE_PREFIX.match(path):
         return None
 
+    # `os.path`, not `posixpath`: `validate_path` uses `os.path`, so this must be `ntpath` on Windows
+    # too. Hard-coding `posixpath` agreed on every POSIX input and split `.\x` in two on Windows -- a
+    # divergence no test on POSIX can reach, because there the two modules are the same one.
+    # Order matters: normpath runs before the backslash rewrite, since on POSIX a backslash is an
+    # ordinary filename character until then. `//x` keeps its doubled slash -- normpath preserves
+    # exactly two, and collapsing it would merge a file with its neighbour.
     normalized = os.path.normpath(path).replace("\\", "/")
     if not normalized.startswith("/"):
         normalized = f"/{normalized}"
@@ -145,19 +132,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     def _note_root(self, run_id: UUID) -> None:
         """Warn once if this handler is observing two runs at the same time.
 
-        The path and plan registries are keyed by path, or by nothing at all, because they describe one
-        run's filesystem. Point a single handler at two concurrent runs and those keys collide: the second
-        run's write of ``/report.md`` chains off the first run's version, and the manifest asserts that one
-        run revised the other's file when they share nothing but a handler. It is a quiet failure -- the
-        graph looks well-formed, it is simply wrong -- which is why it is worth a warning.
-
-        Reusing a handler *sequentially* is not the same thing and is not flagged: across the turns of one
-        conversation it is what makes a file written in the first turn and edited in the third chain
-        properly, rather than appearing as two unrelated entities. The rule is one handler per
-        conversation, never one shared between conversations running at once.
-
-        Warned once per handler, since a run whose callbacks never complete would otherwise leave this
-        reporting a collision on every run that follows.
+        One handler per conversation. Two *concurrent* runs collide on the path-keyed registries and the
+        manifest ends up asserting that one run revised the other's file. Sequential reuse is fine and is
+        deliberately not flagged -- it is what chains a file written in turn one to an edit in turn three.
         """
         if self._open_roots and not self._warned_about_sharing:
             self._warned_about_sharing = True
@@ -191,15 +168,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     ) -> Tuple[Optional[CID], bool, Optional[CID]]:
         """Register one version of a virtual file, or return the version already registered.
 
-        Returns ``(cid, created, replaced)``. ``created`` says whether this call minted a new asset;
-        ``replaced`` is the version this one supersedes at that path, which the caller links as an input so
-        successive edits form a chain rather than unrelated assets. The two are independent: a file
-        *reverted* to bytes seen earlier mints nothing but still replaces something, and a caller that
-        keyed on ``created`` alone would record the revert nowhere and leave the manifest asserting that
-        the superseded content was still current.
-
-        The path is part of the payload, so the same bytes written to two paths are two files rather than
-        one entity wearing whichever name happened to be registered first.
+        Returns ``(cid, created, replaced)``. ``created`` and ``replaced`` are independent: a file reverted
+        to bytes seen earlier mints nothing but still supersedes something, so a caller keying on
+        ``created`` alone records the revert nowhere.
         """
         normalized = _normalize_path(path)
         if normalized is None:
@@ -368,14 +339,11 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     ################################################## Registries ##################################################
 
     def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
-        """Fold in any outputs the callback that is finalizing could not put in ``output_cids`` itself.
+        """Fold in outputs the finalizing callback could not put in ``output_cids`` itself.
 
-        A file written by a tool is one: the DeepAgents state backend applies writes through LangGraph's
-        channel API, so the new content is in neither the tool's result nor the enclosing node's output
-        state, and the base handler has nowhere to hang it. ``on_tool_end`` reconstructs it and leaves it
-        here for the ``_finalize`` its own ``super()`` call is about to make -- a single hand-off, made
-        under the handler's lock and cleared in a ``finally``, so it can neither race another callback nor
-        leak into the next computation if registration raises.
+        ``on_tool_end`` reconstructs a written file and leaves it here for the ``_finalize`` its own
+        ``super()`` call is about to make. Held under the lock and cleared in a ``finally``, so it cannot
+        leak into the next computation.
         """
         if self._pending_outputs:
             pending, self._pending_outputs = self._pending_outputs, []
@@ -578,11 +546,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     def on_tool_end(self, output: Any, *, run_id: UUID, **kwargs: Any) -> None:
         """Record the file a successful filesystem call wrote, as an output of that call.
 
-        Without this a written file is an input to every computation that later reads it and an output of
-        none, which in a provenance graph says the run found it already there. It says that because the
-        DeepAgents state backend writes through LangGraph's channel API: the content reaches ``files`` in
-        state without ever passing through the tool's result, so the only place it can be attributed to
-        the call that produced it is here, from the arguments the call was made with.
+        The state backend writes through LangGraph's channel API, so the content never passes through the
+        tool result. Reconstructed from the call's arguments -- otherwise a written file is an output of
+        nothing, which in a provenance graph says the run found it already there.
         """
         with self._lock:
             pending = self._pending_writes.pop(run_id, None)
@@ -667,27 +633,13 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     def _record_read(self, run_id: UUID, path: str, output: Any, window: Dict[str, int]) -> None:
         """Give a file the run only ever *read* a place in the graph.
 
-        A file the agent writes is registered from the write's arguments, and one carried in graph state
-        is registered by the extractor. Neither reaches a file that already existed and is never written --
-        which is every source file an agent reads under a filesystem, store or sandbox backend, since those
-        keep the filesystem out of state entirely. Left alone, the model's answer derives from a `read_file`
-        computation that consumed nothing, and the file it was actually built from is absent.
+        Under filesystem, store and sandbox backends the filesystem is not in state, so a file that is read
+        but never written reaches neither the write path nor the extractor -- and the answer derived from
+        it would consume nothing.
 
-        What is recorded is what the tool returned, and it is labelled as such rather than as the file: the
-        result is a *rendering* -- line-numbered, chunked at long lines, truncated when large -- and it is
-        lossy in a way that cannot be undone. A file ending in a newline renders identically to one that
-        does not, so reconstructing the bytes is impossible, not merely fragile. Recording the rendering
-        under the file's own identity would therefore assert a content hash the file never had.
-
-        Kept out of `_file_versions` and `_file_contents` for the same reason: a rendering must never
-        become the version a later `edit_file` is reconstructed against, nor the version a later read is
-        linked to. It is an *input* -- the run consumed it and did not produce it -- and only ever when the
-        path has no real version already, so a file the run wrote is never shadowed by how it was read.
-
-        `read_file` takes `offset` and `limit`, so one file can be read in several windows. Each is its own
-        rendering, and the window is part of the payload and of the name: without it a manifest holds two
-        assets both called `/big.md` and both described as the file, with nothing saying either is a slice
-        of it -- and two windows that happened to render alike would collapse into one.
+        Recorded as a *rendering*, not as the file: the tool result is line-numbered, chunked and
+        truncated, and a file ending in a newline renders identically to one that does not, so the bytes
+        cannot be recovered. It is an input only, and only when the path has no real version already.
         """
         if self._file_latest.get(path) is not None:
             return  # on_tool_start already linked the version this read saw
@@ -727,11 +679,8 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
     def _apply_edit(self, path: str, pending: Dict[str, Any]) -> Optional[str]:
         """The content ``edit_file`` produced, or ``None`` when that cannot be known exactly.
 
-        ``edit_file`` reports only that it succeeded, so the resulting content has to be derived from the
-        version the edit was made against. That is a plain string replacement -- and the same occurrence
-        rules the backend applies are re-checked here, so a case where this would be guessing produces
-        nothing rather than a file version the run never had. The file then registers at its next sighting
-        in state, as an input, which understates its provenance but does not misstate it.
+        Re-applies the replacement under the backend's own occurrence rules; anything ambiguous returns
+        None rather than a version the file never held.
         """
         current = self._file_contents.get(path)
         if current is None:
@@ -748,15 +697,9 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
 def _is_tool_error(output: Any) -> bool:
     """Whether a filesystem tool reported a failure in its result rather than by raising.
 
-    DeepAgents' filesystem tools return their errors as ordinary text -- a missing string, an ambiguous
-    match, a backend that was unreachable -- so a call that "succeeded" as far as the callbacks are
-    concerned may have changed nothing.
-
-    ``status`` is the reliable signal and is checked first: the wording is the backend's own, and only
-    some of them say "Error" (the store, LangSmith and sandbox backends variously report "Failed to write
-    file ..." or the remote's message verbatim). Reading the text alone would take those for successes and
-    attest a file version that was never written. The prefix is still honoured, for a result that carries
-    no status at all.
+    ``status`` first, then the text prefix as a fallback: only some backends say "Error" -- store,
+    LangSmith and sandbox report "Failed to write file ..." or the remote's message verbatim, so matching
+    on wording alone reads those as successes.
     """
     if getattr(output, "status", None) == "error":
         return True

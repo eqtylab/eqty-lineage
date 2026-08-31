@@ -6,10 +6,9 @@ manifest does and does not contain.
 
 Surveyed against upstream commit `a1af029` (2026-08-28), `deepagents` 0.7.11.
 
-**Eight can be instrumented; seven cannot.** The seven are not a shortcoming of this package — they have no
-in-process Python entrypoint for a callback to attach to. Nothing in the eight *breaks*: no example errors, and
-none produces a wrong manifest. Where recording is incomplete the failure is silent under-recording, never
-misrecording, which is the direction the handler is built to fail in.
+**Eight are covered here.** Nothing in them *breaks*: no example errors, and none produces a wrong manifest.
+Where recording is incomplete the failure is silent under-recording, never misrecording, which is the direction
+the handler is built to fail in.
 
 ## The survey
 
@@ -23,13 +22,6 @@ misrecording, which is the direction the handler is built to fail in.
 | `better-harness` | `FilesystemBackend(virtual_mode=True)` | `better_harness/agent.py:214`, `:616` | Files via tool calls |
 | `llm-wiki` | `CompositeBackend` — LangSmith sandbox + filesystem | `helpers.py:639` — `agent.invoke` | Files via tool calls |
 | `nvidia_deep_agent` | `CompositeBackend` — Modal sandbox | `src/agent.py:90` — module-level graph | Files via tool calls |
-| `ralph_mode` | — | **nothing to attach to** — runs in a server subprocess | — |
-| `deploy-coding-agent` | — | **nothing to attach to** — `agent.json`, platform-hosted | — |
-| `deploy-content-writer` | — | **nothing to attach to** — `agent.json`, platform-hosted | — |
-| `deploy-gtm-agent` | — | **nothing to attach to** — `agent.json`, platform-hosted | — |
-| `deploy-mcp-docs-agent` | — | **nothing to attach to** — `agent.json`, platform-hosted | — |
-| `talon` | — | **nothing to attach to** — Docker runtime | — |
-| `downloading_agents` | — | **nothing to attach to** — ships a `.zip` | — |
 
 ## The pattern
 
@@ -210,19 +202,12 @@ agent's belt, which content-addresses those to their real implementations.
 Covered under `async-subagent-server` above, and the single most likely way to get a wrong manifest out of this
 package. One handler per run.
 
-## The seven that cannot be instrumented
+## What this does not cover
 
-`ralph_mode` delegates to `deepagents-cli`'s `run_non_interactive`, which starts a **`langgraph dev` server
-subprocess** and drives it over the SDK. It builds its own `RunnableConfig` internally and exposes no callbacks
-parameter, and even if it did, a callback is an in-process Python object that cannot cross into another process.
-
-`deploy-coding-agent`, `deploy-content-writer`, `deploy-gtm-agent` and `deploy-mcp-docs-agent` are `agent.json`
-manifests deployed with `deepagents deploy` and run on LangSmith's platform. `talon` ships a Dockerfile and
-compose runtime; `downloading_agents` ships a `.zip`. In none of them is there a Python call site to pass
-`config={"callbacks": [...]}` to, and callbacks are not serialisable across a platform API.
-
-This is a deployment-model limitation rather than anything about the handler. Recording a platform-hosted run
-would need a hook the platform exposes; we do not claim support for one today.
+An in-process Python call site is what a callback attaches to. Examples that run the agent somewhere else —
+in a `langgraph dev` subprocess, on LangSmith's platform from an `agent.json`, or inside a container — have no
+such call site, so there is nothing to pass `config={"callbacks": [...]}` to. That is a deployment-model
+limitation rather than anything about the handler; recording those would need a hook the runtime exposes.
 
 ## What was verified, and what was not
 
@@ -232,4 +217,4 @@ the write/edit/read chain, read-only renderings and the concurrency warning.
 
 The examples themselves were **read, not executed**: nearly all require paid API keys (Anthropic, Tavily,
 LangSmith, NVIDIA, Modal). The sandbox behaviour of `llm-wiki` and `nvidia_deep_agent` is therefore reasoned from
-the backend contract rather than observed, and `interrupt_on` is untested in any configuration.
+the backend contract rather than observed.

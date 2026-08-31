@@ -50,15 +50,9 @@ logger = logging.getLogger("eqty.langgraph")
 def _is_graph_control_flow(error: BaseException) -> bool:
     """Whether LangGraph raised this to move the graph rather than to report a failure.
 
-    LangGraph signals control flow with exceptions. ``interrupt()`` unwinds the graph with a
-    ``GraphInterrupt`` so a human can approve a tool call; ``Command(goto=...)`` crossing a subgraph
-    boundary raises ``ParentCommand``; delegation raises ``GraphDelegate``. All of them subclass
-    ``GraphBubbleUp``, and all of them arrive at ``on_chain_error`` looking exactly like a crash.
-
-    They are not crashes. A run that paused for approval goes on to finish on resume, and recording an
-    ``*_error`` computation for it asserts a failure that never happened -- in a manifest whose whole
-    purpose is to say what did. Matched on the base class *name* because this package depends on
-    ``langchain-core`` alone and must not import ``langgraph``.
+    ``GraphInterrupt`` (a pause for approval), ``ParentCommand`` and ``GraphDelegate`` all subclass
+    ``GraphBubbleUp`` and all reach ``on_chain_error`` looking like a crash. Matched on the base class
+    *name*: this package depends on ``langchain-core`` alone and must not import ``langgraph``.
     """
     return any(cls.__name__ == "GraphBubbleUp" for cls in type(error).__mro__)
 
@@ -134,14 +128,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     _COMPONENT_INTEGRATIONS = frozenset({"langchain_chat_model"})
 
     def _verbose_metadata(self, fields: Dict[str, Any]) -> Dict[str, Any]:
-        """Sanitize verbose fields into scalar metadata values safe to unpack into SDK asset constructors.
+        """Sanitize verbose fields into scalars safe to unpack into SDK asset constructors.
 
-        Returns ``{}`` unless verbose mode is on, so call sites can unconditionally unpack the result. Values are
-        run through ``_to_jsonable`` (stringifying UUIDs, Paths, messages, ...) and non-scalars are JSON-encoded.
-        Keys that collide with the SDK's own kwargs (``name``, ``description``, ...) are prefixed with ``LC-`` so
-        they can never raise "got multiple values for keyword argument" (dash, not underscore: the graph explorer
-        camel-cases keys and turns ``_`` into a space). ``None`` values are kept and encoded as the string
-        ``"null"`` so a present-but-empty key is distinguishable from an absent one.
+        Returns ``{}`` unless verbose mode is on, so call sites can unpack unconditionally. Keys colliding
+        with the SDK's own kwargs get an ``LC-`` prefix; ``None`` is encoded as ``"null"`` so a
+        present-but-empty key stays distinguishable from an absent one.
         """
         if not self.verbose:
             return {}
@@ -286,13 +277,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> Dict[str, Any]:
         """What identifies this retriever, as opposed to what it returned.
 
-        A retriever is a class pointed at a corpus, and the class name alone cannot tell two of them
-        apart -- the same wrapper aimed at a different index looks identical. Whatever the caller attached
-        via ``with_config`` is therefore folded in, so a manifest records *which* corpus was consulted and
-        not merely that something was.
-
-        ``ls_retriever_name`` is the class, stable even when ``run_name`` renames the run; ``name`` is what
-        this run called it. Both are kept rather than guessing which is which.
+        The class name alone cannot tell two retrievers apart -- the same wrapper aimed at a different
+        index looks identical -- so whatever the caller attached via ``with_config`` is folded in.
         """
         identity: Dict[str, Any] = {"retriever": name}
 
@@ -312,13 +298,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def _note_framework(self, metadata: Optional[Dict[str, Any]]) -> None:
         """Record which harness produced this run, the first time a run says so.
 
-        ``ls_integration`` is LangSmith's tag; LangChain's ``create_agent`` sets it to
-        ``langchain_create_agent`` and DeepAgents to ``deepagents``. A plain ``StateGraph`` sets neither, so
-        the ``langgraph_*`` keys stand in as the evidence there. Anything else is plain LangChain.
-
-        Not every ``ls_integration`` names a harness: langchain-core stamps ``langchain_chat_model`` on
-        every model run, which says what the *component* is, not what is orchestrating it. Taking it would
-        label a plain LCEL chain after the model it happens to call.
+        ``ls_integration`` names it (``langchain_create_agent``, ``deepagents``); a plain ``StateGraph``
+        sets neither, so the ``langgraph_*`` keys stand in. ``langchain_chat_model`` is excluded -- it
+        names a component, not a harness, and would label an LCEL chain after the model it calls.
         """
         if self._framework is not None:
             return
@@ -337,11 +319,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> Tuple[str, str]:
         """Work out what model this was, from whichever source actually names it.
 
-        ``invocation_params`` is the richest source when a provider fills it in, but nothing requires one
-        to: ``GenericFakeChatModel`` reports only ``_type``, and providers vary in whether they use
-        ``model`` or ``model_name``. LangSmith's ``ls_model_name`` and ``ls_provider`` are the
-        standardised fields and are set from ``_get_ls_params``, so they are the next best thing, and the
-        runnable's own class name beats calling a model that plainly exists "unknown".
+        Providers vary between ``model`` and ``model_name`` and some fill in neither, so this falls back
+        through ``ls_model_name``/``ls_provider`` to the runnable's class name before giving up.
         """
         meta = metadata or {}
         name = (
@@ -366,12 +345,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
         """Record a failed activity and link it to whatever was waiting on it.
 
-        Every ``on_*_error`` funnels through here, so all four behave alike. The enclosing activity observed
-        the failure whether or not it recovered from one: LangGraph's ``ToolNode`` re-raises by default and
-        the node dies with it, but a ``ToolInvocationError``, a configured ``handle_tool_errors``, or a retry
-        middleware all leave the caller alive and holding the error. When the caller does die, its own error
-        computation is built from its inputs and the link simply goes unused -- so linking is right in the
-        first case and harmless in the second.
+        Every ``on_*_error`` funnels through here. The caller is linked because it observed the failure
+        whether or not it recovered -- and when it dies too, its own error computation is built from its
+        inputs and the link goes unused.
         """
         if run is None:
             return
@@ -446,14 +422,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> Optional[str]:
         """Return this run's agent name if it starts a *new* agent, else None.
 
-        This is LangChain's own rule, from ``langchain.agents._subagent_transformer``: a subagent boundary
-        is a nested run whose ``lc_agent_name`` is set and differs from its parent's. Plain subgraphs
-        inherit the parent's name and are excluded, which is what keeps every internal LangGraph run from
-        being mistaken for an agent.
-
-        Without this a DeepAgents subagent is invisible: its root run carries the subagent's name but
-        inherits ``langgraph_node`` from the ``task`` tool that spawned it, so it matches neither the node
-        rule nor the root rule, and its internal work is never linked to the call that asked for it.
+        LangChain's own rule, from ``langchain.agents._subagent_transformer``: a nested run whose
+        ``lc_agent_name`` is set and differs from its parent's. Plain subgraphs inherit the parent name and
+        are excluded, which keeps internal LangGraph runs from being mistaken for agents.
         """
         own = (metadata or {}).get("lc_agent_name")
         inherited = self._agent_names.get(parent_run_id) if parent_run_id is not None else None
@@ -880,14 +851,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> None:
         """Register a retrieval as its own computation.
 
-        For a RAG chain the retrieved documents are the provenance that matters most -- they are where
-        the answer's content actually came from -- and they were leaving no trace at all. The retriever
-        itself is registered as a Tool, because that is what it is from the graph's point of view: a named
-        capability the run invoked.
-
-        Its asset is content-addressed to its identity, which includes whatever the caller attached with
-        ``with_config`` -- so pointing the same class at a different index produces a different asset,
-        and the manifest records which corpus was consulted rather than only that one was.
+        The retriever is registered as a Tool -- a named capability the run invoked -- content-addressed
+        to its identity, so the same class pointed at a different index is a different asset.
         """
         logger.debug(run_id)
         self._note_framework(metadata)
