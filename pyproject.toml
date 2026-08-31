@@ -38,10 +38,6 @@ python_executable = ".venv/bin/python"
 [tool.ruff]
 line-length = 120
 
-# Pinned rather than left to ruff's defaults, which have grown over time: ruff 0.16 turns on UP, I and S
-# by default, so `just lint` reported 128 findings locally while CI's older ruff reported none. Same
-# command, same config, different answer. This is the set CI has been enforcing all along; adopting the
-# newer defaults would mean modernising the `Dict`/`Optional` idiom the handlers use throughout, which is
-# a separate decision from making the check deterministic.
+# Pinning ruff linting for consistency between local checks & CI checks
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
