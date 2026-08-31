@@ -213,26 +213,32 @@ handler.add_extractor(BudgetExtractor())
 Extractors are consulted newest-first, so one registered here beats this package's own. See the
 [LangChain package README](../eqty-lineage-langchain/README.md) for the full contract.
 
-## Limitation: context compaction is not in the graph
+## Limitation: compaction is recorded, but not *as* a compaction
 
 `SummarizationMiddleware` is in the default deep agent stack. On a long run it compacts the conversation: the new
-context is derived from the old, but **lossily**, with most of it discarded. This handler does not record that, for
-two reasons.
+context is derived from the old, but **lossily**, with most of it discarded.
 
-**It is not observable.** DeepAgents compacts inside `wrap_model_call`, not in a graph node of its own, so no
-callback marks the boundary. What reaches `on_chat_model_start` is simply a shorter message list.
+**It is observable, and it is recorded.** An earlier version of this note claimed otherwise, on the belief that
+compaction happens inside `wrap_model_call`. It does not: `SummarizationMiddleware` overrides `before_model`, which
+LangGraph runs as a node of its own, so the handler records it like any other. Verified against a run that compacted
+4 of its 7 model turns:
 
-**There is nowhere to put it.** The SDK's edge vocabulary is `add_computation_statement(inputs, outputs)` —
-`prov:used` and `prov:wasGeneratedBy` — plus `CERTIFIES`, `INCLUDES` and `IS_INSTANCE_OF` associations. Recording
-compaction with any of them asserts an ordinary derivation, implying the output carries the input when in fact most
-of it was dropped. Omitting it loses the boundary. Neither is honest, and no asset type fixes it: the missing thing
-is an *edge*, not an entity. PROV, OpenLineage and in-toto do not model lossy derivation either.
+- the node appears as a `graph_node` computation named `SummarizationMiddleware.before_model`, on every turn;
+- a turn that compacted has an output state carrying the `RemoveMessage` sentinel, the summary message and whatever
+  `keep` preserved, where a pass-through turn carries `state_update: null`;
+- the summarization model call is its own `chat_model` computation, with the summary prompt as a `Prompt` asset and
+  the generated summary as `Reasoning`.
 
-**What this means for a reader.** On a run long enough to compact, the recorded lineage of the final answer will show
-it derived from the model turns that survived compaction, and will not show that earlier context existed and was
-discarded. A manifest that omitted this note would claim a completeness it does not have. An `eqty:wasCompactedFrom`
-edge is the one thing here that cannot be expressed today and cannot be worked around by choosing a different asset
-type; it is being raised with the SDK team separately.
+**What is missing is the edge.** The SDK's vocabulary is `add_computation_statement(inputs, outputs)` —
+`prov:used` and `prov:wasGeneratedBy` — plus `CERTIFIES`, `INCLUDES` and `IS_INSTANCE_OF` associations. The
+compaction is therefore recorded as an ordinary derivation, which implies the output carries the input when in fact
+most of it was dropped. No asset type fixes this: the missing thing is an *edge*, not an entity. PROV, OpenLineage
+and in-toto do not model lossy derivation either.
+
+**What this means for a reader.** You can see *that* a compaction happened, which turn it happened on, and what
+survived it. You cannot tell from the edges alone that the step was lossy rather than an ordinary transformation.
+An `eqty:wasCompactedFrom` edge is the one thing here that cannot be expressed today and cannot be worked around by
+choosing a different asset type; it is being raised with the SDK team separately.
 
 Compaction only fires on long runs, so shorter runs are unaffected.
 
