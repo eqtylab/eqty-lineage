@@ -16,11 +16,11 @@ manifest at all, not even as a bare node. A query asking "did anything touch X" 
 alone will miss it, and only the sidecar can answer that. The two records are not interchangeable.
 """
 
+import posixpath
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatch
-from pathlib import PurePosixPath
 from re import Pattern
 
 # Paths whose contents are never stored. Matched against the full resolved path and against the
@@ -69,6 +69,42 @@ DEFAULT_CONTENT_PATTERNS: tuple[Pattern[str], ...] = (
 
 REDACTION_MARKER = b"[eqty-lineage: redacted]"
 
+#: ``C:``, ``\\?\C:`` and friends. A drive letter in front of an absolute path stops it matching a glob
+#: anchored at ``/``, so ``C:/secrets/key.txt`` slipped past a ``/secrets/*`` rule.
+_DRIVE_PREFIX = re.compile(r"^(?:\\\\\?\\)?[A-Za-z]:")
+
+
+def canonical_path(path: str) -> str | None:
+    """The single form every glob is matched against, or ``None`` when there isn't one.
+
+    Three things have to happen before a pattern can be trusted against a path, and the gate previously
+    did only the first:
+
+    1. ``\\`` becomes ``/``, so Windows separators match POSIX globs.
+    2. A drive prefix is dropped. ``C:/secrets/key.txt`` and ``/secrets/key.txt`` name the same file to
+       every rule in this module, and only the second one matched.
+    3. ``.`` and ``..`` segments are collapsed. This is the one that mattered:
+       ``PurePosixPath`` removes ``.`` but *preserves* ``..``, so ``/tmp/../secrets/key.txt`` was
+       compared verbatim against ``/secrets/*``, did not match, and had its bytes stored.
+
+    ``None`` means the path still escapes above its own root after collapsing -- a relative path whose
+    real location depends on a working directory this module does not have. Callers treat that as
+    denied. **The gate fails closed**: over-withholding costs a blob, under-withholding costs a
+    secret, and only one of those is recoverable. Identity is recorded either way.
+
+    Resolution here is purely lexical. It deliberately does not touch the filesystem, so a symlink
+    cannot make the answer depend on the machine the recorder happens to run on -- and cannot make a
+    denied path look permitted by pointing somewhere innocuous.
+    """
+    candidate = _DRIVE_PREFIX.sub("", path.replace("\\", "/"))
+    if not candidate:
+        return None
+
+    normalized = posixpath.normpath(candidate)
+    if normalized == ".." or normalized.startswith("../"):
+        return None
+    return normalized
+
 
 @dataclass(frozen=True)
 class ContentPolicy:
@@ -88,7 +124,10 @@ class ContentPolicy:
 
     def path_allowed(self, path: str) -> bool:
         """True when this path's *content* may be stored. Identity is always recorded regardless."""
-        normalized = str(PurePosixPath(path.replace("\\", "/")))
+        normalized = canonical_path(path)
+        if normalized is None:
+            # No form to match a pattern against, so no pattern can be shown not to apply.
+            return False
         name = normalized.rsplit("/", 1)[-1]
 
         for pattern in self.allow_globs:

@@ -36,7 +36,7 @@ from .projection import (
     select_determination,
     select_file_lineage,
 )
-from .redaction import PERMISSIVE, ContentPolicy
+from .redaction import PERMISSIVE, ContentPolicy, canonical_path
 from .serialize import as_bytes, scalar_metadata, to_jsonable
 from .tool_results import apply_edit, file_events_from_result
 from .triples import Triple, TripleSink
@@ -63,7 +63,6 @@ def __dir__():
 
 
 __all__ = [
-    "PERMISSIVE",
     "Compacted",
     "ContentPolicy",
     "Coverage",
@@ -75,6 +74,7 @@ __all__ = [
     "InstructionsLoaded",
     "LineageRecorder",
     "ModelCall",
+    "PERMISSIVE",
     "PermissionDecision",
     "PermissionOutcome",
     "ProjectionStats",
@@ -90,6 +90,7 @@ __all__ = [
     "activity_signatures",
     "apply_edit",
     "as_bytes",
+    "canonical_path",
     "canonical_triples",
     "file_events_from_result",
     "graph_diff",

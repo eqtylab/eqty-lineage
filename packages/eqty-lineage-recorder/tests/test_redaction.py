@@ -33,6 +33,74 @@ class TestPathRules:
         assert not ContentPolicy().path_allowed(r"C:\repo\.env")
 
 
+class TestPathCanonicalisation:
+    """A path that reaches a denied file must be denied however it spells itself.
+
+    The gate matches globs against text. Any spelling that reaches the same file without matching the
+    pattern is a way to get the file's bytes into the blob store, so these are the cases where getting
+    normalisation wrong costs a secret rather than a node.
+    """
+
+    def test_a_parent_segment_cannot_walk_back_into_a_denied_region(self):
+        # `/tmp/../secrets/key.txt` is `/secrets/key.txt`. Matched verbatim it is neither, and the
+        # bytes were stored.
+        p = ContentPolicy(deny_globs=("/secrets/*",))
+        assert not p.path_allowed("/secrets/key.txt")
+        assert not p.path_allowed("/tmp/../secrets/key.txt")
+        assert not p.path_allowed("/a/b/../../secrets/key.txt")
+
+    def test_a_drive_letter_does_not_hide_an_absolute_path(self):
+        p = ContentPolicy(deny_globs=("/secrets/*",))
+        assert not p.path_allowed("C:/secrets/key.txt")
+        assert not p.path_allowed(r"C:\secrets\key.txt")
+
+    def test_a_current_directory_segment_is_collapsed(self):
+        p = ContentPolicy(deny_globs=("/secrets/*",))
+        assert not p.path_allowed("/secrets/./key.txt")
+
+    def test_a_sibling_directory_is_not_swept_up_by_the_collapse(self):
+        # `/var/secrets` is a different directory from `/secrets`, and normalising must not conflate
+        # them -- over-denying is safe but wrong, and this is the case that catches a lazy substring fix.
+        p = ContentPolicy(deny_globs=("/secrets/*",))
+        assert p.path_allowed("/var/./secrets/key.txt")
+        assert p.path_allowed("/secretsandsuch/key.txt")
+
+    def test_a_path_that_escapes_its_own_root_is_denied(self):
+        # Where `../elsewhere/x` really points depends on a working directory this module does not
+        # have, so no pattern can be shown not to apply. The gate fails closed.
+        p = ContentPolicy(deny_globs=("/secrets/*",))
+        assert not p.path_allowed("../elsewhere/x.txt")
+        assert not p.path_allowed("..")
+
+    def test_a_relative_path_that_stays_inside_itself_is_still_matched_normally(self):
+        p = ContentPolicy(deny_globs=("*.pem",))
+        assert p.path_allowed("repo/util.py")
+        assert p.path_allowed("./repo/util.py")
+        assert not p.path_allowed("./repo/key.pem")
+
+    def test_an_empty_path_is_denied_rather_than_matched(self):
+        assert not ContentPolicy().path_allowed("")
+
+    def test_an_anchored_glob_is_as_strong_as_a_wildcard_one(self):
+        """Why the shipped defaults never leaked, and why that was luck rather than design.
+
+        Every entry in ``DEFAULT_DENY_GLOBS`` is matched on the basename or begins with ``*``, and
+        ``fnmatch``'s ``*`` crosses ``/`` -- so ``*/.ssh/*`` already caught ``/home/u/x/../.ssh/id_rsa``
+        before this fix. Only a glob anchored at ``/`` could be walked around, which is exactly the
+        shape a deployment writes by hand for its own directories.
+
+        Pinned because the two spellings must now be equally strong. Tightening a default to
+        ``/home/*/.ssh/*`` some day must not quietly reopen this.
+        """
+        anchored = ContentPolicy(deny_globs=("/home/u/.ssh/*",))
+        wildcard = ContentPolicy(deny_globs=("*/.ssh/*",))
+        walked = "/home/u/project/../.ssh/id_rsa"
+
+        assert not wildcard.path_allowed(walked)
+        assert not anchored.path_allowed(walked)
+        assert not ContentPolicy().path_allowed(walked)
+
+
 class TestContentScrubbing:
     def test_a_recognised_secret_is_replaced(self):
         scrubbed, modified = ContentPolicy().scrub(b'AWS_SECRET_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"')
