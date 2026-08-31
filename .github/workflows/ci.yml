@@ -52,7 +52,7 @@ jobs:
       - name: Format
         id: format
         continue-on-error: true
-        run: just fmt
+        run: just fmt-check
 
       - name: Lint
         id: lint
