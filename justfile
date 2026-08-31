@@ -44,7 +44,7 @@ langchain-diff-demo REF="":
 fmt:
   ruff format .
 
-# Verify formatting without rewriting anything -- this is what CI runs
+# Verify formatting without rewriting anything
 fmt-check:
   ruff format --check .
 
