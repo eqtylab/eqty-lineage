@@ -23,7 +23,7 @@ from typing import Any
 
 from . import prov
 
-logger = logging.getLogger("eqty.lineage.core")
+logger = logging.getLogger("eqty.lineage.recorder")
 
 # Asset types that constitute file lineage. These are the nodes worth looking at.
 FILE_TYPES = frozenset({"Code", "Document", "Configuration", "Dataset"})

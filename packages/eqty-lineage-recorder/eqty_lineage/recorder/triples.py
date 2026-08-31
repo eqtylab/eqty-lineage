@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("eqty.lineage.core")
+logger = logging.getLogger("eqty.lineage.recorder")
 
 
 @dataclass(frozen=True)

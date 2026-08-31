@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("eqty.lineage.core")
+logger = logging.getLogger("eqty.lineage.recorder")
 
 # kwargs the SDK asset constructors claim for themselves; caller metadata must never shadow them
 RESERVED_SDK_KWARGS = frozenset({"obj", "path", "name", "description", "_store"})
@@ -29,7 +29,7 @@ def to_jsonable(obj: Any, extra: JsonableHook | None = None) -> Any:
     """Convert ``obj`` into plain JSON-serializable data, best effort.
 
     ``extra`` lets an adapter handle its own types (a LangChain ``BaseMessage``, a Claude Code content
-    block) without core depending on them. It is tried first and may return ``NotImplemented`` to fall
+    block) without the recorder depending on them. It is tried first and may return ``NotImplemented`` to fall
     through.
     """
     if extra is not None:

@@ -1,10 +1,10 @@
 """Framework-agnostic lineage recorder shared by the EQTY lineage integrations.
 
-Adapters translate their source into :mod:`~eqty_lineage.core.events` and hand them to
-:class:`~eqty_lineage.core.recorder.LineageRecorder`, which produces EQTY assets, computation statements,
+Adapters translate their source into :mod:`~eqty_lineage.recorder.events` and hand them to
+:class:`~eqty_lineage.recorder.recorder.LineageRecorder`, which produces EQTY assets, computation statements,
 and a parallel triple fact set. Nothing but the recorder touches ``eqty_sdk``.
 
-    from eqty_lineage.core import LineageRecorder, SessionStarted, ToolCallStarted
+    from eqty_lineage.recorder import LineageRecorder, SessionStarted, ToolCallStarted
 
     recorder = LineageRecorder()
     recorder.handle(SessionStarted(session_id="...", agent="claude-code"))

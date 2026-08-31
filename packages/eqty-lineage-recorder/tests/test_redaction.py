@@ -5,8 +5,8 @@ path still gets a node and still gets its lineage edges -- withholding the bytes
 fact that the file participated, or the graph would quietly lie about what the agent touched.
 """
 
-from eqty_lineage.core import PERMISSIVE, ContentPolicy
-from eqty_lineage.core.redaction import REDACTION_MARKER
+from eqty_lineage.recorder import PERMISSIVE, ContentPolicy
+from eqty_lineage.recorder.redaction import REDACTION_MARKER
 
 
 class TestPathRules:

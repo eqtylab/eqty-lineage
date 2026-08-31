@@ -1,4 +1,4 @@
-# eqty-lineage-core
+# eqty-lineage-recorder
 
 Framework-agnostic lineage recorder shared by the EQTY lineage integrations. Adapters translate their
 source — a Claude Code hook POST, a Codex hook, a session transcript on disk — into a small event
@@ -6,7 +6,7 @@ vocabulary; this package turns that vocabulary into EQTY assets, computation sta
 triple fact set.
 
 ```python
-from eqty_lineage.core import LineageRecorder, SessionStarted, ToolCallStarted, FileObserved
+from eqty_lineage.recorder import LineageRecorder, SessionStarted, ToolCallStarted, FileObserved
 
 recorder = LineageRecorder(framework="claude-code")
 recorder.handle(SessionStarted(session_id="...", agent="claude-code", agent_version="2.1.220"))
@@ -85,7 +85,7 @@ a Datalog evaluator consumes — so the query engine never has to be chosen at c
 lives there; content stays in the SDK blob store, which keeps a heavy session to low thousands of facts.
 
 ```python
-from eqty_lineage.core import TripleSink
+from eqty_lineage.recorder import TripleSink
 
 recorder = LineageRecorder(triples=TripleSink(".eqty_sdk/triples.jsonl"))
 ```
@@ -102,7 +102,7 @@ complete, while its bytes are withheld — the denied bytes are never handed to 
 all. Provenance does not require publication.
 
 ```python
-from eqty_lineage.core import ContentPolicy
+from eqty_lineage.recorder import ContentPolicy
 
 LineageRecorder(policy=ContentPolicy(deny_globs=(*ContentPolicy.deny_globs, "*.internal")))
 ```
@@ -116,7 +116,7 @@ real sessions, 136 to 1,995 assets and up to 1,359 activities, of which `Dataset
 around **88%**. Every model response and tool-argument blob is a node, so the file provenance is buried.
 
 ```python
-from eqty_lineage.core import project_manifest, select_file_lineage
+from eqty_lineage.recorder import project_manifest, select_file_lineage
 
 project_manifest("full.json", "lineage.json", select_file_lineage(recorder.triples))
 ```

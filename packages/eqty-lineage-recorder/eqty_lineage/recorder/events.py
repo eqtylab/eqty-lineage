@@ -1,7 +1,7 @@
 """The event vocabulary every coding-agent adapter targets.
 
 An adapter's only job is to turn its source -- a Claude Code hook POST, a Codex hook, a session
-transcript on disk -- into this sequence of events. :class:`~eqty_lineage.core.recorder.LineageRecorder`
+transcript on disk -- into this sequence of events. :class:`~eqty_lineage.recorder.recorder.LineageRecorder`
 turns the sequence into EQTY assets and statements. Keeping the vocabulary in the middle is what lets the
 offline and live capture paths be checked against each other: same session, same events, same graph.
 

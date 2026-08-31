@@ -5,7 +5,7 @@ description = "EQTY lineage integrations workspace."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-lineage-core",
+    "eqty-lineage-recorder",
     "eqty-lineage-langchain",
 ]
 
@@ -24,7 +24,7 @@ default-groups = ["dev"]
 members = ["packages/*"]
 
 [tool.uv.sources]
-eqty-lineage-core = { workspace = true }
+eqty-lineage-recorder = { workspace = true }
 eqty-lineage-langchain = { workspace = true }
 eqty-sdk = { index = "eqty" }
 
@@ -33,6 +33,11 @@ name = "eqty"
 url = "https://pypi.eqtylab.io/simple/"
 publish-url = "https://pypi.eqtylab.io/"
 explicit = true
+
+[tool.pytest.ini_options]
+# Anchors rootdir at the workspace root, so the shared `sdk` fixture in the root conftest.py stays in
+# scope even when pytest is invoked from inside one package's directory.
+testpaths = ["packages/eqty-lineage-recorder/tests", "packages/eqty-lineage-langchain/tests"]
 
 [tool.mypy]
 python_executable = ".venv/bin/python"

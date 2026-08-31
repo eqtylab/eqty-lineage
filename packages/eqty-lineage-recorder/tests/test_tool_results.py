@@ -5,8 +5,8 @@ one, and the conformance check cannot see it -- the classic correlated-fault bli
 comparison. It gets tested directly for that reason.
 """
 
-from eqty_lineage.core import apply_edit
-from eqty_lineage.core.tool_results import file_events_from_result
+from eqty_lineage.recorder import apply_edit
+from eqty_lineage.recorder.tool_results import file_events_from_result
 
 
 class TestApplyEdit:

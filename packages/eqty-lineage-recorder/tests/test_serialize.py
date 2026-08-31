@@ -13,8 +13,8 @@ raises "got multiple values for keyword argument" when caller metadata shadows a
 import json
 from pathlib import Path
 
-from eqty_lineage.core import as_bytes, scalar_metadata, to_jsonable
-from eqty_lineage.core.serialize import COLLISION_PREFIX, RESERVED_SDK_KWARGS
+from eqty_lineage.recorder import as_bytes, scalar_metadata, to_jsonable
+from eqty_lineage.recorder.serialize import COLLISION_PREFIX, RESERVED_SDK_KWARGS
 
 
 class TestAsBytesIsStable:
@@ -107,7 +107,7 @@ class TestToJsonable:
 
 
 class TestJsonableHook:
-    """The adapter escape hatch: core must not need to know about a LangChain message or a Claude
+    """The adapter escape hatch: the recorder must not need to know about a LangChain message or a Claude
     Code content block."""
 
     def test_the_hook_is_tried_first(self):

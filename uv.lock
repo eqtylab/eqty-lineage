@@ -5,8 +5,8 @@ requires-python = ">=3.11"
 [manifest]
 members = [
     "eqty-lineage",
-    "eqty-lineage-core",
     "eqty-lineage-langchain",
+    "eqty-lineage-recorder",
 ]
 
 [[package]]
@@ -158,8 +158,8 @@ name = "eqty-lineage"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "eqty-lineage-core" },
     { name = "eqty-lineage-langchain" },
+    { name = "eqty-lineage-recorder" },
 ]
 
 [package.dev-dependencies]
@@ -171,8 +171,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "eqty-lineage-core", editable = "packages/eqty-lineage-core" },
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
+    { name = "eqty-lineage-recorder", editable = "packages/eqty-lineage-recorder" },
 ]
 
 [package.metadata.requires-dev]
@@ -181,17 +181,6 @@ dev = [
     { name = "langgraph", specifier = ">=0.2" },
     { name = "pytest", specifier = ">=8" },
 ]
-
-[[package]]
-name = "eqty-lineage-core"
-version = "0.1.0"
-source = { editable = "packages/eqty-lineage-core" }
-dependencies = [
-    { name = "eqty-sdk" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "eqty-sdk", specifier = ">=2.2,<3", index = "https://pypi.eqtylab.io/simple/" }]
 
 [[package]]
 name = "eqty-lineage-langchain"
@@ -207,6 +196,17 @@ requires-dist = [
     { name = "eqty-sdk", index = "https://pypi.eqtylab.io/simple/" },
     { name = "langchain-core", specifier = ">=0.3" },
 ]
+
+[[package]]
+name = "eqty-lineage-recorder"
+version = "0.0.0"
+source = { editable = "packages/eqty-lineage-recorder" }
+dependencies = [
+    { name = "eqty-sdk" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "eqty-sdk", specifier = ">=2.2,<3", index = "https://pypi.eqtylab.io/simple/" }]
 
 [[package]]
 name = "eqty-sdk"

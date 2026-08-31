@@ -1,7 +1,7 @@
 """Turns the agent event vocabulary into EQTY assets, statements, and triples.
 
 The recorder is deliberately the only place that talks to ``eqty_sdk``. Adapters produce
-:mod:`~eqty_lineage.core.events` and nothing else, which is what makes the offline and live capture paths
+:mod:`~eqty_lineage.recorder.events` and nothing else, which is what makes the offline and live capture paths
 comparable: if they emit the same events they must produce the same graph, and any divergence is a bug in
 one adapter rather than a difference of opinion about the SDK.
 
@@ -69,7 +69,7 @@ from .serialize import JsonableHook, as_bytes, scalar_metadata, to_jsonable
 from .tool_results import apply_edit
 from .triples import TripleSink
 
-logger = logging.getLogger("eqty.lineage.core")
+logger = logging.getLogger("eqty.lineage.recorder")
 
 # Extension -> asset type. The SDK already ships 22 asset types; a coding agent maps onto the existing
 # set with no new primitives, which keeps manifests readable in the graph explorer (the type drives the

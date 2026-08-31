@@ -47,11 +47,14 @@ test-nosdk:
   #!/usr/bin/env bash
   set -euo pipefail
   venv="$(mktemp -d)/venv"
-  python3 -m venv "$venv"
+  # The interpreter the workspace itself runs on, not whatever `python3` resolves to -- on macOS that
+  # is the system 3.9, below this package's >=3.11 floor, so the recipe failed on the install step
+  # rather than proving anything about the SDK.
+  "$(command -v python)" -m venv "$venv"
   "$venv/bin/pip" -q install pytest
-  "$venv/bin/pip" -q install --no-deps ./packages/eqty-lineage-core
+  "$venv/bin/pip" -q install --no-deps ./packages/eqty-lineage-recorder
   ! "$venv/bin/python" -c 'import eqty_sdk' 2>/dev/null || { echo "eqty-sdk leaked in"; exit 1; }
-  "$venv/bin/python" -m pytest tests/test_redaction.py tests/test_serialize.py tests/test_tool_results.py
+  "$venv/bin/python" -m pytest -p no:cacheprovider packages/eqty-lineage-recorder/tests/test_redaction.py packages/eqty-lineage-recorder/tests/test_serialize.py packages/eqty-lineage-recorder/tests/test_tool_results.py
 
 # Format all Python code in the repo
 fmt:

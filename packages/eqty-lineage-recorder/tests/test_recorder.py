@@ -5,7 +5,7 @@ semiring and engine suites are deliberately runnable without it.
 """
 
 import pytest
-from eqty_lineage.core import (
+from eqty_lineage.recorder import (
     PERMISSIVE,
     Compacted,
     ContentPolicy,
@@ -22,7 +22,7 @@ from eqty_lineage.core import (
     file_events_from_result,
     prov,
 )
-from eqty_lineage.core.canonical import activity_signatures, graph_diff
+from eqty_lineage.recorder.canonical import activity_signatures, graph_diff
 
 pytestmark = pytest.mark.usefixtures("sdk")
 
@@ -248,7 +248,7 @@ class TestGraphShape:
 class TestCanonicalIdentity:
     @staticmethod
     def record_twice(sdk):
-        from eqty_lineage.core import LineageRecorder
+        from eqty_lineage.recorder import LineageRecorder
         from eqty_sdk.context import graph_context
 
         graphs = []
@@ -288,7 +288,7 @@ class TestCanonicalIdentity:
         """
         import time
 
-        from eqty_lineage.core import LineageRecorder
+        from eqty_lineage.recorder import LineageRecorder
         from eqty_sdk.context import graph_context
 
         graphs = []
@@ -489,7 +489,7 @@ class TestCoverageIsSigned:
         assert abs(recorder.coverage.context_retained_rate - 0.2) < 1e-9
 
     def test_an_opaque_subagent_is_counted_as_missing_work(self, recorder):
-        from eqty_lineage.core import SubagentEnded
+        from eqty_lineage.recorder import SubagentEnded
 
         recorder.handle(SessionStarted(session_id="s1", agent="claude-code"))
         recorder.handle(SubagentEnded(agent_id="a1", result="done", opaque=True))
