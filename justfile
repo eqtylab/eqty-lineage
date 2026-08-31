@@ -51,6 +51,10 @@ deepagents-demo *ARGS:
 fmt:
   ruff format .
 
+# Verify formatting without rewriting anything
+fmt-check:
+  ruff format --check .
+
 # Lint all Python code in the repo
 lint:
   ruff check .

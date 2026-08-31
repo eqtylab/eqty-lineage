@@ -45,3 +45,7 @@ python_executable = ".venv/bin/python"
 
 [tool.ruff]
 line-length = 120
+
+# Pinning ruff linting for consistency between local checks & CI checks
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
