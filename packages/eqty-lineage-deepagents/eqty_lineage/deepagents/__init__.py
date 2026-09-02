@@ -190,17 +190,6 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
             return known, False, previous if previous is not None and previous != known else None
 
         try:
-            # The payload is the file's content and nothing else, so the asset's CID is the content's
-            # CID -- the same value `get_cid_for_bytes` gives for those bytes, and the same identity any
-            # other tool computes for that file. Wrapping it as `{"path": ..., "content": ...}` made the
-            # CID a hash of a JSON envelope instead: two identical files at different paths got
-            # different CIDs, the digest depended on `json.dumps` key order and separator whitespace,
-            # and the explorer showed a JSON blob where the file was supposed to be.
-            #
-            # The path is metadata, not identity, and it is attached unconditionally -- `_verbose_metadata`
-            # returns `{}` unless verbose mode is on, so relying on it would drop the path from every
-            # default-configuration run. Merged rather than unpacked twice because verbose mode emits
-            # `file_path` too, and passing it in both places is a duplicate keyword argument.
             asset = Document.from_object(
                 content,
                 name=path,
