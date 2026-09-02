@@ -57,7 +57,29 @@ statement generation is Phase 3.
 | asset CIDs match `eqty_sdk` exactly | yes — `tests/lineage.rs`, golden vector |
 | derives file versions from tool results | yes — `tests/files.rs` |
 | file identity, replay chain, redaction gate | yes — `tests/recorder.rs` |
-| classified events reach the recorder | **not yet** — the subscriber still only counts |
+| classified events reach the recorder | yes — `src/mailbox.rs` |
+| a real event stream writes a manifest | yes — `tests/end_to_end.rs` |
+| a live session writes a manifest | **not yet run** — needs Relay installed |
+
+## How an event reaches disk
+
+```
+Relay subscriber (sync, must return promptly)
+  └─ classify + attribute + try_send        ← the only work on this thread
+       └─ bounded queue (4096)
+            └─ worker thread, current-thread runtime
+                 └─ one Recorder per session
+                      └─ SessionEnded *or* Drop → generate_manifest → {session_id}.json
+```
+
+Three constraints decide that shape. The subscriber is synchronous and must return, so it classifies
+and hands off. The recorder is async and single-owner, so one worker thread owns every recorder — an
+actor, not a shared lock. And **Codex never closes its agent scope**, so `Drop` is not cleanup: it is
+the only export path a Codex session will ever take.
+
+The queue is bounded on purpose. Unbounded would turn a slow recorder into unbounded memory inside
+the agent's process; blocking would stall the agent, which a collector must never do. Overflow is
+counted instead, so the manifest can say it happened rather than quietly under-reporting.
 
 ## What a file node means
 

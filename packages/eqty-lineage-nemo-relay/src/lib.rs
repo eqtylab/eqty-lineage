@@ -31,6 +31,7 @@ mod classify;
 mod config;
 mod files;
 mod lineage;
+mod mailbox;
 mod recorder;
 mod redaction;
 mod session;
@@ -39,6 +40,7 @@ pub use classify::{Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{EditAttempt, FileMode, FileObserved, apply_edit, file_events_from_result};
 pub use lineage::{AssetRef, LineageSession};
+pub use mailbox::{Mailbox, SignerFactory};
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
@@ -47,6 +49,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::{
     ConfigDiagnostic, Event, Json, NativePlugin, PluginContext, Result, nemo_relay_plugin,
 };
@@ -71,14 +74,20 @@ pub struct Tally {
     pub classified: AtomicU64,
     /// Classified events that could not be attributed to any session, and were dropped.
     pub unattributed: AtomicU64,
+    /// Events dropped because the recorder's queue was full. Blocking instead would stall the agent.
+    pub queue_overflow: AtomicU64,
     /// Callback invocations that panicked and were contained.
     pub panicked: AtomicU64,
 }
 
 /// The plugin object Relay owns for the lifetime of the component.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct EqtyLineagePlugin {
     tally: Arc<Tally>,
+    /// Held so that dropping the plugin drops the mailbox, which flushes every open session. Relay
+    /// has no explicit teardown hook -- `Drop` on this struct is the only shutdown notification a
+    /// native plugin gets, and on Codex it is the only thing that ever writes a manifest.
+    mailbox: Option<Arc<Mailbox>>,
 }
 
 impl EqtyLineagePlugin {
@@ -110,10 +119,22 @@ impl NativePlugin for EqtyLineagePlugin {
     ) -> Result<()> {
         // Registration is the last place a bad config can be refused. Relay calls `validate` first,
         // but a component can also be configured by hand-writing the TOML block, which skips it.
-        let (_config, diagnostics) = Config::parse(plugin_config);
+        let (config, diagnostics) = Config::parse(plugin_config);
         if let Some(problem) = diagnostics.first() {
             return Err(problem.message.clone());
         }
+
+        let policy = Policy::new(config.deny_globs.clone(), config.max_content_bytes);
+        // A factory rather than one signer: each session gets its own, so nothing signing-related is
+        // shared process-wide. Signer creation can fail, and a session that cannot be signed is not
+        // recorded rather than recorded unsigned.
+        let signer: SignerFactory = Box::new(|| {
+            Ed25519Signer::create()
+                .ok()
+                .map(|signer| LineageSession::new(SignerType::ED25519(signer)))
+        });
+        let mailbox = Arc::new(Mailbox::start(config.manifest_dir.clone(), policy, signer));
+        self.mailbox = Some(Arc::clone(&mailbox));
 
         let tally = Arc::clone(&self.tally);
         // `register_subscriber` takes `Fn`, not `FnMut`, so the router's state lives behind a lock.
@@ -121,7 +142,7 @@ impl NativePlugin for EqtyLineagePlugin {
         // this is uncontended in practice -- but it must never be held across anything slow.
         let router = Mutex::new(SessionRouter::new());
         ctx.register_subscriber(SUBSCRIBER_NAME, move |event: &Event| {
-            observe(&tally, &router, event);
+            observe(&tally, &router, &mailbox, event);
         })?;
 
         Ok(())
@@ -132,7 +153,12 @@ impl NativePlugin for EqtyLineagePlugin {
 ///
 /// The SDK wraps the plugin *entry* symbol in `catch_unwind`, but not each subscriber invocation --
 /// that is ours to do, and it is the difference between a dropped event and a dead agent.
-fn observe(tally: &Arc<Tally>, router: &Mutex<SessionRouter>, event: &Event) {
+fn observe(
+    tally: &Arc<Tally>,
+    router: &Mutex<SessionRouter>,
+    mailbox: &Arc<Mailbox>,
+    event: &Event,
+) {
     tally.seen.fetch_add(1, Ordering::Relaxed);
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -147,14 +173,22 @@ fn observe(tally: &Arc<Tally>, router: &Mutex<SessionRouter>, event: &Event) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .attribute(event);
-        classify(event).map(|lineage| (session_id, lineage))
+        // Relay's own timestamp, never wall-clock at ingest: the two capture paths must not disagree
+        // on when something happened just because one of them replayed it later.
+        let at = event.timestamp().to_rfc3339();
+        classify(event).map(|lineage| (session_id, at, lineage))
     }));
 
     match outcome {
-        Ok(Some((Some(_session_id), _lineage))) => {
+        Ok(Some((Some(session_id), at, lineage))) => {
             tally.classified.fetch_add(1, Ordering::Relaxed);
+            // Hand off and return. Everything expensive -- hashing, signing, writing -- happens on
+            // the mailbox's own thread, so a slow recorder cannot become a slow agent.
+            if !mailbox.send(&session_id, at, lineage) {
+                tally.queue_overflow.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        Ok(Some((None, _lineage))) => {
+        Ok(Some((None, _at, _lineage))) => {
             tally.unattributed.fetch_add(1, Ordering::Relaxed);
         }
         Ok(None) => {}
