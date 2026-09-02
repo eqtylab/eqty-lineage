@@ -85,6 +85,13 @@ every file — once per node — and no file is ever an entity in its own right.
 state key and replaces it with a map of path → content CID, so the state asset says *which* files the node had
 without containing them.
 
+**A file asset's CID is its content's CID.** The payload handed to the `Document` constructor is the file's
+content and nothing else, so the CID is exactly what `get_cid_for_bytes` returns for those bytes — the same
+identity any other tool computes for that file, and what Lineage Explorer renders when you open the node. The
+path is metadata (`file_path`), attached unconditionally rather than only in verbose mode. Two consequences
+worth knowing: identical content at two paths is *one* asset, and a file's identity is comparable across runs,
+across capture paths, and against a CID computed outside this package.
+
 Versions are keyed on `(path, content)`, the same rule `PathExtractor` applies to real paths:
 
 - **new content at a known path** — a new `Document`, recorded as an *output* of the call that wrote it, with the
