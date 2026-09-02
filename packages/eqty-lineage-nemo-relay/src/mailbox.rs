@@ -18,9 +18,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
+use nemo_relay_plugin::{AnnotatedLlmRequest, AnnotatedLlmResponse};
 use serde_json::Value as Json;
 
 use crate::classify::LineageEvent;
@@ -56,6 +58,8 @@ struct OpenTool {
 struct SessionState {
     recorder: Recorder,
     open_tools: HashMap<String, OpenTool>,
+    /// Model calls whose request has arrived and whose response has not, keyed by scope UUID.
+    open_calls: HashMap<String, Arc<AnnotatedLlmRequest>>,
     dropped_events: u64,
 }
 
@@ -154,6 +158,7 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
                 SessionState {
                     recorder: Recorder::new(lineage, policy.clone()),
                     open_tools: HashMap::new(),
+                    open_calls: HashMap::new(),
                     dropped_events: 0,
                 },
             );
@@ -223,9 +228,28 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
             )
             .await;
         }
+        LineageEvent::ModelCallStarted { call_id, request } => {
+            state.open_calls.insert(call_id, request);
+        }
+        LineageEvent::ModelCallEnded {
+            call_id,
+            model,
+            response,
+            correlation,
+        } => {
+            record_model_call(
+                state,
+                &call_id,
+                model.as_deref(),
+                response,
+                correlation.is_observed(),
+                at,
+            )
+            .await;
+        }
         LineageEvent::SessionEnded => return true,
-        // Prompts, model calls and compaction are not yet nodes. They are classified and counted;
-        // wiring them is the next increment, and recording them badly would be worse than the gap.
+        // Prompts, subagents and compaction are classified and counted but are not yet nodes.
+        // Recording them badly would be worse than the gap.
         _ => {}
     }
     false
@@ -264,6 +288,59 @@ fn observation_from_arguments(
         user_modified: false,
         edit: None,
     })
+}
+
+/// Pair a completed model call with the request that opened it, and record it.
+///
+/// A response whose request never arrived is dropped rather than recorded half-way. The prompt is
+/// what makes a completion attributable -- a manifest carrying model output with no record of what
+/// was asked attests that the model said something, not that it was asked anything.
+async fn record_model_call(
+    state: &mut SessionState,
+    call_id: &str,
+    model: Option<&str>,
+    response: Option<Arc<AnnotatedLlmResponse>>,
+    observed: bool,
+    at: Option<String>,
+) {
+    let Some(request) = state.open_calls.remove(call_id) else {
+        return;
+    };
+
+    // Serialized from Relay's *normalized* types rather than from provider JSON. That is what makes
+    // the CID portable: the same conversation through Anthropic and through OpenAI Responses
+    // normalizes to the same messages and therefore hashes the same, so two sessions on different
+    // providers join on the prompt rather than forking on its wire format.
+    let prompt = serde_json::to_vec(&serde_json::json!({
+        "instructions": request.instructions,
+        "messages": request.messages,
+    }));
+    let Ok(prompt) = prompt else {
+        return;
+    };
+
+    let completion = response.as_ref().and_then(|response| {
+        serde_json::to_vec(&serde_json::json!({
+            "message": response.message,
+            "tool_calls": response.tool_calls,
+        }))
+        .ok()
+    });
+
+    let details = match &response {
+        Some(response) => serde_json::json!({
+            "model": response.model.as_deref().or(model),
+            "finishReason": response.finish_reason,
+            "usage": response.usage,
+            "observed": observed,
+        }),
+        None => serde_json::json!({ "model": model, "observed": observed }),
+    };
+
+    let _ = state
+        .recorder
+        .record_model_call(model, &prompt, completion.as_deref(), details, observed, at)
+        .await;
 }
 
 async fn record_tool(

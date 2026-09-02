@@ -55,9 +55,15 @@ fn a_real_session_classifies_end_to_end() {
         .iter()
         .filter(|e| matches!(e, LineageEvent::SessionStarted { .. }))
         .count();
+    // Counted at the end only: a call is not lineage until its response exists. The starts are
+    // classified too -- they carry the request -- and paired by scope UUID downstream.
     let model_calls = classified
         .iter()
-        .filter(|e| matches!(e, LineageEvent::ModelCall { .. }))
+        .filter(|e| matches!(e, LineageEvent::ModelCallEnded { .. }))
+        .count();
+    let model_starts = classified
+        .iter()
+        .filter(|e| matches!(e, LineageEvent::ModelCallStarted { .. }))
         .count();
     let tool_starts = classified
         .iter()
@@ -86,7 +92,7 @@ fn a_real_session_classifies_end_to_end() {
     assert_eq!(tool_ends, 3, "each Bash call closed");
     assert_eq!(
         classified.len(),
-        starts + prompts + model_calls + tool_starts + tool_ends,
+        starts + prompts + model_starts + model_calls + tool_starts + tool_ends,
         "nothing else in this capture is lineage: {classified:#?}"
     );
 }

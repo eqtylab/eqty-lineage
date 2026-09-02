@@ -189,6 +189,88 @@ impl Recorder {
         Ok(Some(asset))
     }
 
+    /// Register a payload that is not a file: a prompt, a completion, a set of instructions.
+    ///
+    /// Same identity rule as a file -- the CID is over the bytes as given -- and the same content
+    /// ceiling, because a long conversation is exactly the thing that blows past it. Content over
+    /// the ceiling becomes a deterministic descriptor rather than being dropped, so the graph still
+    /// names what was sent even when it does not carry it.
+    pub async fn register_payload(
+        &mut self,
+        kind: &str,
+        name: &str,
+        bytes: &[u8],
+        extra: Value,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
+        let content_cid = blake3_cid_raw_binary(bytes)?;
+        let withheld = self.policy.decide(name, bytes.len()) != Disposition::Store;
+
+        let mut metadata = json!({
+            "name": name,
+            "assetType": kind,
+            "provType": "Entity",
+            "redacted": withheld,
+            "content-cid": content_cid,
+        });
+        if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+
+        if withheld {
+            self.count("PayloadTooLarge");
+            let descriptor = canonical_descriptor(name, &content_cid, true);
+            return self
+                .lineage
+                .register_content(&descriptor, metadata, at)
+                .await;
+        }
+        self.lineage.register_content(bytes, metadata, at).await
+    }
+
+    /// Record one completed model call as a computation from its prompt to its completion.
+    ///
+    /// The prompt is an input and the completion an output, which is the same PROV shape a tool run
+    /// gets. A call whose response never arrived is counted and not recorded: an activity with no
+    /// output is a node no reader can reach, and a prompt with no completion attests nothing about
+    /// what the model did.
+    pub async fn record_model_call(
+        &mut self,
+        model: Option<&str>,
+        prompt: &[u8],
+        completion: Option<&[u8]>,
+        details: Value,
+        observed: bool,
+        at: Option<String>,
+    ) -> Result<bool> {
+        let prompt_asset = self
+            .register_payload(
+                "Prompt",
+                "prompt",
+                prompt,
+                json!({ "model": model, "observed": observed }),
+                at.clone(),
+            )
+            .await?;
+
+        let Some(completion) = completion else {
+            self.count("ModelCallWithoutResponse");
+            return Ok(false);
+        };
+
+        let completion_asset = self
+            .register_payload("Reasoning", "completion", completion, details, at.clone())
+            .await?;
+
+        self.lineage
+            .record_computation(&[prompt_asset], &[completion_asset], at)
+            .await?;
+        self.count("ModelCall");
+        Ok(true)
+    }
+
     /// Record a tool run that consumed and produced the given files.
     ///
     /// A run with no outputs is not recorded. It cannot be reached from any asset, so it is a node

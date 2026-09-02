@@ -59,7 +59,23 @@ statement generation is Phase 3.
 | file identity, replay chain, redaction gate | yes — `tests/recorder.rs` |
 | classified events reach the recorder | yes — `src/mailbox.rs` |
 | a real event stream writes a manifest | yes — `tests/end_to_end.rs` |
+| model calls recorded from typed payloads | yes — `tests/end_to_end.rs` |
 | a live session writes a manifest | **not yet run** — needs Relay installed |
+
+## Why native, in one test
+
+`the_same_conversation_through_two_providers_is_one_prompt` is the reason this is an in-process
+plugin rather than a consumer of exported ATOF files.
+
+Model calls are recorded from `annotated_request` / `annotated_response` — Relay's **typed,
+provider-normalized** objects, not the serialized `data` a file consumer sees. So the prompt CID is
+computed over a normalized conversation, and the identical exchange through Anthropic Messages and
+through OpenAI Responses hashes to the same prompt. Two sessions on different providers join on that
+node instead of forking on wire format.
+
+Hashing raw provider JSON would fail this *silently*: both manifests would look perfectly well-formed
+while describing the same prompt as two different things. Normalization reaches the vocabulary too —
+Anthropic's `end_turn` and OpenAI's `stop` both arrive as `FinishReason::Complete`.
 
 ## How an event reaches disk
 

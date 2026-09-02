@@ -20,7 +20,11 @@
 //! separation is forced by the data: events arriving through Relay's gateway carry no session
 //! identifier at all. See [`crate::session`].
 
-use nemo_relay_plugin::{Event, EventCategory, Json, ScopeCategory};
+use std::sync::Arc;
+
+use nemo_relay_plugin::{
+    AnnotatedLlmRequest, AnnotatedLlmResponse, Event, EventCategory, Json, ScopeCategory,
+};
 
 /// How much Relay trusts its own join between an event and the scope it parented that event to.
 ///
@@ -75,10 +79,27 @@ pub enum LineageEvent {
     },
     /// A user turn opened with a prompt.
     PromptSubmitted { text: String },
-    /// A completed model call. Only the scope *end* produces one, because the response is not known
-    /// at the start.
-    ModelCall {
+    /// A model call began, carrying the request that opened it.
+    ///
+    /// Split from the end for the same reason a tool call is: the request is known at the start and
+    /// the response only at the end, and they arrive as two events sharing one scope UUID. Pairing
+    /// them is the mailbox's job.
+    ///
+    /// The payload is the **typed** request object, not the serialized `data` a file consumer sees.
+    /// This is the in-process advantage that motivated choosing a native plugin: `messages` and
+    /// `instructions` here are normalized across providers, so the same conversation through
+    /// Anthropic and through OpenAI Responses produces the same bytes and therefore the same CID.
+    /// Held behind an `Arc`, so carrying it off the subscriber thread is a refcount bump rather than
+    /// a deep copy of a conversation that can run to tens of kilobytes.
+    ModelCallStarted {
+        call_id: String,
+        request: Arc<AnnotatedLlmRequest>,
+    },
+    /// A model call completed.
+    ModelCallEnded {
+        call_id: String,
         model: Option<String>,
+        response: Option<Arc<AnnotatedLlmResponse>>,
         correlation: Correlation,
     },
     /// A tool call began. `tool_input` is the arguments object verbatim.
@@ -137,12 +158,19 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
     let is_end = matches!(event.scope_category(), Some(ScopeCategory::End));
 
     match (category, is_end) {
-        // An LLM scope is only lineage once it has a response, which is at the end.
-        ("llm", true) => Some(LineageEvent::ModelCall {
+        // Scope start and end share one UUID, which is what lets the two halves be paired.
+        ("llm", false) => event
+            .annotated_request()
+            .map(|request| LineageEvent::ModelCallStarted {
+                call_id: event.uuid().to_string(),
+                request: Arc::clone(request),
+            }),
+        ("llm", true) => Some(LineageEvent::ModelCallEnded {
+            call_id: event.uuid().to_string(),
             model: event.model_name().map(str::to_string),
+            response: event.annotated_response().map(Arc::clone),
             correlation: Correlation::from_metadata(metadata),
         }),
-        ("llm", false) => None,
 
         ("tool", false) => Some(LineageEvent::ToolCallStarted {
             tool_use_id: event.tool_call_id().map(str::to_string),
