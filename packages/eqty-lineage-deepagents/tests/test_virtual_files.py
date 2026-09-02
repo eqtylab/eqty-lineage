@@ -172,3 +172,37 @@ def _digest(content: str) -> str:
     from eqty_lineage.deepagents import _digest as digest
 
     return digest(content)
+
+
+# A file asset's CID has to *be* its content's CID. Wrapping the payload as
+# `{"path": ..., "content": ...}` made it the hash of a JSON envelope instead, which broke three
+# things at once: two identical files at different paths got different CIDs, the digest depended on
+# `json.dumps` key order and separator whitespace, and Lineage Explorer rendered a JSON blob where the
+# file was supposed to be. Nothing pinned the property before, so the regression shipped in 0.1.0.
+def test_file_asset_cid_is_the_content_cid(recording_handler):
+    """The stored blob is the file, byte for byte -- not a JSON object describing it."""
+    from eqty_sdk import get_cid_for_bytes
+
+    content = "# Report\n\nFindings.\n\n- one\n- two\n"
+    cid, created, _ = recording_handler.register_virtual_file("/report.md", content, {})
+
+    assert created, "the version should have been registered"
+    assert str(cid) == str(get_cid_for_bytes(content.encode("utf-8"), False)), (
+        "the Document's CID is not the CID of its content, so the payload is not the file itself"
+    )
+
+
+def test_identical_content_at_two_paths_is_one_asset(recording_handler):
+    """Content addressing means the bytes decide identity; the path is metadata.
+
+    This is the property the JSON envelope destroyed, and it is also the thing to watch when changing
+    the payload: `_file_versions` stays keyed per path, so both paths still get their own version
+    record and their own lineage, while the asset they point at is shared.
+    """
+    content = "identical\n"
+    first, first_created, _ = recording_handler.register_virtual_file("/a.md", content, {})
+    second, _, _ = recording_handler.register_virtual_file("/b.md", content, {})
+
+    assert first_created
+    assert str(first) == str(second), "same bytes at two paths should be one content-addressed asset"
+    assert recording_handler._file_latest["/a.md"] == recording_handler._file_latest["/b.md"]

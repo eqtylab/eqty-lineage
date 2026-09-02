@@ -191,10 +191,10 @@ class EqtyDeepAgentsHandler(EqtyCallbackHandler):
 
         try:
             asset = Document.from_object(
-                {"path": path, "content": content},
+                content,
                 name=path,
                 description=f"File '{path}' in the DeepAgents virtual filesystem.",
-                **metadata,
+                **{"file_path": path, **metadata},
             )
         except Exception:  # noqa: BLE001 - never let the observer take down the run it observes
             logger.debug("could not register virtual file '%s'", path)
