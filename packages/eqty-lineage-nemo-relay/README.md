@@ -55,7 +55,29 @@ statement generation is Phase 3.
 | attributes gateway events to a session | yes — `tests/session.rs` |
 | builds a signed manifest from Rust | yes — `tests/lineage.rs` |
 | asset CIDs match `eqty_sdk` exactly | yes — `tests/lineage.rs`, golden vector |
-| classified events reach the manifest | **not yet** — the recorder is the remaining work |
+| derives file versions from tool results | yes — `tests/files.rs` |
+| file identity, replay chain, redaction gate | yes — `tests/recorder.rs` |
+| classified events reach the recorder | **not yet** — the subscriber still only counts |
+
+## What a file node means
+
+Three rules, each of which looks like over-thinking until the case that motivates it appears.
+
+**`(path, content)` is the dedup key; content alone is the identity.** The same bytes are one asset
+wherever they live — the path travels as metadata, which is the property
+`eqty-lineage-deepagents@0.2.0` shipped. But each path keeps its own version record, because keying
+versions on content alone would lose the fact that two files were touched.
+
+**There are three ways not to know, and they must not collapse.** A real content CID means we hold
+the bytes. `unknown:{path}` means we saw the path and never established its content. `deleted:{path}`
+means the file is gone. Merging the last two would let a deletion deduplicate against a failed read
+of the same path, and the graph would assert a removal nobody observed.
+
+**Identity is computed before redaction, never after.** Two different secrets at one path scrub to
+the same placeholder; hashing what was stored rather than what was seen would merge them into one
+version. Content withheld by policy still becomes a node carrying its path and its true content CID —
+provenance does not require publication — and that node is deterministic across runs, so two
+recordings that both read the same secret join on it.
 
 ## `src/lineage/` is written to be liftable
 

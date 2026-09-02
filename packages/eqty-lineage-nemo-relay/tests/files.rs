@@ -1,0 +1,135 @@
+//! File extraction, and the things it must refuse to guess.
+//!
+//! Ported from the existing recorder's `tool_results.py`. The payload shapes below are Claude Code's
+//! `tool_response`, which is what Relay hands us verbatim as the tool-end scope's `data`.
+
+use eqty_lineage_nemo_relay::{FileMode, apply_edit, file_events_from_result};
+use serde_json::json;
+
+#[test]
+fn a_whole_read_carries_its_content() {
+    let (events, attributed) = file_events_from_result(
+        &json!({"type": "text", "file": {
+            "filePath": "/report.md", "content": "# Report\n", "numLines": 1, "totalLines": 1, "startLine": 1
+        }}),
+        Some("t1"),
+        true,
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].path, "/report.md");
+    assert_eq!(events[0].mode, FileMode::Read);
+    assert_eq!(events[0].content.as_deref(), Some(b"# Report\n".as_slice()));
+    assert_eq!(
+        attributed, None,
+        "a read changes nothing, so it attributes nothing"
+    );
+}
+
+#[test]
+fn a_sliced_read_establishes_the_path_but_not_the_content() {
+    // The hazard this whole module exists to avoid. Hashing a fragment as the file would content-
+    // address a version the file never had, and the manifest would assert it without hedging.
+    for slice in [
+        json!({"filePath": "/big.md", "content": "line 40\n", "startLine": 40, "numLines": 1, "totalLines": 900}),
+        json!({"filePath": "/big.md", "content": "head\n", "startLine": 1, "numLines": 10, "totalLines": 900}),
+    ] {
+        let (events, _) = file_events_from_result(&json!({ "file": slice }), Some("t1"), true);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "/big.md");
+        assert_eq!(
+            events[0].content, None,
+            "a partial read must not be recorded as the file's content"
+        );
+    }
+}
+
+#[test]
+fn an_edit_records_both_the_version_read_and_the_version_written() {
+    let (events, attributed) = file_events_from_result(
+        &json!({
+            "filePath": "/a.py", "originalFile": "x = 1\n",
+            "oldString": "x = 1", "newString": "x = 2", "replaceAll": false
+        }),
+        Some("t2"),
+        true,
+    );
+
+    assert_eq!(events.len(), 2, "an edit is a read and a write: {events:?}");
+    assert_eq!(events[0].mode, FileMode::Read);
+    assert_eq!(events[0].content.as_deref(), Some(b"x = 1\n".as_slice()));
+    assert_eq!(events[1].mode, FileMode::Wrote);
+    assert_eq!(
+        events[1].content.as_deref(),
+        Some(b"x = 2\n".as_slice()),
+        "replaying the replacement reproduces the file exactly"
+    );
+    assert_eq!(attributed.as_deref(), Some("/a.py"));
+}
+
+#[test]
+fn an_edit_without_its_pre_image_hands_on_the_replacement() {
+    // `originalFile` is null on most Edit results, so this is the common case rather than the edge.
+    // Dropping it would lose the transition; guessing would invent one. It is carried instead, for
+    // the recorder to replay against content the session already knows.
+    let (events, _) = file_events_from_result(
+        &json!({"filePath": "/a.py", "oldString": "x = 1", "newString": "x = 2", "structuredPatch": []}),
+        Some("t3"),
+        true,
+    );
+
+    assert_eq!(events.len(), 1, "no pre-image means no read event");
+    assert_eq!(events[0].content, None);
+    let attempt = events[0]
+        .edit
+        .as_ref()
+        .expect("the replacement is carried forward");
+    assert_eq!(attempt.old, "x = 1");
+    assert_eq!(attempt.new, "x = 2");
+}
+
+#[test]
+fn a_write_gives_the_post_state_directly() {
+    let (events, _) = file_events_from_result(
+        &json!({"filePath": "/new.md", "content": "created\n", "type": "create"}),
+        Some("t4"),
+        true,
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].mode, FileMode::Wrote);
+    assert_eq!(events[0].content.as_deref(), Some(b"created\n".as_slice()));
+}
+
+#[test]
+fn a_payload_that_disagrees_with_itself_is_refused() {
+    // `old` does not occur in `original`. Replaying anyway would produce a version that never
+    // existed, and content-address it as though it had.
+    assert_eq!(
+        apply_edit(Some("x = 1\n"), Some("y = 9"), Some("z"), false),
+        None
+    );
+    assert_eq!(apply_edit(None, Some("a"), Some("b"), false), None);
+    assert_eq!(apply_edit(Some("aaa"), None, Some("b"), false), None);
+}
+
+#[test]
+fn replace_all_is_honoured() {
+    assert_eq!(
+        apply_edit(Some("a a a"), Some("a"), Some("b"), true).as_deref(),
+        Some("b b b")
+    );
+    assert_eq!(
+        apply_edit(Some("a a a"), Some("a"), Some("b"), false).as_deref(),
+        Some("b a a")
+    );
+}
+
+#[test]
+fn a_bash_result_yields_nothing() {
+    // Every Bash result in the reference capture is a bare string. A shell command that writes a
+    // file is not attributable from its result alone, and inventing an attribution would be worse
+    // than the gap.
+    let (events, attributed) = file_events_from_result(&json!("/Users/b/Dev\n"), Some("t5"), true);
+    assert!(events.is_empty());
+    assert_eq!(attributed, None);
+}

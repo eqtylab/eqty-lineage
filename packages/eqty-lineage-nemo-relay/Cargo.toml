@@ -39,3 +39,5 @@ serde_json = "1"
 # cannot coexist with `integrity` in one dependency graph. See `abi-test/Cargo.toml`.
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Manifest blobs are base64; the recorder tests decode them to read what was actually attested.
+base64 = "0.22"

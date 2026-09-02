@@ -29,12 +29,18 @@
 
 mod classify;
 mod config;
+mod files;
 mod lineage;
+mod recorder;
+mod redaction;
 mod session;
 
 pub use classify::{Correlation, LineageEvent, classify};
 pub use config::Config;
+pub use files::{EditAttempt, FileMode, FileObserved, apply_edit, file_events_from_result};
 pub use lineage::{AssetRef, LineageSession};
+pub use recorder::Recorder;
+pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};

@@ -2018,6 +2018,7 @@ name = "eqty-lineage-nemo-relay"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "integrity",
  "nemo-relay-plugin",
