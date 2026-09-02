@@ -3,7 +3,9 @@
 //! Ported from the existing recorder's `tool_results.py`. The payload shapes below are Claude Code's
 //! `tool_response`, which is what Relay hands us verbatim as the tool-end scope's `data`.
 
-use eqty_lineage_nemo_relay::{FileMode, apply_edit, file_events_from_result};
+use eqty_lineage_nemo_relay::{
+    FileMode, apply_edit, file_events_from_patch, file_events_from_result,
+};
 use serde_json::json;
 
 #[test]
@@ -132,4 +134,58 @@ fn a_bash_result_yields_nothing() {
     let (events, attributed) = file_events_from_result(&json!("/Users/b/Dev\n"), Some("t5"), true);
     assert!(events.is_empty());
     assert_eq!(attributed, None);
+}
+
+#[test]
+fn an_added_file_is_recovered_exactly_from_a_patch() {
+    let events = file_events_from_patch(
+        "*** Begin Patch\n*** Add File: src/new.rs\n+fn main() {}\n+// done\n*** End Patch\n",
+        Some("t6"),
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].path, "src/new.rs");
+    assert_eq!(events[0].mode, FileMode::Wrote);
+    assert_eq!(
+        events[0].content.as_deref(),
+        Some(b"fn main() {}\n// done\n".as_slice()),
+        "an Add File body is the whole file, so stripping the `+` reproduces it byte for byte"
+    );
+}
+
+#[test]
+fn an_updated_file_is_named_but_not_reconstructed() {
+    // `Update File` carries hunks and no pre-image, so the post-image cannot be computed from the
+    // document. Guessing would content-address a state the file may never have had.
+    let events = file_events_from_patch(
+        "*** Begin Patch\n*** Update File: src/old.rs\n@@\n-was\n+is\n*** End Patch\n",
+        Some("t7"),
+    );
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].path, "src/old.rs");
+    assert_eq!(events[0].content, None, "hunks are not a file");
+}
+
+#[test]
+fn a_patch_touching_several_files_yields_one_event_each() {
+    let events = file_events_from_patch(
+        "*** Begin Patch\n\
+         *** Add File: a.txt\n+alpha\n\
+         *** Update File: b.txt\n@@\n-x\n+y\n\
+         *** Delete File: c.txt\n\
+         *** End Patch\n",
+        Some("t8"),
+    );
+    let paths: Vec<&str> = events.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
+    assert_eq!(events[0].content.as_deref(), Some(b"alpha\n".as_slice()));
+    assert_eq!(events[1].content, None);
+    assert_eq!(
+        events[2].content, None,
+        "a deleted file has no content to hash"
+    );
+}
+
+#[test]
+fn text_that_is_not_a_patch_yields_nothing() {
+    assert!(file_events_from_patch("just some output\n", Some("t9")).is_empty());
 }

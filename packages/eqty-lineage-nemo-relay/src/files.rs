@@ -81,6 +81,84 @@ pub fn apply_edit(
     })
 }
 
+/// Derive file versions from a Codex `apply_patch` document.
+///
+/// Codex applies edits by handing the shell a patch in its own format rather than by calling a
+/// structured tool, so none of the shape dispatch above sees it. The document is delimited by
+/// `*** Begin Patch` / `*** End Patch` and names each file with an action:
+///
+/// ```text
+/// *** Begin Patch
+/// *** Add File: src/new.rs
+/// +fn main() {}
+/// *** Update File: src/old.rs
+/// @@
+/// -was
+/// +is
+/// *** Delete File: src/gone.rs
+/// *** End Patch
+/// ```
+///
+/// **`Add File` is exactly recoverable and nothing else is.** Its body is the whole file, every line
+/// prefixed with `+`, so stripping the prefixes reproduces it byte for byte. `Update File` carries
+/// only hunks -- there is no pre-image in the document, so the post-image cannot be computed from it
+/// alone, and those become identity-only versions. Guessing from hunks would content-address a file
+/// state that may never have existed.
+pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<FileObserved> {
+    let mut events = Vec::new();
+    let mut adding: Option<(String, Vec<String>)> = None;
+
+    let flush = |adding: &mut Option<(String, Vec<String>)>, events: &mut Vec<FileObserved>| {
+        if let Some((path, lines)) = adding.take() {
+            // A trailing newline: the patch body is line-oriented, and a file written from it ends
+            // with one. Joining without it would hash to a different file than the one on disk.
+            let mut content = lines.join("\n");
+            content.push('\n');
+            events.push(FileObserved {
+                path,
+                content: Some(content.into_bytes()),
+                mode: FileMode::Wrote,
+                tool_use_id: tool_use_id.map(str::to_string),
+                user_modified: false,
+                edit: None,
+            });
+        }
+    };
+
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            flush(&mut adding, &mut events);
+            adding = Some((path.trim().to_string(), Vec::new()));
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            flush(&mut adding, &mut events);
+            events.push(identity_only(path.trim(), FileMode::Wrote, tool_use_id));
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            flush(&mut adding, &mut events);
+            events.push(identity_only(path.trim(), FileMode::Wrote, tool_use_id));
+        } else if line.starts_with("*** End Patch") {
+            flush(&mut adding, &mut events);
+        } else if let Some((_, lines)) = adding.as_mut()
+            && let Some(added) = line.strip_prefix('+')
+        {
+            lines.push(added.to_string());
+        }
+    }
+    flush(&mut adding, &mut events);
+    events
+}
+
+/// A file we know was touched and whose content we could not establish.
+fn identity_only(path: &str, mode: FileMode, tool_use_id: Option<&str>) -> FileObserved {
+    FileObserved {
+        path: path.to_string(),
+        content: None,
+        mode,
+        tool_use_id: tool_use_id.map(str::to_string),
+        user_modified: false,
+        edit: None,
+    }
+}
+
 /// Derive file versions from one tool result.
 ///
 /// Returns `(events, attributed_path)`. `attributed_path` is set when the result fully described a

@@ -26,7 +26,7 @@ use nemo_relay_plugin::{AnnotatedLlmRequest, AnnotatedLlmResponse};
 use serde_json::Value as Json;
 
 use crate::classify::LineageEvent;
-use crate::files::{FileMode, FileObserved, file_events_from_result};
+use crate::files::{FileMode, FileObserved, file_events_from_patch, file_events_from_result};
 use crate::lineage::{AssetRef, LineageSession};
 use crate::recorder::Recorder;
 use crate::redaction::Policy;
@@ -60,7 +60,29 @@ struct SessionState {
     open_tools: HashMap<String, OpenTool>,
     /// Model calls whose request has arrived and whose response has not, keyed by scope UUID.
     open_calls: HashMap<String, Arc<AnnotatedLlmRequest>>,
+    /// The agent that ran the session.
+    agent: Option<AssetRef>,
+    /// The prompt that opened the current turn, and an input to everything it caused.
+    turn_prompt: Option<AssetRef>,
+    /// Subagents seen this session.
+    subagents: HashMap<String, AssetRef>,
+    /// The subagent currently doing the work, when one is.
+    active_subagent: Option<AssetRef>,
     dropped_events: u64,
+}
+
+impl SessionState {
+    /// Who is doing the work right now: the active subagent, or the root agent.
+    ///
+    /// Recorded as metadata *on the activity*, never as one of its inputs. Putting an agent in
+    /// `inputs` would say the activity consumed the agent; PROV keeps association and usage apart,
+    /// and so does this.
+    fn actor_name(&self) -> Option<String> {
+        self.active_subagent
+            .as_ref()
+            .or(self.agent.as_ref())
+            .map(|asset| asset.as_str().to_string())
+    }
 }
 
 /// The handle the plugin holds. Dropping it flushes every open session.
@@ -159,6 +181,10 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
                     recorder: Recorder::new(lineage, policy.clone()),
                     open_tools: HashMap::new(),
                     open_calls: HashMap::new(),
+                    agent: None,
+                    turn_prompt: None,
+                    subagents: HashMap::new(),
+                    active_subagent: None,
                     dropped_events: 0,
                 },
             );
@@ -188,10 +214,68 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
     let at = Some(at.to_string());
     match event {
         LineageEvent::SessionStarted { agent, model } => {
-            let _ = state
+            let name = agent.clone().unwrap_or_else(|| "unknown-agent".into());
+            if let Ok(asset) = state
                 .recorder
-                .record_agent(agent.as_deref(), model.as_deref(), at)
-                .await;
+                .record_actor(
+                    "Agent",
+                    &name,
+                    &format!("The coding agent '{name}' that ran this session."),
+                    serde_json::json!({ "model": model }),
+                    at,
+                )
+                .await
+            {
+                state.agent = Some(asset);
+            }
+        }
+        LineageEvent::PromptSubmitted { text } => {
+            // The turn's instruction. Everything the agent does afterwards is downstream of it, so
+            // it becomes the input the turn's activities hang from -- without it a manifest attests
+            // what an agent did and not what it was asked to do.
+            if let Ok(asset) = state
+                .recorder
+                .register_payload(
+                    "Prompt",
+                    "user prompt",
+                    "The instruction that opened this turn.",
+                    text.as_bytes(),
+                    serde_json::json!({ "role": "user" }),
+                    at,
+                )
+                .await
+            {
+                state.turn_prompt = Some(asset);
+            }
+        }
+        LineageEvent::SubagentStarted { subagent_id, name } => {
+            let label = name.unwrap_or_else(|| "subagent".into());
+            if let Ok(asset) = state
+                .recorder
+                .record_actor(
+                    "Agent",
+                    &label,
+                    &format!("The subagent '{label}', running inside this session."),
+                    serde_json::json!({ "subagentId": subagent_id, "role": "subagent" }),
+                    at,
+                )
+                .await
+            {
+                // Delegated work is attributed to the subagent that did it, not to the root agent.
+                // A manifest that credited everything to the root would say one actor did work that
+                // several actors did, which is the thing a provenance record exists to prevent.
+                state.subagents.insert(subagent_id, asset.clone());
+                state.active_subagent = Some(asset);
+            }
+        }
+        LineageEvent::SubagentEnded { .. } => {
+            state.active_subagent = None;
+        }
+        LineageEvent::Compacted => {
+            // A compaction is a real transformation of the agent's context: everything before it has
+            // left the model's window. Recorded as an activity so a reader can see which later steps
+            // could no longer have been informed by earlier ones.
+            let _ = state.recorder.record_compaction(at).await;
         }
         // Keyed by tool-call id when there is one. Relay synthesizes ids for post-only hooks, so a
         // missing one means the pre hook never arrived and the end will have to stand alone.
@@ -311,13 +395,13 @@ async fn record_model_call(
     // the CID portable: the same conversation through Anthropic and through OpenAI Responses
     // normalizes to the same messages and therefore hashes the same, so two sessions on different
     // providers join on the prompt rather than forking on its wire format.
-    let prompt = serde_json::to_vec(&serde_json::json!({
-        "instructions": request.instructions,
-        "messages": request.messages,
-    }));
-    let Ok(prompt) = prompt else {
+    let Ok(prompt) = serde_json::to_vec(&request.messages) else {
         return;
     };
+    let instructions = request
+        .instructions
+        .as_ref()
+        .and_then(|instructions| serde_json::to_vec(instructions).ok());
 
     let completion = response.as_ref().and_then(|response| {
         serde_json::to_vec(&serde_json::json!({
@@ -337,9 +421,29 @@ async fn record_model_call(
         None => serde_json::json!({ "model": model, "observed": observed }),
     };
 
+    // The instruction that opened the turn is an input to the call it caused, and only to the first
+    // one: repeating it on every subsequent call would assert that the user asked the same thing
+    // several times, when the later calls were caused by the tool results in between.
+    let caused_by = state.turn_prompt.take();
+
     let _ = state
         .recorder
-        .record_model_call(model, &prompt, completion.as_deref(), details, observed, at)
+        .record_model_call(
+            model,
+            instructions.as_deref(),
+            &prompt,
+            completion.as_deref(),
+            caused_by,
+            details,
+            serde_json::json!({
+                "computation_type": "model_call",
+                "model": model,
+                "performedBy": state.actor_name(),
+                "observed": observed,
+            }),
+            observed,
+            at,
+        )
         .await;
 }
 
@@ -357,23 +461,55 @@ async fn record_tool(
 
     let (mut observations, _attributed) = file_events_from_result(&result, tool_use_id, true);
 
+    // Codex edits files by handing a patch document to the shell, so nothing above sees it. The
+    // patch is in the tool's *arguments*, not its result -- another case where having both halves
+    // of the scope is what makes the lineage recoverable at all.
+    if observations.is_empty()
+        && let Some(open) = &open
+        && let Some(patch) = open
+            .input
+            .as_ref()
+            .and_then(|input| {
+                ["command", "patch", "input"]
+                    .iter()
+                    .find_map(|key| input.get(*key))
+            })
+            .and_then(Json::as_str)
+        && patch.contains("*** Begin Patch")
+    {
+        observations = file_events_from_patch(patch, tool_use_id);
+    }
+
     if observations.is_empty() {
         // The result said nothing about a file. The *arguments* still might: Relay passes the tool
         // input through verbatim, so a `Write` or `Read` names its path there even when the result
         // is a bare string. That yields an identity-only node -- this path was touched, content not
         // established -- which is worth more than silence and is honest about what was seen.
-        //
-        // A shell command remains unattributable either way, and inventing an attribution for one
-        // would be worse than the gap.
         if let Some(observation) = observation_from_arguments(open.as_ref(), tool_use_id) {
             observations.push(observation);
-        } else {
-            return;
         }
     }
 
     let mut inputs: Vec<AssetRef> = Vec::new();
     let mut outputs: Vec<AssetRef> = Vec::new();
+
+    // The tool that did the work is an input to it. Naming it as a node rather than as a label makes
+    // "which runs used this tool" a question the graph answers, and it is the shape the LangChain
+    // and DeepAgents manifests already have.
+    if let Some(open) = &open
+        && let Ok(tool) = state
+            .recorder
+            .record_actor(
+                "Tool",
+                &open.name,
+                &format!("The '{}' tool, as invoked by the agent.", open.name),
+                serde_json::json!({}),
+                at.clone(),
+            )
+            .await
+    {
+        inputs.push(tool);
+    }
     for observation in &observations {
         // A failed registration must not take the session down with it: the observation is skipped
         // and the count survives in coverage, so the manifest still says something was seen and not
@@ -390,7 +526,44 @@ async fn record_tool(
         }
     }
 
-    let _ = state.recorder.record_tool_run(&inputs, &outputs, at).await;
+    // The tool's own result is an output of the run, which is the shape the shipped manifests have:
+    // `[Tool, reads...] -> [result, writes...]`. Without it a read-only call has no output at all
+    // and is refused as an activity -- so a `Read` would leave a file node dangling with no record
+    // of the run that produced it.
+    if let Some(name) = open.as_ref().map(|open| open.name.as_str())
+        && let Ok(body) = serde_json::to_vec(&result)
+        && let Ok(asset) = state
+            .recorder
+            .register_payload(
+                "Dataset",
+                &format!("{name} result"),
+                &format!("What the '{name}' tool returned."),
+                &body,
+                serde_json::json!({ "toolUseId": tool_use_id, "observed": observed }),
+                at.clone(),
+            )
+            .await
+    {
+        outputs.push(asset);
+    }
+
+    // Who performed it. The active subagent when one is running, otherwise the root agent -- so
+    // delegated work is credited to the actor that did it rather than to the session as a whole.
+    let performed_by = state.actor_name();
+    let _ = state
+        .recorder
+        .record_tool_run(
+            &inputs,
+            &outputs,
+            serde_json::json!({
+                "computation_type": "tool_call",
+                "tool": open.as_ref().map(|open| open.name.clone()),
+                "performedBy": performed_by,
+                "observed": observed,
+            }),
+            at,
+        )
+        .await;
 }
 
 fn export(

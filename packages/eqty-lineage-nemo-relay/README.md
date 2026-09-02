@@ -60,7 +60,33 @@ statement generation is Phase 3.
 | classified events reach the recorder | yes — `src/mailbox.rs` |
 | a real event stream writes a manifest | yes — `tests/end_to_end.rs` |
 | model calls recorded from typed payloads | yes — `tests/end_to_end.rs` |
+| prompts, subagents, compaction, `apply_patch` | yes |
+| same document shape as the shipped integrations | yes — see below |
 | a live session writes a manifest | **not yet run** — needs Relay installed |
+
+## The completeness bar, set by evidence
+
+"Complete" here means *the same kind of document the LangChain and DeepAgents integrations already
+produce*, checked against the manifests in `manifests/` rather than against an opinion:
+
+```
+NeMo Relay plugin       {DataRegistration, MetadataRegistration, CredentialRegistration, ComputationRegistration}
+                        {Agent, Dataset, Document, Model, Prompt, Reasoning, System_Prompt, Tool}
+
+DeepAgents (shipped)    {same four}
+                        {same eight}
+```
+
+Same statement types, same asset vocabulary, everything content-addressed. The shipped manifests
+contain **no** `EntityRegistration` at all, and neither does this one: a node whose identity is a
+fresh UUID cannot join across runs.
+
+Activities carry `computation_type` and `performedBy`, and the shapes match too — a model call is
+`[Model, System_Prompt, Prompt] → [Reasoning]`, a tool run is `[Tool, reads…] → [result, writes…]`.
+
+**Attribution is metadata on the activity, never an input.** Putting an agent in `inputs` would
+assert that the activity *consumed* the agent. PROV keeps association and usage apart, so a subagent
+is named in the computation's metadata and the graph stays honest about what was used.
 
 ## Why native, in one test
 

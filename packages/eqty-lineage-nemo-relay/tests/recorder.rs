@@ -297,7 +297,10 @@ async fn a_run_with_no_outputs_is_not_recorded() {
         .await
         .unwrap()
         .unwrap();
-    let recorded = rec.record_tool_run(&[input], &[], None).await.unwrap();
+    let recorded = rec
+        .record_tool_run(&[input], &[], serde_json::json!({}), None)
+        .await
+        .unwrap();
     assert!(!recorded);
     assert_eq!(rec.stats().get("ActivityWithoutOutputs"), Some(&1));
 }
@@ -305,9 +308,15 @@ async fn a_run_with_no_outputs_is_not_recorded() {
 #[tokio::test]
 async fn a_session_exports_a_manifest_stating_its_own_coverage() {
     let mut rec = recorder();
-    rec.record_agent(Some("claude-code"), Some("opus"), None)
-        .await
-        .unwrap();
+    rec.record_actor(
+        "Agent",
+        "claude-code",
+        "The coding agent.",
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    .unwrap();
     let input = rec
         .observe_file(&seen("/in.md", Some(b"in\n"), FileMode::Read), true, None)
         .await
@@ -322,7 +331,7 @@ async fn a_session_exports_a_manifest_stating_its_own_coverage() {
         .await
         .unwrap()
         .unwrap();
-    rec.record_tool_run(&[input], &[output], None)
+    rec.record_tool_run(&[input], &[output], serde_json::json!({}), None)
         .await
         .unwrap();
 

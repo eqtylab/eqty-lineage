@@ -613,17 +613,33 @@ fn a_prompt_produces_a_completion_and_not_the_reverse() {
         .values()
         .find(|statement| statement["@type"] == "ComputationRegistration")
         .expect("the model call should be a computation");
-    let rendered = serde_json::to_string(computation).unwrap();
+
+    // `input` and `output` are each a single value or an array, so normalize before asserting.
+    let cids = |field: &str| -> Vec<String> {
+        match &computation[field] {
+            serde_json::Value::String(one) => vec![one.clone()],
+            serde_json::Value::Array(many) => many
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let inputs = cids("input");
+    let outputs = cids("output");
 
     assert!(
-        rendered.contains(&format!("\"input\":\"urn:cid:{prompt}\""))
-            || rendered.contains(&format!("\"input\":[\"urn:cid:{prompt}\"]")),
-        "the prompt must be the input: {rendered}"
+        inputs.contains(&format!("urn:cid:{prompt}")),
+        "the prompt must be an input: inputs={inputs:?} prompt={prompt}"
+    );
+    assert_eq!(
+        outputs,
+        vec![format!("urn:cid:{completion}")],
+        "the completion must be the sole output"
     );
     assert!(
-        rendered.contains(&format!("\"output\":\"urn:cid:{completion}\""))
-            || rendered.contains(&format!("\"output\":[\"urn:cid:{completion}\"]")),
-        "the completion must be the output: {rendered}"
+        !outputs.contains(&format!("urn:cid:{prompt}")),
+        "the prompt must never be an output -- that edge reads as the answer producing the question"
     );
 }
 
@@ -643,4 +659,438 @@ fn the_real_capture_records_its_model_calls() {
         decoded.contains("\"ModelCall\":4"),
         "coverage should report four recorded model calls: {decoded}"
     );
+}
+
+/// A mark, which is how Relay carries session start, subagent lifecycle and compaction.
+fn mark(session: &str, uuid: &str, parent: &str, name: &str, metadata: serde_json::Value) -> Event {
+    let mut meta = serde_json::json!({ "session_id": session, "agent_kind": "claude-code" });
+    if let (Some(target), Some(extra)) = (meta.as_object_mut(), metadata.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "mark",
+        "name": name,
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "timestamp": "2026-09-02T12:00:00.000000+00:00",
+        "metadata": meta
+    }))
+    .expect("a well-formed mark")
+}
+
+/// A whole session: agent, prompt, a model call, a tool call that reads and writes, a subagent, and
+/// a compaction. Everything the plugin can currently record, in one run.
+fn full_session(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000c0";
+    let turn = "01a040aa-0000-0000-0000-0000000000c1";
+    let call = "01a040aa-0000-0000-0000-0000000000c2";
+    let tool = "01a040aa-0000-0000-0000-0000000000c3";
+
+    let mut events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        turn_scope(session, turn, root, "start"),
+    ];
+
+    // The prompt that opened the turn.
+    let mut prompt_event = turn_scope(session, turn, root, "start");
+    let mut json = prompt_event.to_json_value();
+    json["data"] = serde_json::json!({ "prompt": "summarise the report" });
+    json["metadata"]["nemo_relay_scope_role"] = serde_json::json!("turn");
+    prompt_event = serde_json::from_value(json).expect("a turn carrying a prompt");
+    events.push(prompt_event);
+
+    events.push(mark(session, "01a040aa-0000-0000-0000-0000000000c4", turn, "subagent",
+        serde_json::json!({ "hook_event_name": "SubagentStart", "subagent_id": "sub-1", "agent_type": "researcher" })));
+
+    events.push(llm_scope(
+        "anthropic.messages",
+        call,
+        turn,
+        "start",
+        serde_json::json!({
+            "model_name": "opus",
+            "annotated_request": {
+                "model": "opus",
+                "instructions": "You are careful.",
+                "messages": [{ "role": "user", "content": "summarise the report" }]
+            }
+        }),
+    ));
+    events.push(llm_scope(
+        "anthropic.messages",
+        call,
+        turn,
+        "end",
+        serde_json::json!({
+            "model_name": "opus",
+            "annotated_response": {
+                "model": "opus",
+                "message": "Here is the summary.",
+                "finish_reason": "complete",
+                "usage": { "prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17 }
+            }
+        }),
+    ));
+
+    events.push(claude_read(
+        session,
+        tool,
+        turn,
+        "start",
+        serde_json::json!({ "file_path": "/report.md" }),
+    ));
+    events.push(claude_read(
+        session,
+        tool,
+        turn,
+        "end",
+        serde_json::json!({
+            "filePath": "/report.md",
+            "originalFile": "old body\n",
+            "oldString": "old body",
+            "newString": "new body",
+            "replaceAll": false
+        }),
+    ));
+
+    events.push(mark(
+        session,
+        "01a040aa-0000-0000-0000-0000000000c5",
+        turn,
+        "subagent",
+        serde_json::json!({ "hook_event_name": "SubagentStop", "subagent_id": "sub-1" }),
+    ));
+    events.push(mark(
+        session,
+        "01a040aa-0000-0000-0000-0000000000c6",
+        turn,
+        "compact",
+        serde_json::json!({ "hook_event_name": "PreCompact" }),
+    ));
+
+    events
+}
+
+#[test]
+fn a_full_session_produces_the_same_kind_of_manifest_as_the_shipped_integrations() {
+    // The completeness bar, set by evidence rather than by opinion: the LangChain and DeepAgents
+    // manifests in `manifests/` carry these asset types and these statement types, and a manifest
+    // from this plugin should be recognisable as the same kind of document.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000010"), &into);
+
+    let path = &manifests(&into)[0];
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let decoded = decoded_blobs(path);
+
+    for kind in [
+        "Agent",
+        "Model",
+        "Prompt",
+        "Reasoning",
+        "System_Prompt",
+        "Tool",
+        "Document",
+    ] {
+        assert!(
+            decoded.contains(&format!("\"assetType\":\"{kind}\"")),
+            "a complete manifest should carry a {kind} node:\n{decoded}"
+        );
+    }
+
+    let types: std::collections::BTreeSet<String> = manifest["statements"]
+        .as_object()
+        .expect("statements")
+        .values()
+        .filter_map(|statement| statement["@type"].as_str().map(str::to_string))
+        .collect();
+    for kind in [
+        "DataRegistration",
+        "MetadataRegistration",
+        "ComputationRegistration",
+        "CredentialRegistration",
+    ] {
+        assert!(types.contains(kind), "missing {kind}; present: {types:?}");
+    }
+
+    // Every asset is content-addressed. The shipped manifests contain no EntityRegistration at all,
+    // and a node whose identity is a fresh UUID cannot join across runs.
+    assert!(
+        !types.contains("EntityRegistration"),
+        "assets should be content-addressed, not minted: {types:?}"
+    );
+
+    assert!(
+        decoded.contains("\"name\":") && decoded.contains("\"description\":"),
+        "every asset should be named and described, as in the shipped manifests"
+    );
+}
+
+#[test]
+fn a_full_session_records_every_kind_of_activity_it_saw() {
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000011"), &into);
+    let decoded = decoded_blobs(&manifests(&into)[0]);
+
+    for (key, what) in [
+        ("\"ModelCall\":1", "the model call"),
+        ("\"Compaction\":1", "the compaction"),
+        ("\"Activity\":1", "the tool run"),
+        ("\"Agent\":2", "the agent and its subagent"),
+        ("\"Tool\":1", "the tool it used"),
+        ("\"Model\":1", "the model it called"),
+    ] {
+        assert!(
+            decoded.contains(key),
+            "coverage should report {what} ({key}):\n{decoded}"
+        );
+    }
+}
+
+#[test]
+fn an_edit_links_the_version_read_to_the_version_written() {
+    // The shape a file edit must have: the pre-image is an input and the post-image an output of the
+    // same run, so the graph shows which version was changed into which.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000012"), &into);
+    let decoded = decoded_blobs(&manifests(&into)[0]);
+
+    assert!(decoded.contains("\"fileVersion\":1"), "the version read");
+    assert!(
+        decoded.contains("\"fileVersion\":2"),
+        "and the version written:\n{decoded}"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic: writes a manifest to /tmp for inspection"]
+fn dump_a_full_manifest() {
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000099"), &into);
+    fs::copy(&manifests(&into)[0], "/tmp/relay-manifest.json").expect("copied");
+}
+
+/// Pull the input CIDs of every computation in a manifest.
+fn computation_inputs(path: &std::path::Path) -> Vec<Vec<String>> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    manifest["statements"]
+        .as_object()
+        .expect("statements")
+        .values()
+        .filter(|statement| statement["@type"] == "ComputationRegistration")
+        .map(|statement| match &statement["input"] {
+            serde_json::Value::String(one) => vec![one.clone()],
+            serde_json::Value::Array(many) => many
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// Every blob in a manifest that parses as a JSON object.
+///
+/// Blobs are decoded one at a time rather than concatenated. A concatenated string cannot tell one
+/// node's fields from the next one's, and both an actor's *descriptor* and its *metadata* are blobs
+/// -- so a substring search for a name finds the descriptor, which carries no content CID.
+fn blob_objects(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    manifest["blobs"]
+        .as_object()
+        .expect("a blobs map")
+        .values()
+        .filter_map(|blob| blob.as_str())
+        .filter_map(|blob| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(blob).ok()
+        })
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| value.is_object())
+        .collect()
+}
+
+/// The content CID of the asset node with the given `name`.
+///
+/// Keyed on name rather than on `assetType`, because several nodes share a type -- the user's
+/// instruction and the conversation sent to the model are both `Prompt`.
+fn cid_for_named(path: &std::path::Path, name: &str) -> String {
+    blob_objects(path)
+        .into_iter()
+        .find(|object| object["name"] == name && object["content-cid"].is_string())
+        .map(|object| object["content-cid"].as_str().unwrap().to_string())
+        .unwrap_or_else(|| panic!("no asset node named {name}"))
+}
+
+#[test]
+fn the_tool_is_an_input_to_the_run_it_performed() {
+    // Registering a Tool node is not enough. If it is not wired into the computation, "which runs
+    // used this tool" has no edge to follow and the node is decoration.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000013"), &into);
+
+    let path = &manifests(&into)[0];
+    let tool = format!("urn:cid:{}", cid_for_named(path, "Read"));
+    assert!(
+        computation_inputs(path)
+            .iter()
+            .any(|inputs| inputs.contains(&tool)),
+        "the Tool node should be an input to the run that used it"
+    );
+}
+
+/// A session that calls the same tool twice and makes two model calls.
+fn repeated_work(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000d0";
+    let turn = "01a040aa-0000-0000-0000-0000000000d1";
+    let mut events = vec![turn_scope(session, turn, root, "start")];
+
+    let mut prompt = turn_scope(session, turn, root, "start");
+    let mut json = prompt.to_json_value();
+    json["data"] = serde_json::json!({ "prompt": "do the thing" });
+    json["metadata"]["nemo_relay_scope_role"] = serde_json::json!("turn");
+    prompt = serde_json::from_value(json).unwrap();
+    events.push(prompt);
+
+    for (index, body) in [(2u8, "first"), (3u8, "second")] {
+        let call = format!("01a040aa-0000-0000-0000-0000000000d{index}");
+        events.push(llm_scope("anthropic.messages", &call, turn, "start", serde_json::json!({
+            "model_name": "opus",
+            "annotated_request": { "model": "opus", "messages": [{ "role": "user", "content": body }] }
+        })));
+        events.push(llm_scope("anthropic.messages", &call, turn, "end", serde_json::json!({
+            "model_name": "opus",
+            "annotated_response": { "model": "opus", "message": body, "finish_reason": "complete" }
+        })));
+
+        let tool = format!("01a040aa-0000-0000-0000-0000000000e{index}");
+        events.push(claude_read(
+            session,
+            &tool,
+            turn,
+            "start",
+            serde_json::json!({ "file_path": format!("/{body}.md") }),
+        ));
+        events.push(claude_read(
+            session,
+            &tool,
+            turn,
+            "end",
+            serde_json::json!({
+                "type": "text",
+                "file": { "filePath": format!("/{body}.md"), "content": format!("{body}\n"),
+                          "numLines": 1, "totalLines": 1, "startLine": 1 }
+            }),
+        ));
+    }
+    events
+}
+
+#[test]
+fn a_tool_used_twice_is_one_node_with_two_edges() {
+    // A tool called forty times must not be forty nodes. Deduplicating actors by identity is what
+    // makes the graph answer "which runs used this" instead of listing forty lookalikes.
+    let into = TempDir::new().expect("a temp dir");
+    replay(
+        &repeated_work("01a040aa-0000-0000-0000-000000000014"),
+        &into,
+    );
+    let decoded = decoded_blobs(&manifests(&into)[0]);
+
+    assert!(
+        decoded.contains("\"Tool\":1"),
+        "one Tool node for two calls:\n{decoded}"
+    );
+    assert!(
+        decoded.contains("\"Model\":1"),
+        "one Model node for two calls"
+    );
+    assert!(decoded.contains("\"Activity\":2"), "but two runs");
+    assert!(decoded.contains("\"ModelCall\":2"), "and two model calls");
+}
+
+#[test]
+fn the_user_prompt_feeds_the_call_it_caused_and_not_the_later_ones() {
+    // The prompt caused the first call. The later ones were caused by what came back in between,
+    // and repeating the prompt across all of them would assert the user asked several times.
+    let into = TempDir::new().expect("a temp dir");
+    replay(
+        &repeated_work("01a040aa-0000-0000-0000-000000000015"),
+        &into,
+    );
+
+    let path = &manifests(&into)[0];
+    let prompt = format!("urn:cid:{}", cid_for_named(path, "user prompt"));
+    let feeding = computation_inputs(path)
+        .iter()
+        .filter(|inputs| inputs.contains(&prompt))
+        .count();
+
+    assert_eq!(
+        feeding, 1,
+        "the turn's prompt should be an input exactly once"
+    );
+}
+
+#[test]
+fn work_done_inside_a_subagent_is_credited_to_it() {
+    // The point of tracking subagents. A manifest that credited everything to the root agent would
+    // say one actor did work that several actors did, which is the thing a provenance record exists
+    // to prevent.
+    //
+    // Attribution rides as metadata *on the activity*, not as one of its inputs -- an agent in
+    // `inputs` would assert the activity consumed the agent, which is false. PROV keeps association
+    // and usage apart.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000016"), &into);
+    let path = &manifests(&into)[0];
+
+    let subagent = cid_for_named(path, "researcher");
+    let root = cid_for_named(path, "claude-code");
+    assert_ne!(subagent, root, "the subagent is its own node");
+
+    let performers: Vec<String> = blob_objects(path)
+        .into_iter()
+        .filter_map(|object| object["performedBy"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !performers.is_empty(),
+        "activities should say who performed them"
+    );
+    assert!(
+        performers.iter().all(|who| who == &subagent),
+        "the session's work happened inside the subagent, so it should be credited: {performers:?}"
+    );
+
+    // And the attribution must not be an input edge.
+    let subagent_ref = format!("urn:cid:{subagent}");
+    assert!(
+        !computation_inputs(path)
+            .iter()
+            .any(|inputs| inputs.contains(&subagent_ref)),
+        "an agent must never be an input -- that reads as the activity consuming the agent"
+    );
+}
+
+#[test]
+fn an_activity_says_what_kind_of_work_it_was() {
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000017"), &into);
+
+    let kinds: std::collections::BTreeSet<String> = blob_objects(&manifests(&into)[0])
+        .into_iter()
+        .filter_map(|object| object["computation_type"].as_str().map(str::to_string))
+        .collect();
+
+    assert!(kinds.contains("model_call"), "got {kinds:?}");
+    assert!(kinds.contains("tool_call"), "got {kinds:?}");
 }

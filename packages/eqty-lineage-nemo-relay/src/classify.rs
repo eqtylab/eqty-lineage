@@ -119,7 +119,18 @@ pub enum LineageEvent {
         is_error: Option<bool>,
         correlation: Correlation,
     },
+    /// A subagent began, as its own actor within the session.
+    SubagentStarted {
+        subagent_id: String,
+        name: Option<String>,
+    },
+    /// A subagent finished.
+    SubagentEnded { subagent_id: String },
     /// The agent compacted its context. Recorded because everything before it left the transcript.
+    ///
+    /// Worth a node of its own: everything before a compaction has left the model's context, so a
+    /// reader who cannot see where it happened cannot tell which later steps could still have been
+    /// informed by earlier ones.
     Compacted,
     /// The session ended. This is the export trigger.
     SessionEnded,
@@ -148,6 +159,15 @@ fn classify_mark(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent>
         }),
         _ => match string_at(metadata, "hook_event_name") {
             Some("PreCompact" | "PostCompact") => Some(LineageEvent::Compacted),
+            Some("SubagentStart") => Some(LineageEvent::SubagentStarted {
+                subagent_id: subagent_id(event, metadata)?,
+                name: string_at(metadata, "agent_type")
+                    .or_else(|| string_at(metadata, "subagent_type"))
+                    .map(str::to_string),
+            }),
+            Some("SubagentStop") => Some(LineageEvent::SubagentEnded {
+                subagent_id: subagent_id(event, metadata)?,
+            }),
             _ => None,
         },
     }
@@ -218,6 +238,18 @@ fn terminal_status(metadata: Option<&Json>) -> Option<bool> {
         // A spelling this build does not know. Preserve the uncertainty.
         _ => None,
     }
+}
+
+/// The subagent an event belongs to.
+///
+/// Relay spells this differently depending on where it recovered the identity from, and falls back
+/// to the scope UUID when the payload named no subagent at all -- which still gives the session a
+/// stable handle for the actor, even though it says nothing about what kind of actor it was.
+fn subagent_id(event: &Event, metadata: Option<&Json>) -> Option<String> {
+    string_at(metadata, "subagent_id")
+        .or_else(|| string_at(metadata, "agent_id"))
+        .map(str::to_string)
+        .or_else(|| Some(event.uuid().to_string()))
 }
 
 /// Read a string field from a JSON object that may be absent or may not be an object.

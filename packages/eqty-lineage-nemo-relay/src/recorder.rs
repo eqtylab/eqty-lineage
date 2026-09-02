@@ -60,6 +60,8 @@ pub struct Recorder {
     versions: HashMap<String, usize>,
     /// Counts a reader needs in order to discount the graph correctly.
     stats: BTreeMap<String, u64>,
+    /// Actors already registered this session, keyed by `(kind, name)`.
+    actors: HashMap<(String, String), AssetRef>,
 }
 
 impl Recorder {
@@ -72,6 +74,7 @@ impl Recorder {
             by_content: HashMap::new(),
             versions: HashMap::new(),
             stats: BTreeMap::new(),
+            actors: HashMap::new(),
         }
     }
 
@@ -147,6 +150,7 @@ impl Recorder {
         let metadata = json!({
             "name": path,
             "assetType": "Document",
+            "description": format!("File '{path}' observed by the agent."),
             "provType": "Entity",
             "filePath": path,
             "fileVersion": version,
@@ -199,6 +203,7 @@ impl Recorder {
         &mut self,
         kind: &str,
         name: &str,
+        description: &str,
         bytes: &[u8],
         extra: Value,
         at: Option<String>,
@@ -209,6 +214,7 @@ impl Recorder {
         let mut metadata = json!({
             "name": name,
             "assetType": kind,
+            "description": description,
             "provType": "Entity",
             "redacted": withheld,
             "content-cid": content_cid,
@@ -230,45 +236,121 @@ impl Recorder {
         self.lineage.register_content(bytes, metadata, at).await
     }
 
-    /// Record one completed model call as a computation from its prompt to its completion.
+    /// Record one completed model call.
     ///
-    /// The prompt is an input and the completion an output, which is the same PROV shape a tool run
-    /// gets. A call whose response never arrived is counted and not recorded: an activity with no
-    /// output is a node no reader can reach, and a prompt with no completion attests nothing about
-    /// what the model did.
+    /// The computation's inputs are everything that determined the answer -- the model itself, the
+    /// system prompt, and the conversation -- and its output is the response. Naming the model as an
+    /// input rather than as a label on the edge is what makes "which runs used this model" a graph
+    /// question instead of a string search.
+    ///
+    /// A call whose response never arrived is counted and not recorded: an activity with no output
+    /// is a node no reader can reach, and a prompt with no completion attests nothing about what the
+    /// model did.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_model_call(
         &mut self,
         model: Option<&str>,
+        instructions: Option<&[u8]>,
         prompt: &[u8],
         completion: Option<&[u8]>,
+        caused_by: Option<AssetRef>,
         details: Value,
+        describes: Value,
         observed: bool,
         at: Option<String>,
     ) -> Result<bool> {
-        let prompt_asset = self
-            .register_payload(
+        let mut inputs = Vec::new();
+
+        // The user instruction this call answers, when this is the first call of the turn.
+        if let Some(caused_by) = caused_by {
+            inputs.push(caused_by);
+        }
+
+        if let Some(model) = model {
+            inputs.push(
+                self.record_actor(
+                    "Model",
+                    model,
+                    &format!("The model '{model}' that served this call."),
+                    json!({}),
+                    at.clone(),
+                )
+                .await?,
+            );
+        }
+
+        // The system prompt is a separate node from the conversation because it changes on a
+        // different cadence: one system prompt governs many turns, and keeping them apart lets a
+        // reader see that a run's instructions were unchanged while its messages were not.
+        if let Some(instructions) = instructions {
+            inputs.push(
+                self.register_payload(
+                    "System_Prompt",
+                    "system prompt",
+                    "Provider-level instructions sent alongside the conversation.",
+                    instructions,
+                    json!({ "model": model, "observed": observed }),
+                    at.clone(),
+                )
+                .await?,
+            );
+        }
+
+        inputs.push(
+            self.register_payload(
                 "Prompt",
                 "prompt",
+                "The normalized conversation sent to the model.",
                 prompt,
                 json!({ "model": model, "observed": observed }),
                 at.clone(),
             )
-            .await?;
+            .await?,
+        );
 
         let Some(completion) = completion else {
             self.count("ModelCallWithoutResponse");
             return Ok(false);
         };
 
-        let completion_asset = self
-            .register_payload("Reasoning", "completion", completion, details, at.clone())
+        let output = self
+            .register_payload(
+                "Reasoning",
+                "completion",
+                "The model's response, including any tool calls it requested.",
+                completion,
+                details,
+                at.clone(),
+            )
             .await?;
 
         self.lineage
-            .record_computation(&[prompt_asset], &[completion_asset], at)
+            .record_computation_described(&inputs, &[output], describes, at)
             .await?;
         self.count("ModelCall");
         Ok(true)
+    }
+
+    /// Record that the agent compacted its context.
+    ///
+    /// A node rather than a log line, because compaction changes what the agent could possibly have
+    /// known: everything before it has left the model's window. A reader tracing why a later step
+    /// ignored an earlier one needs to see where the boundary was.
+    pub async fn record_compaction(&mut self, at: Option<String>) -> Result<AssetRef> {
+        let index = self.stats.get("Compaction").copied().unwrap_or(0) + 1;
+        let name = format!("compaction {index}");
+        let asset = self
+            .register_payload(
+                "Dataset",
+                &name,
+                "A context compaction: everything before this point left the model's window.",
+                format!(r#"{{"compaction":{index}}}"#).as_bytes(),
+                json!({ "provType": "Activity" }),
+                at,
+            )
+            .await?;
+        self.count("Compaction");
+        Ok(asset)
     }
 
     /// Record a tool run that consumed and produced the given files.
@@ -279,37 +361,47 @@ impl Recorder {
         &mut self,
         inputs: &[AssetRef],
         outputs: &[AssetRef],
+        describes: Value,
         at: Option<String>,
     ) -> Result<bool> {
         if outputs.is_empty() {
             self.count("ActivityWithoutOutputs");
             return Ok(false);
         }
-        self.lineage.record_computation(inputs, outputs, at).await?;
+        self.lineage
+            .record_computation_described(inputs, outputs, describes, at)
+            .await?;
         self.count("Activity");
         Ok(true)
     }
 
-    /// Register the agent that ran the session.
-    pub async fn record_agent(
+    /// Register an actor -- an agent, a subagent, a model, a tool -- deduplicated by identity.
+    ///
+    /// Content-addressed on a canonical descriptor of *what it is* rather than minted fresh, so the
+    /// same model or the same tool is one node across every session that used it. That is what lets
+    /// "which runs used this tool" be a graph question rather than a string search across manifests.
+    ///
+    /// Registered once per session: a tool called forty times is one node with forty edges, not
+    /// forty nodes.
+    pub async fn record_actor(
         &mut self,
-        agent: Option<&str>,
-        model: Option<&str>,
+        kind: &str,
+        name: &str,
+        description: &str,
+        extra: Value,
         at: Option<String>,
     ) -> Result<AssetRef> {
+        let key = (kind.to_string(), name.to_string());
+        if let Some(existing) = self.actors.get(&key) {
+            return Ok(existing.clone());
+        }
+
+        let descriptor = format!(r#"{{"kind":"{kind}","name":"{name}"}}"#).into_bytes();
         let asset = self
-            .lineage
-            .register_entity(
-                json!({
-                    "name": agent.unwrap_or("unknown-agent"),
-                    "assetType": "Agent",
-                    "provType": "Agent",
-                    "model": model,
-                }),
-                at,
-            )
+            .register_payload(kind, name, description, &descriptor, extra, at)
             .await?;
-        self.count("Agent");
+        self.actors.insert(key, asset.clone());
+        self.count(kind);
         Ok(asset)
     }
 
@@ -326,17 +418,19 @@ impl Recorder {
             .collect::<serde_json::Map<_, _>>()
             .into();
 
-        self.lineage
-            .register_entity(
-                json!({
-                    "name": "coverage",
-                    "assetType": "Configuration",
-                    "provType": "Entity",
-                    "coverage": coverage,
-                }),
-                at,
-            )
-            .await?;
+        // Content-addressed like everything else. Two runs that saw the same things produce the
+        // same coverage node, which is what lets a reader compare what two sessions could observe
+        // rather than only what they did.
+        let body = serde_json::to_vec(&coverage).unwrap_or_default();
+        self.register_payload(
+            "Dataset",
+            "coverage",
+            "What this recording saw, and what it could not: counts a reader needs to weigh the graph.",
+            &body,
+            json!({ "provType": "Entity", "coverage": coverage }),
+            at,
+        )
+        .await?;
 
         self.lineage.into_manifest().await
     }

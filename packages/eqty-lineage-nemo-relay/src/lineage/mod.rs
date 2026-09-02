@@ -159,6 +159,40 @@ impl LineageSession {
         Ok(AssetRef(entity_id))
     }
 
+    /// Record that some inputs produced some outputs, and say something about the activity itself.
+    ///
+    /// The metadata's subject is the computation statement, not an asset. That is the difference
+    /// between "this activity was performed by the researcher subagent" and "this activity consumed
+    /// the researcher subagent" -- the second is what putting an agent in `inputs` would assert, and
+    /// it is false. PROV keeps association and usage apart, and so does this.
+    pub async fn record_computation_described(
+        &mut self,
+        inputs: &[AssetRef],
+        outputs: &[AssetRef],
+        describes: Value,
+        at: Option<String>,
+    ) -> Result<()> {
+        if outputs.is_empty() {
+            return Err(anyhow!("a computation with no outputs is not lineage"));
+        }
+
+        let computation = Statement::ComputationRegistration(
+            ComputationStatement::create(
+                None,
+                inputs.iter().map(|input| input.0.clone()).collect(),
+                outputs.iter().map(|output| output.0.clone()).collect(),
+                self.did.clone(),
+                None,
+                self.did.clone(),
+                at.clone(),
+            )
+            .await?,
+        );
+        let subject = computation.get_id();
+        self.push_with_proof(computation, at.clone()).await?;
+        self.push_metadata(subject, describes, at).await
+    }
+
     /// Record that some inputs produced some outputs.
     ///
     /// Empty outputs are rejected rather than recorded. An activity with no output is not evidence
