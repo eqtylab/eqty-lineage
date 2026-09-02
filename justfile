@@ -34,6 +34,9 @@ clean:
 test *ARGS:
   uv run --no-sync pytest "$@"
   cd packages/eqty-lineage-nemo-relay && cargo test
+  # Its own crate, with its own dependency graph: it needs Relay's core, which cannot coexist with
+  # `integrity`. See packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml.
+  cd packages/eqty-lineage-nemo-relay/abi-test && cargo test
 
 # Compare the LangChain lineage the handler produces now against a released one (default: newest tag)
 langchain-diff-demo REF="":
@@ -51,17 +54,35 @@ langchain-diff-demo REF="":
 deepagents-demo *ARGS:
   uv run --no-sync python examples/deepagents/research_agent.py "$@"
 
+# Regenerate the golden content-CID vector the Relay plugin checks itself against
+#
+# The plugin has no Python dependency and must not grow one; this writes a fixture from eqty_sdk so
+# the Rust tests can assert cross-language agreement on asset identity without importing anything.
+relay-cid-vector:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  out="$PWD/packages/eqty-lineage-nemo-relay/tests/fixtures/content-cids.json"
+  # eqty_sdk writes its store relative to the working directory, so run somewhere disposable.
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cd "$work"
+  "$OLDPWD/.venv/bin/python" "$OLDPWD/packages/eqty-lineage-nemo-relay/tests/fixtures/content_cids.py" > "$out"
+  echo "wrote $out"
+
 # Format every package in the repo
 fmt:
   ruff format .
   cd packages/eqty-lineage-nemo-relay && cargo fmt
+  cd packages/eqty-lineage-nemo-relay/abi-test && cargo fmt
 
 # Verify formatting without rewriting anything
 fmt-check:
   ruff format --check .
   cd packages/eqty-lineage-nemo-relay && cargo fmt --check
+  cd packages/eqty-lineage-nemo-relay/abi-test && cargo fmt --check
 
 # Lint every package in the repo
 lint:
   ruff check .
   cd packages/eqty-lineage-nemo-relay && cargo clippy --all-targets -- -D warnings
+  cd packages/eqty-lineage-nemo-relay/abi-test && cargo clippy --all-targets -- -D warnings

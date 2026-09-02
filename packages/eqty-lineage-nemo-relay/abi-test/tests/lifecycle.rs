@@ -9,6 +9,10 @@
 //! cdylib, materializes a manifest with the artifact's real digest, and activates it through
 //! `PluginHostActivation` -- the same dynamic-plugin host path the gateway runs. If the C ABI
 //! contract is broken, it breaks here.
+//!
+//! It lives in its own crate because it must: Relay's core crate needs `sha2 ^0.11`, and `integrity`
+//! pins `=0.11.0-rc.5` transitively through `iroh-base`. Semver excludes pre-releases from `^0.11`,
+//! so the plugin's dependency graph and this test's cannot be the same graph. See `Cargo.toml`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -114,7 +118,7 @@ fn config(value: serde_json::Value) -> Map<String, serde_json::Value> {
 /// which would otherwise contend on cargo's lock.
 fn build_cdylib() -> (TempDir, PathBuf) {
     let target = TempDir::new().expect("build target directory");
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
     let status = Command::new(env!("CARGO"))
         .args(["build", "--manifest-path"])
         .arg(manifest)
@@ -185,5 +189,12 @@ symbol = "nemo_relay_register_plugin"
 
 fn digest(path: &Path) -> String {
     let bytes = std::fs::read(path).expect("library should read");
-    format!("sha256:{:x}", Sha256::digest(&bytes))
+    // sha2 0.11 returns a `hybrid-array` type, which does not implement `LowerHex` the way 0.10's
+    // `GenericArray` did. Relay compares this string against its own digest, so the encoding has to
+    // be plain lowercase hex with no separators.
+    let mut hex = String::from("sha256:");
+    for byte in Sha256::digest(&bytes) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }

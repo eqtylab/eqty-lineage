@@ -49,11 +49,40 @@ statement generation is Phase 3.
 
 | | |
 |---|---|
-| loads through the C ABI and registers `eqty.lineage` | yes — `tests/lifecycle.rs` |
+| loads through the C ABI and registers `eqty.lineage` | yes — `abi-test/tests/lifecycle.rs` |
 | config validated, all problems reported at once | yes — `tests/config.rs` |
 | classifies a real Codex capture | yes — `tests/classify.rs` |
 | attributes gateway events to a session | yes — `tests/session.rs` |
-| writes a manifest | not yet |
+| builds a signed manifest from Rust | yes — `tests/lineage.rs` |
+| asset CIDs match `eqty_sdk` exactly | yes — `tests/lineage.rs`, golden vector |
+| classified events reach the manifest | **not yet** — the recorder is the remaining work |
+
+## `src/lineage/` is written to be liftable
+
+The statement composition lives in `src/lineage/`, and nothing Relay-shaped is allowed in there. That
+is deliberate: `integrity` supplies primitives, but "an asset" is three statements in an arrangement
+that differs depending on whether the asset has content, and that composition is what `integrity-py`
+contributes. We are the second implementation of it.
+
+Whether it should become a feature of `integrity` or a standalone `integrity-rs` is open. Writing it
+already-extracted costs nothing now and makes the answer cheap later.
+
+It does **not** copy `integrity-py`'s process-global config. This plugin is long-lived and records
+many sessions concurrently, so a global active signer is a shared mutable several sessions would race
+over — it is also why `eqty_sdk.init()` is silently ignored on a second call. Here the session owns
+its signer and is passed explicitly.
+
+## Two dependency facts that look like bugs
+
+**The ABI test is a separate crate.** `integrity` reaches `sha2` through `iroh-blobs → iroh-base`,
+which pins it at exactly `=0.11.0-rc.5`. Relay's core crate asks for `^0.11`, and semver excludes
+pre-releases from that range. The two are unsatisfiable together, so `abi-test/` has its own
+workspace and lockfile. It costs nothing real — that crate needs no `integrity`, and the plugin needs
+no `nemo-relay` core, since `nemo-relay-plugin` re-exports the types it uses.
+
+**Statement CIDs are never reproducible.** They cover a credential carrying `validFrom`, so two
+recordings of identical work never match byte for byte. Content CIDs have no such problem, which is
+why the cross-language check in `tests/lineage.rs` is over content and not over statements.
 
 ## Two things the fixture taught us
 

@@ -19,6 +19,14 @@ crate-type = ["cdylib", "rlib"]
 # The plugin authoring SDK. It re-exports `Event` and the rest of `nemo-relay-types`, so depending on
 # Relay's core crate as well would only add a second copy of the same types.
 nemo-relay-plugin = "0.8.3"
+# The EQTY core. Pinned by SHA rather than tag so the build cannot move underneath us; this is
+# v0.0.13. `integrity` does not resolve from a clean crates.io index at any revision -- `core2 0.4.0`
+# is yanked and reachable through two different dependency paths -- so `Cargo.lock` is committed and
+# is a build requirement, not a preference. See README.
+integrity = { git = "https://github.com/eqtylab/integrity", rev = "0d85ae5b9f7204812771c4f8e4985c671b831b0a", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
+anyhow = "1"
+chrono = "0.4"
+tokio = { version = "1", features = ["rt", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = "1"
@@ -27,10 +35,7 @@ uuid = "1"
 # Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`
 # exactly as the host does before it calls a subscriber.
 serde_json = "1"
-# Relay's core, used only by `tests/lifecycle.rs`, which loads the built cdylib through the same
-# dynamic-plugin host path the gateway uses. This is what proves the C ABI contract holds without
-# needing the `nemo-relay` binary installed.
-nemo-relay = "0.8.3"
-sha2 = "0.10"
+# The ABI load test lives in `abi-test/`, as its own crate: it needs Relay's core crate, which
+# cannot coexist with `integrity` in one dependency graph. See `abi-test/Cargo.toml`.
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

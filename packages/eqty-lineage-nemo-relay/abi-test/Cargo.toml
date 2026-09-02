@@ -1,0 +1,28 @@
+[package]
+name = "eqty-lineage-nemo-relay-abi-test"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Loads the eqty-lineage-nemo-relay cdylib through Relay's dynamic-plugin host."
+
+# Its own workspace, and its own lockfile, on purpose.
+#
+# This crate cannot live in the plugin's dependency graph. `integrity` reaches `sha2` through
+# `iroh-blobs -> iroh-base`, which pins it exactly at `=0.11.0-rc.5`; Relay's core crate asks for
+# `^0.11`, and semver excludes pre-releases from that range. The two requirements are unsatisfiable
+# together.
+#
+# Splitting them costs nothing real: this crate needs no `integrity`, and the plugin needs no
+# `nemo-relay` core -- `nemo-relay-plugin` re-exports the types it uses. The separation is what the
+# dependency graph was already telling us.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+nemo-relay = "0.8.3"
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }

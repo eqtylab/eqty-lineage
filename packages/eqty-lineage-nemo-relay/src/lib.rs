@@ -29,10 +29,12 @@
 
 mod classify;
 mod config;
+mod lineage;
 mod session;
 
 pub use classify::{Correlation, LineageEvent, classify};
 pub use config::Config;
+pub use lineage::{AssetRef, LineageSession};
 pub use session::SessionRouter;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
