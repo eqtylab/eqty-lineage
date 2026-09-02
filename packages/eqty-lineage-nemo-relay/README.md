@@ -1,0 +1,111 @@
+# eqty-lineage-nemo-relay
+
+Records a Claude Code or Codex session as a signed EQTY lineage manifest, by registering an EQTY
+subscriber inside [NVIDIA NeMo Relay](https://github.com/NVIDIA/NeMo-Relay) and calling the
+`integrity` Rust core directly.
+
+## What this is
+
+Relay already installs itself into Claude Code and Codex, receives their lifecycle hooks, and proxies
+their LLM traffic through a local gateway. Internally it emits one stream of events and lets plugins
+subscribe to it — which is exactly how its own ATOF and ATIF exporters are built:
+
+```rust
+// nemo-relay: crates/core/src/observability/plugin_component.rs
+ctx.register_subscriber("atof", subscriber)?;   // :1259
+ctx.register_subscriber("atif", dispatcher)?;   // :1344
+```
+
+This crate registers a third subscriber on the same stream, as a peer rather than as a consumer of
+their output files:
+
+```rust
+ctx.register_subscriber("eqty_lineage", move |event: &Event| { … })?;
+```
+
+That matters for fidelity. We see raw events before ATIF normalization drops marks and before ATOF
+serializes anything, and an in-process subscriber can reach `Event::annotated_request` — the typed
+LLM request object, rather than the serialized `data` that file consumers get.
+
+The manifest is written by the same code the Python SDK uses. `eqty_sdk.Context.export()` calls
+`integrity::lineage::models::manifest::generate_manifest`; so do we, directly:
+
+```rust
+pub async fn generate_manifest(
+    include_context: bool,
+    statements: Vec<Statement>,
+    blobs: HashMap<String, String>,
+) -> Result<Manifest>
+```
+
+Same function, same `Statement` type, same signing and CID code underneath — so a manifest produced
+here verifies exactly as one produced by the Python SDK today.
+
+## Status
+
+Phase 2 of [the plan](../../../eqty-lineage-nemo-relay-plugin-plan.md): the plugin loads, validates
+its configuration, and classifies a real event stream. It does **not** yet build a lineage graph —
+statement generation is Phase 3.
+
+| | |
+|---|---|
+| loads through the C ABI and registers `eqty.lineage` | yes — `tests/lifecycle.rs` |
+| config validated, all problems reported at once | yes — `tests/config.rs` |
+| classifies a real Codex capture | yes — `tests/classify.rs` |
+| attributes gateway events to a session | yes — `tests/session.rs` |
+| writes a manifest | not yet |
+
+## Two things the fixture taught us
+
+`tests/fixtures/codex-session.jsonl` is a real Codex session captured through Relay. Two findings
+from it are baked into the design, and both are easy to get wrong by assumption.
+
+**Gateway events carry no session id.** Hook-path events have `session_id` in metadata. LLM scopes
+arrive through the gateway instead, and their metadata is `gateway_path`, `llm_correlation_status`
+and `otel.status_code` — nothing else. Session attribution therefore comes from the `parent_uuid`
+scope tree, not from the event, which is why `session.rs` exists at all.
+
+**Codex never closes its agent scope.** Its plugin hook schema has no `SessionEnd`, so Relay emits no
+`agent` scope end and `SessionEnded` never fires. Flushing on `Drop` is not tidy-shutdown hygiene
+here; on Codex it is the only path that will ever write a manifest.
+
+## Not knowing is recorded as not knowing
+
+ATOF 0.1 defers a terminal `status` field on scope end. Relay fills the gap in metadata — deriving
+`error` from `PostToolUseFailure`, `denied` from a permission denial — and strips nulls, so the key
+is present only when it knows. `is_error` is therefore `Option<bool>` and stays that way.
+
+On Codex that means every tool call is `None`: its hook schema has no failure event, so `ls
+/nonexistent` and `echo hello` are indistinguishable. Recording `false` would turn *we did not
+observe a failure* into *we observed a success*, and attest something nobody saw.
+
+The same rule governs correlation. Relay reports how confident its own join was, and
+`agent_fallback` / `ambiguous_fallback` mean it guessed. Those become `Correlation::Inferred`, never
+`Observed`.
+
+## Building
+
+```bash
+cargo test                       # 19 tests, including a real load through the C ABI
+cargo build --release            # target/release/libeqty_lineage_nemo_relay.dylib
+shasum -a 256 target/release/libeqty_lineage_nemo_relay.dylib
+```
+
+The digest goes in `relay-plugin.toml` under `[integrity] sha256`, which Relay verifies against the
+library before loading it regardless of attestation policy. Release CI generates it; a stale digest
+is an install Relay refuses, and that should be caught before release rather than by a user.
+
+Note that `[integrity] sha256` is **NVIDIA's** artifact digest and has nothing to do with the EQTY
+`integrity` crate this plugin links. The collision is unfortunate; do not conflate them.
+
+## Installing into Relay
+
+```bash
+nemo-relay plugins validate ./relay-plugin.toml
+nemo-relay plugins add --user ./relay-plugin.toml
+nemo-relay plugins inspect eqty.lineage
+nemo-relay plugins enable  eqty.lineage
+```
+
+`enable` changes lifecycle state only — it does not load code. Relay validates and loads enabled
+plugins when the gateway starts, so a change takes effect on the next sidecar start.

@@ -7,9 +7,12 @@ _:
 sync:
   uv sync --group dev --python "$(command -v python)" --no-managed-python --no-python-downloads
 
-# Build the whl and sdist for every workspace package (outputs to ./dist)
+# Build the whl and sdist for every workspace package (outputs to ./dist), and the Relay cdylib
 build:
   uv build --all-packages --python "$(command -v python)" --no-managed-python --no-python-downloads
+  # Not a wheel: `kind = "rust_dynamic"` loads this through a C ABI, so the artifact is a per-platform
+  # shared library that ships with its own `relay-plugin.toml` and sha256 digest.
+  cd packages/eqty-lineage-nemo-relay && cargo build --release
 
 # Build the whl and sdist for one workspace package (outputs to ./dist/<package>)
 build-package package:
@@ -30,6 +33,7 @@ clean:
 # Run the test suite
 test *ARGS:
   uv run --no-sync pytest "$@"
+  cd packages/eqty-lineage-nemo-relay && cargo test
 
 # Compare the LangChain lineage the handler produces now against a released one (default: newest tag)
 langchain-diff-demo REF="":
@@ -47,14 +51,17 @@ langchain-diff-demo REF="":
 deepagents-demo *ARGS:
   uv run --no-sync python examples/deepagents/research_agent.py "$@"
 
-# Format all Python code in the repo
+# Format every package in the repo
 fmt:
   ruff format .
+  cd packages/eqty-lineage-nemo-relay && cargo fmt
 
 # Verify formatting without rewriting anything
 fmt-check:
   ruff format --check .
+  cd packages/eqty-lineage-nemo-relay && cargo fmt --check
 
-# Lint all Python code in the repo
+# Lint every package in the repo
 lint:
   ruff check .
+  cd packages/eqty-lineage-nemo-relay && cargo clippy --all-targets -- -D warnings

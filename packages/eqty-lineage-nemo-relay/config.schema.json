@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "eqty.lineage component configuration",
+  "description": "Settings for one EQTY lineage recorder component inside NeMo Relay.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "manifest_dir": {
+      "type": "string",
+      "minLength": 1,
+      "default": ".eqty/manifests",
+      "description": "Directory manifests are written to, resolved relative to Relay's working directory. One manifest per session, named by session id."
+    },
+    "triples": {
+      "type": "boolean",
+      "default": true,
+      "description": "Write the RDF triples sidecar alongside the manifest."
+    },
+    "deny_globs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [".env*", "*.pem", "id_rsa*", "*/.ssh/*", "*credentials*"],
+      "description": "Paths whose contents are withheld. A matching file still becomes a graph node carrying its path and its true content CID, computed before redaction; only the bytes are withheld. Provenance does not require publication."
+    },
+    "max_content_bytes": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "default": 1048576,
+      "description": "Content larger than this is recorded by CID and metadata, without storing its bytes."
+    },
+    "executor": {
+      "type": "object",
+      "description": "Relay's own per-component executor override.",
+      "additionalProperties": false,
+      "properties": {
+        "worker_threads": { "type": "integer", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

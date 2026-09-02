@@ -1,0 +1,43 @@
+# NeMo Relay plugin manifest for the EQTY lineage recorder.
+#
+# Two traps live in this file, both from name collisions:
+#
+#   * `[plugin] id` must equal the string `plugin_kind()` returns in `src/lib.rs`, and it is what
+#     `components[].kind` refers to in a host's `plugins.toml`. `[plugin] kind` is a different thing
+#     entirely -- the execution model Relay uses to load us.
+#   * `[integrity] sha256` is NVIDIA's digest of the built artifact. It has nothing to do with the
+#     EQTY `integrity` crate this plugin links against. Do not conflate them.
+#
+# `[source] artifact` and `[load] library` must stay aligned, and both are per-platform. CI generates
+# the digest and fails the build if this file disagrees with the artifact: a stale digest is an
+# install Relay refuses, and that should be caught before release rather than by a user.
+
+manifest_version = 1
+
+[plugin]
+id = "eqty.lineage"
+kind = "rust_dynamic"
+
+[compat]
+relay = ">=0.8.0,<1.0"
+native_api = "1"
+
+# Relay requires a native plugin to default to disabled. Enabling is an explicit host decision.
+[defaults]
+enabled = false
+
+[capabilities]
+items = ["plugin_native", "config_schema"]
+
+[config_schema]
+path = "config.schema.json"
+
+[source]
+artifact = "target/release/libeqty_lineage_nemo_relay.dylib"
+
+[integrity]
+sha256 = "sha256:<digest of source.artifact -- generated in CI>"
+
+[load]
+library = "target/release/libeqty_lineage_nemo_relay.dylib"
+symbol = "nemo_relay_register_plugin"

@@ -1,0 +1,198 @@
+//! Turning a Relay `Event` into the vocabulary the EQTY recorder already speaks.
+//!
+//! Relay hands a subscriber every event it emits, in one flat stream: scope starts and ends for
+//! agents, turns, LLM calls and tools, plus point-in-time marks. Most of that stream is not lineage.
+//! This module is the filter and the translation, and it is deliberately the only place that knows
+//! ATOF's spelling of anything -- everything downstream sees [`LineageEvent`].
+//!
+//! Two rules from the ATOF specification shape the code below and are easy to violate by accident:
+//!
+//! * **`data` is opaque.** Its shape is producer-defined and consumers must not dispatch on its
+//!   contents to decide what an event *is*. So classification reads `kind`, `category` and
+//!   `scope_category` -- never `data`. Reading fields *out of* `data` once an event is already
+//!   classified is fine, and is how file lineage will work; deciding an event is a tool call
+//!   *because* `data` has a `command` key is not.
+//! * **Unknown values are preserved, not rejected.** A newer Relay may emit categories this build
+//!   has never heard of. Those classify as `None` and are dropped, which loses a node; treating them
+//!   as an error would lose the whole session.
+//!
+//! Classification says *what an event is*, and nothing about which session it belongs to. That
+//! separation is forced by the data: events arriving through Relay's gateway carry no session
+//! identifier at all. See [`crate::session`].
+
+use nemo_relay_plugin::{Event, EventCategory, Json, ScopeCategory};
+
+/// How much Relay trusts its own join between an event and the scope it parented that event to.
+///
+/// Relay records this on correlated events, and it is the first capture path where the recorder's
+/// `observed` flag comes from a field rather than from a heuristic of ours. The two fallback
+/// statuses mean Relay had to guess: `agent_fallback` when no hint was pending at all, and
+/// `ambiguous_fallback` when hints were pending and none matched -- which Relay's own source
+/// documents as possibly wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Correlation {
+    /// Relay had direct evidence for the association.
+    Observed,
+    /// Relay inferred the association and may be wrong.
+    Inferred,
+}
+
+impl Correlation {
+    /// Read the correlation status Relay recorded on this event.
+    ///
+    /// Tool and LLM events use different metadata keys for the same idea, so both are checked.
+    /// Absent metadata is [`Correlation::Inferred`] rather than [`Correlation::Observed`]: an event
+    /// carrying no statement about its own correlation has not earned the stronger claim.
+    fn from_metadata(metadata: Option<&Json>) -> Self {
+        let status = string_at(metadata, "tool_correlation_status")
+            .or_else(|| string_at(metadata, "llm_correlation_status"));
+        match status {
+            Some("explicit" | "single_hint" | "matched_hint" | "active_subagent") => Self::Observed,
+            _ => Self::Inferred,
+        }
+    }
+
+    /// Whether the recorder should mark statements from this event as observed.
+    pub fn is_observed(self) -> bool {
+        matches!(self, Self::Observed)
+    }
+}
+
+/// The subset of Relay's event stream that means something to a lineage graph.
+///
+/// This mirrors the frozen event dataclasses in `eqty_lineage.recorder.events`. Keeping the two in
+/// step is what lets a manifest recorded through Relay be compared against one recorded through the
+/// Python capture paths: same vocabulary in the middle, so a difference in the graph is a real
+/// difference and not a translation artifact.
+///
+/// No variant carries a session identifier. Session attribution is [`crate::session`]'s job.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LineageEvent {
+    /// A session began. Carries the agent identity the manifest will attest.
+    SessionStarted {
+        agent: Option<String>,
+        model: Option<String>,
+    },
+    /// A user turn opened with a prompt.
+    PromptSubmitted { text: String },
+    /// A completed model call. Only the scope *end* produces one, because the response is not known
+    /// at the start.
+    ModelCall {
+        model: Option<String>,
+        correlation: Correlation,
+    },
+    /// A tool call began. `tool_input` is the arguments object verbatim.
+    ToolCallStarted {
+        tool_use_id: Option<String>,
+        tool_name: String,
+        tool_input: Option<Json>,
+        correlation: Correlation,
+    },
+    /// A tool call finished.
+    ToolCallEnded {
+        tool_use_id: Option<String>,
+        tool_name: String,
+        result: Option<Json>,
+        /// `None` means Relay did not know, which is not the same as "succeeded". See
+        /// [`terminal_status`].
+        is_error: Option<bool>,
+        correlation: Correlation,
+    },
+    /// The agent compacted its context. Recorded because everything before it left the transcript.
+    Compacted,
+    /// The session ended. This is the export trigger.
+    SessionEnded,
+}
+
+/// Classify one Relay event, or `None` when it carries no lineage.
+///
+/// The overwhelming majority of a real session is `llm.chunk` marks -- 428 of the 445 events in the
+/// reference Codex capture -- and they are streaming detail already summarized by the enclosing LLM
+/// scope. Dropping them here keeps the rest of the plugin from ever seeing them.
+pub fn classify(event: &Event) -> Option<LineageEvent> {
+    let metadata = event.metadata();
+    match event.kind() {
+        "mark" => classify_mark(event, metadata),
+        "scope" => classify_scope(event, metadata),
+        // ATOF may grow event kinds. An unknown one is not an error.
+        _ => None,
+    }
+}
+
+fn classify_mark(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent> {
+    match event.name() {
+        "session.start" => Some(LineageEvent::SessionStarted {
+            agent: string_at(metadata, "agent_kind").map(str::to_string),
+            model: string_at(metadata, "model").map(str::to_string),
+        }),
+        _ => match string_at(metadata, "hook_event_name") {
+            Some("PreCompact" | "PostCompact") => Some(LineageEvent::Compacted),
+            _ => None,
+        },
+    }
+}
+
+fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent> {
+    let category = event.category().map(EventCategory::as_str)?;
+    let is_end = matches!(event.scope_category(), Some(ScopeCategory::End));
+
+    match (category, is_end) {
+        // An LLM scope is only lineage once it has a response, which is at the end.
+        ("llm", true) => Some(LineageEvent::ModelCall {
+            model: event.model_name().map(str::to_string),
+            correlation: Correlation::from_metadata(metadata),
+        }),
+        ("llm", false) => None,
+
+        ("tool", false) => Some(LineageEvent::ToolCallStarted {
+            tool_use_id: event.tool_call_id().map(str::to_string),
+            tool_name: event.name().to_string(),
+            tool_input: event.data().cloned(),
+            correlation: Correlation::from_metadata(metadata),
+        }),
+        ("tool", true) => Some(LineageEvent::ToolCallEnded {
+            tool_use_id: event.tool_call_id().map(str::to_string),
+            tool_name: event.name().to_string(),
+            result: event.data().cloned(),
+            is_error: terminal_status(metadata),
+            correlation: Correlation::from_metadata(metadata),
+        }),
+
+        // The turn scope is where a prompt arrives. Relay spells the role in metadata rather than in
+        // the scope name, which differs per agent (`codex-turn` against `claude-code-turn`).
+        ("custom", false) if string_at(metadata, "nemo_relay_scope_role") == Some("turn") => {
+            let text = string_at(event.data(), "prompt")?.to_string();
+            Some(LineageEvent::PromptSubmitted { text })
+        }
+
+        ("agent", true) => Some(LineageEvent::SessionEnded),
+
+        _ => None,
+    }
+}
+
+/// Whether a tool call failed, as far as Relay could tell.
+///
+/// ATOF 0.1 defers a terminal `status` field on scope end, so there is no specified place to read
+/// this from. Relay fills the gap in metadata: it takes an explicit `status`/`decision`/`permission`
+/// from the hook payload, and otherwise derives one from the hook event name -- `error` for
+/// `PostToolUseFailure`, `denied` for a permission denial. Crucially Relay strips null metadata
+/// before emitting, so the key is present *only when it knows*.
+///
+/// That three-valued result is preserved here rather than flattened. `None` means Relay had no
+/// evidence either way, which on Codex is every tool call -- its hook schema has no failure event,
+/// so a failing command and a succeeding one are indistinguishable. Defaulting that to `false` would
+/// turn "we did not observe a failure" into "we observed a success", and attest something nobody saw.
+fn terminal_status(metadata: Option<&Json>) -> Option<bool> {
+    match string_at(metadata, "status")? {
+        "error" | "failed" | "failure" | "denied" => Some(true),
+        "ok" | "success" | "allow" | "allowed" => Some(false),
+        // A spelling this build does not know. Preserve the uncertainty.
+        _ => None,
+    }
+}
+
+/// Read a string field from a JSON object that may be absent or may not be an object.
+pub(crate) fn string_at<'a>(value: Option<&'a Json>, key: &str) -> Option<&'a str> {
+    value?.get(key)?.as_str()
+}

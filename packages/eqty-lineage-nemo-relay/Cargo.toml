@@ -1,0 +1,36 @@
+[package]
+name = "eqty-lineage-nemo-relay"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Records a NeMo Relay session as a signed EQTY lineage manifest."
+license = "Apache-2.0"
+
+# A standalone workspace: the repository around it is a uv/Python workspace, and cargo must not try
+# to inherit from a parent it would never find.
+[workspace]
+
+[lib]
+name = "eqty_lineage_nemo_relay"
+# cdylib is what `kind = "rust_dynamic"` loads through the C ABI; rlib is what `tests/` links.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The plugin authoring SDK. It re-exports `Event` and the rest of `nemo-relay-types`, so depending on
+# Relay's core crate as well would only add a second copy of the same types.
+nemo-relay-plugin = "0.8.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = "1"
+
+[dev-dependencies]
+# Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`
+# exactly as the host does before it calls a subscriber.
+serde_json = "1"
+# Relay's core, used only by `tests/lifecycle.rs`, which loads the built cdylib through the same
+# dynamic-plugin host path the gateway uses. This is what proves the C ABI contract holds without
+# needing the `nemo-relay` binary installed.
+nemo-relay = "0.8.3"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
