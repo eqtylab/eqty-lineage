@@ -510,6 +510,31 @@ async fn record_tool(
     {
         inputs.push(tool);
     }
+    // What the tool was invoked with. Without it the graph says "Bash ran and produced this output"
+    // and never what command ran -- and on a real session most of the work went through Bash, so
+    // that is most of the information missing. The arguments are an input for the same reason the
+    // result is an output: the run consumed them.
+    //
+    // `register_payload` applies the size policy, so a large `Write` body is withheld and recorded
+    // by CID rather than inlined.
+    if let Some(open) = &open
+        && let Some(input) = open.input.as_ref()
+        && let Ok(body) = serde_json::to_vec(input)
+        && let Ok(asset) = state
+            .recorder
+            .register_payload(
+                "Dataset",
+                &format!("{} input", open.name),
+                &format!("What the '{}' tool was invoked with.", open.name),
+                &body,
+                serde_json::json!({ "toolUseId": tool_use_id }),
+                at.clone(),
+            )
+            .await
+    {
+        inputs.push(asset);
+    }
+
     for observation in &observations {
         // A failed registration must not take the session down with it: the observation is skipped
         // and the count survives in coverage, so the manifest still says something was seen and not

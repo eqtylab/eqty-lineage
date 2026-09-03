@@ -1134,3 +1134,54 @@ fn every_statement_carries_a_credential() {
         "the fixture must actually produce metadata statements, or this test proves nothing"
     );
 }
+
+#[test]
+fn a_tool_run_records_what_it_was_invoked_with() {
+    // Two live sessions recorded five tool runs each as `[Tool] -> Dataset`: something ran, here is
+    // its output, and no record of what was asked of it. Most of the work went through Bash, so
+    // most of the information was the command -- which the event carries and we were discarding.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000097";
+    let tool = "01a040aa-0000-0000-0000-0000000000d1";
+    let root = "01a040aa-0000-0000-0000-0000000000d0";
+
+    let mut events = vec![mark(
+        session,
+        root,
+        root,
+        "session.start",
+        serde_json::json!({ "model": "opus" }),
+    )];
+    events.push(claude_read(
+        session,
+        tool,
+        root,
+        "start",
+        serde_json::json!({ "command": "curl -s https://example.com/weather" }),
+    ));
+    events.push(claude_read(
+        session,
+        tool,
+        root,
+        "end",
+        serde_json::json!("18 degrees and raining"),
+    ));
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let decoded = decoded_blobs(path);
+    assert!(
+        decoded.contains("curl -s https://example.com/weather"),
+        "the command the tool ran must be in the manifest:\n{decoded}"
+    );
+
+    // And it must be an *input* to the run -- the activity consumed it. Asserting only that the
+    // bytes appear somewhere would pass with the node dangling off the graph.
+    let arguments = format!("urn:cid:{}", cid_for_named(path, "Read input"));
+    assert!(
+        computation_inputs(path)
+            .iter()
+            .any(|inputs| inputs.contains(&arguments)),
+        "the arguments must be an input to the run that used them"
+    );
+}
