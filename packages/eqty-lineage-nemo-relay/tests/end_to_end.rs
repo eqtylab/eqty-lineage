@@ -1094,3 +1094,43 @@ fn an_activity_says_what_kind_of_work_it_was() {
     assert!(kinds.contains("model_call"), "got {kinds:?}");
     assert!(kinds.contains("tool_call"), "got {kinds:?}");
 }
+
+#[test]
+fn every_statement_carries_a_credential() {
+    // A metadata statement holds the claims a reader acts on -- a file's path, an activity's
+    // `performedBy`. Without a credential over it, those claims are unattributed: the manifest
+    // still verifies with them altered or added, so the attribution in the graph asserts nothing
+    // about who made it. The shipped manifests credential every statement; this one did not,
+    // and no existing check noticed, because "the manifest is internally sound" was only ever
+    // asserted over the statements that happened to be signed.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000098"), &into);
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifests(&into)[0]).unwrap()).unwrap();
+    let statements = manifest["statements"].as_object().expect("statements");
+
+    let credentialed: std::collections::HashSet<&str> = statements
+        .values()
+        .filter(|s| s["@type"] == "CredentialRegistration")
+        .filter_map(|s| s["credential"]["credentialSubject"]["id"].as_str())
+        .collect();
+
+    let uncredentialed: Vec<(&str, &str)> = statements
+        .iter()
+        .filter(|(_, s)| s["@type"] != "CredentialRegistration")
+        .filter(|(id, _)| !credentialed.contains(id.as_str()))
+        .map(|(id, s)| (s["@type"].as_str().unwrap_or("?"), id.as_str()))
+        .collect();
+
+    assert!(
+        uncredentialed.is_empty(),
+        "every statement should be attested, but these are not: {uncredentialed:?}"
+    );
+    assert!(
+        statements
+            .values()
+            .any(|s| s["@type"] == "MetadataRegistration"),
+        "the fixture must actually produce metadata statements, or this test proves nothing"
+    );
+}

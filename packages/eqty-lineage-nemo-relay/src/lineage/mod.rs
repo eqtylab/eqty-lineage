@@ -240,11 +240,17 @@ impl LineageSession {
         Ok(())
     }
 
-    /// Append a metadata statement, and the bytes it commits to.
+    /// Append a metadata statement, the bytes it commits to, and a credential over it.
     ///
     /// `create_from_json` stores only a CID of the canonicalized metadata. Storing the matching
     /// bytes is not optional bookkeeping: without them the manifest carries a reference that
     /// resolves to nothing, and a reader cannot see what was claimed.
+    ///
+    /// The credential is not optional either. A metadata statement carries the claims a reader
+    /// actually acts on -- a file's path, an activity's `performedBy` -- and without a VC over it
+    /// those claims are unattributed: the manifest still verifies with them altered or added. The
+    /// shipped manifests credential every statement; an earlier version of this method credentialed
+    /// none of its own.
     async fn push_metadata(
         &mut self,
         subject: String,
@@ -254,10 +260,11 @@ impl LineageSession {
         let (metadata_cid, canonical) = integrity::cid::jcs::compute_jcs_cid(&metadata)?;
         self.blobs.insert(metadata_cid, canonical);
 
-        self.statements.push(Statement::MetadataRegistration(
-            MetadataStatement::create_from_json(subject, metadata, self.did.clone(), at).await?,
-        ));
-        Ok(())
+        let statement = Statement::MetadataRegistration(
+            MetadataStatement::create_from_json(subject, metadata, self.did.clone(), at.clone())
+                .await?,
+        );
+        self.push_with_proof(statement, at).await
     }
 
     /// Resolve every referenced blob and build the manifest.
