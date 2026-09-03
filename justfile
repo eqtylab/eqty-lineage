@@ -86,3 +86,63 @@ lint:
   ruff check .
   cd packages/eqty-lineage-nemo-relay && cargo clippy --all-targets -- -D warnings
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo clippy --all-targets -- -D warnings
+
+# Stage a signed, installable Relay plugin into dist/relay-plugin.
+#
+# The staging directory is the point, not a convenience. `nemo-relay` copies the WHOLE directory
+# containing relay-plugin.toml into an activation snapshot, recursively, against a 512 MiB budget.
+# Installed from the package root that closure is src/ + tests/ + target/ + abi-test/target/ -- 11 GB
+# -- and the gateway refuses to start, naming some unrelated rlib. So the installed manifest lives
+# beside just the dylib, its signature, and the config schema.
+#
+# Signing is not optional at runtime. `plugins add` evaluates trust with attestation defaulting to
+# `integrity_only`, but ACTIVATION calls apply_secure_runtime_defaults(), which forces
+# `signature_required` unless plugins.toml says otherwise. An unsigned plugin therefore installs
+# cleanly and then refuses to start.
+#
+# Relay verifies a raw Ed25519 signature over the ARTIFACT BYTES (not over the digest), read from
+# the file named by `integrity.signature`, base64 with an optional `ed25519:` prefix.
+#
+# Override the key with RELAY_SIGNING_KEY=/path/to/ed25519.pem. A dev key is generated on first use;
+# release CI should pass EQTY's real key instead.
+nemo-relay-package:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  key="${RELAY_SIGNING_KEY:-$HOME/.config/eqty-lineage/relay-dev-signing-key.pem}"
+  if [ ! -f "$key" ]; then
+    mkdir -p "$(dirname "$key")"
+    (umask 077 && openssl genpkey -algorithm ed25519 -out "$key")
+    echo "generated a NEW dev signing key at $key (private -- do not commit or share)"
+  fi
+  cd packages/eqty-lineage-nemo-relay && cargo build --release --lib && cd ../..
+  rm -rf dist/relay-plugin && mkdir -p dist/relay-plugin
+  cp packages/eqty-lineage-nemo-relay/target/release/libeqty_lineage_nemo_relay.dylib dist/relay-plugin/
+  cp packages/eqty-lineage-nemo-relay/config.schema.json dist/relay-plugin/
+  cp packages/eqty-lineage-nemo-relay/relay-plugin.toml dist/relay-plugin/
+  cd dist/relay-plugin
+  lib=libeqty_lineage_nemo_relay.dylib
+  digest=$(shasum -a 256 "$lib" | awk '{print $1}')
+  openssl pkeyutl -sign -rawin -inkey "$key" -in "$lib" -out "$lib.sig.raw"
+  base64 < "$lib.sig.raw" | tr -d '\n' > "$lib.sig"
+  rm -f "$lib.sig.raw"
+  pub="ed25519:$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+  python3 - "$digest" "$lib.sig" <<'EOF'
+  import re, sys
+  digest, signature = sys.argv[1], sys.argv[2]
+  p = "relay-plugin.toml"
+  s = open(p).read()
+  s = re.sub(r'sha256 = "sha256:[^"]*"', f'sha256 = "sha256:{digest}"', s)
+  if "signature =" not in s:
+      s = s.replace(f'sha256 = "sha256:{digest}"',
+                    f'sha256 = "sha256:{digest}"\nsignature = "{signature}"')
+  open(p, "w").write(s)
+  EOF
+  echo "staged dist/relay-plugin  sha256:$digest"
+  echo
+  echo "Add this to the [plugins.policy] block of your plugins.toml, or activation will refuse:"
+  echo
+  echo "  [plugins.policy.overrides.\"eqty.lineage\"]"
+  echo "  attestation = \"signature_required\""
+  echo "  trusted_public_keys = [\"$pub\"]"
+  echo
+  echo "then: nemo-relay plugins add --user ./dist/relay-plugin/relay-plugin.toml"
