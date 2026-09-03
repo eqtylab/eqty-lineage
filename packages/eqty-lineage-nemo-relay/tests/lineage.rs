@@ -220,3 +220,67 @@ async fn asset_cids_match_the_python_sdk_exactly() {
         );
     }
 }
+
+/// Count statements of one `@type` in a serialized manifest.
+fn count_of(json: &serde_json::Value, kind: &str) -> usize {
+    json["statements"]
+        .as_object()
+        .expect("statements")
+        .values()
+        .filter(|statement| statement["@type"] == kind)
+        .count()
+}
+
+#[tokio::test]
+async fn identical_content_is_registered_once() {
+    // Under content addressing a second registration of the same bytes asserts nothing the first
+    // did not -- same CID, same node, same edges. A real session repeats its system prompt on every
+    // call, which made 22 of 77 data statements redundant before this held.
+    let mut lineage = session();
+    let first = lineage
+        .register_content(b"you are careful", metadata("system prompt"), None)
+        .await
+        .expect("content registers");
+    for _ in 0..4 {
+        let again = lineage
+            .register_content(b"you are careful", metadata("system prompt"), None)
+            .await
+            .expect("content registers");
+        assert_eq!(again, first, "the same bytes must resolve to the same node");
+    }
+
+    let json = serde_json::to_value(lineage.into_manifest().await.expect("manifest")).unwrap();
+    assert_eq!(count_of(&json, "DataRegistration"), 1);
+    assert_eq!(count_of(&json, "MetadataRegistration"), 1);
+    // The credential rides along, so collapsing the registration must collapse it too.
+    assert_eq!(count_of(&json, "CredentialRegistration"), 2);
+}
+
+#[tokio::test]
+async fn the_same_bytes_seen_two_ways_keep_both_descriptions() {
+    // The guard on the test above. Deduping on content alone would be wrong: one file's contents
+    // seen at two paths is a single node with two things said about it, and dropping the second
+    // metadata would silently lose a path the recording did observe.
+    let mut lineage = session();
+    let here = lineage
+        .register_content(b"shared bytes", metadata("/a/config.toml"), None)
+        .await
+        .expect("content registers");
+    let there = lineage
+        .register_content(b"shared bytes", metadata("/b/config.toml"), None)
+        .await
+        .expect("content registers");
+    assert_eq!(here, there, "content decides identity; path is metadata");
+
+    let json = serde_json::to_value(lineage.into_manifest().await.expect("manifest")).unwrap();
+    assert_eq!(
+        count_of(&json, "DataRegistration"),
+        1,
+        "one set of bytes is one node"
+    );
+    assert_eq!(
+        count_of(&json, "MetadataRegistration"),
+        2,
+        "but both paths must survive"
+    );
+}

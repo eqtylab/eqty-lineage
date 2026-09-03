@@ -29,7 +29,7 @@
 //!
 //! Here the session owns its signer and its statements, and is passed explicitly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -84,6 +84,19 @@ pub struct LineageSession {
     /// CID to bytes, for every blob a statement references. `generate_manifest` inlines these, so a
     /// metadata statement whose bytes are missing here becomes a CID nobody can resolve.
     blobs: HashMap<String, Vec<u8>>,
+    /// Content CIDs that already carry a `DataRegistration`.
+    ///
+    /// Under content addressing a second registration of identical bytes asserts nothing the first
+    /// did not: same CID, same node, same edges. On a real session the system prompt repeats on
+    /// every call, and re-registering it made 22 of 77 data statements redundant -- each dragging a
+    /// credential and a metadata statement with it.
+    registered_content: HashSet<String>,
+    /// `(subject, metadata CID)` pairs that already carry a `MetadataRegistration`.
+    ///
+    /// Deduped separately from the content, because the same bytes can be described differently --
+    /// one file's contents seen at two paths is one node with two things said about it, and
+    /// collapsing on content alone would silently drop the second path.
+    described: HashSet<(String, String)>,
 }
 
 impl LineageSession {
@@ -95,6 +108,8 @@ impl LineageSession {
             did,
             statements: Vec::new(),
             blobs: HashMap::new(),
+            registered_content: HashSet::new(),
+            described: HashSet::new(),
         }
     }
 
@@ -124,10 +139,13 @@ impl LineageSession {
         let content_cid = blake3_cid_raw_binary(content)?;
         self.blobs.insert(content_cid.clone(), content.to_vec());
 
-        let data = Statement::DataRegistration(
-            DataStatement::create(vec![content_cid.clone()], self.did.clone(), at.clone()).await?,
-        );
-        self.push_with_proof(data, at.clone()).await?;
+        if self.registered_content.insert(content_cid.clone()) {
+            let data = Statement::DataRegistration(
+                DataStatement::create(vec![content_cid.clone()], self.did.clone(), at.clone())
+                    .await?,
+            );
+            self.push_with_proof(data, at.clone()).await?;
+        }
 
         // The metadata's subject is the *content CID*, not the statement that registered it. An
         // entity's metadata points at its statement instead; see `register_entity`.
@@ -258,7 +276,12 @@ impl LineageSession {
         at: Option<String>,
     ) -> Result<()> {
         let (metadata_cid, canonical) = integrity::cid::jcs::compute_jcs_cid(&metadata)?;
-        self.blobs.insert(metadata_cid, canonical);
+        self.blobs.insert(metadata_cid.clone(), canonical);
+
+        // Same subject, same claim, already stated. Saying it twice adds nothing a reader can use.
+        if !self.described.insert((subject.clone(), metadata_cid)) {
+            return Ok(());
+        }
 
         let statement = Statement::MetadataRegistration(
             MetadataStatement::create_from_json(subject, metadata, self.did.clone(), at.clone())
