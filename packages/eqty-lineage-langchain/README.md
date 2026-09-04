@@ -27,7 +27,7 @@ and reuses one child context per LangGraph `thread_id`; every asset and statemen
 recorded beneath that child. A `run_id` identifies one execution, not a multi-turn user session.
 
 ```python
-root_context = Context.new("travel-agent")
+root_context = Context.new("my-agent")
 eqty_sdk.init(default_context=root_context)
 
 app.invoke(

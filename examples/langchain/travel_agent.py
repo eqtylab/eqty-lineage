@@ -21,11 +21,9 @@ Requires OPENAI_API_KEY.
 """
 
 import argparse
-import logging
 import os
-from uuid import UUID
 from pathlib import Path
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, TypedDict
 
 from eqty_lineage.langchain import EqtyCallbackHandler, eqty_tool
 from eqty_sdk import Context, Signer, init, set_active_signer
@@ -116,7 +114,7 @@ class AgentState(TypedDict):
     answer: str
 
 
-def build_graph(model=None, checkpointer: Any = None):
+def build_graph(model=None):
     if model is None:
         model = ChatOpenAI(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
@@ -147,11 +145,11 @@ def build_graph(model=None, checkpointer: Any = None):
     graph.add_conditional_edges("agent", route_after_agent, ["tools", "summarize"])
     graph.add_edge("tools", "agent")
     graph.add_edge("summarize", END)
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile()
 
 
 def init_sdk():
-    ctx = Context.from_uuid(UUID("11111111-2222-3333-4444-555555555555"))
+    ctx = Context.new("Travel Assistant")
     cfg = init(default_context=ctx).set_store_all_blobs(True)
     signer = Signer.new(name="travel_assistant", _load_if_exists=True)
     set_active_signer(signer)
@@ -178,21 +176,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.debug:
-        logging.basicConfig(
-            # Keep the root logger quiet: DEBUG here otherwise enables verbose HTTP/Rust runtime
-            # logging (for example ``hyper_util``) that obscures the lineage events.
-            level=logging.WARNING,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        )
-        logging.getLogger("eqty").setLevel(logging.DEBUG)
-        logging.getLogger("eqty_sdk").setLevel(logging.DEBUG)
-        for logger_name in ("httpx", "httpcore", "urllib3", "openai", "hyper", "hyper_util"):
-            logging.getLogger(logger_name).setLevel(logging.WARNING)
     app = build_graph()
     result = app.invoke(
         {"messages": [HumanMessage(args.question)], "question": args.question, "answer": ""},
-        config={"callbacks": [EqtyCallbackHandler(verbose=args.debug, integrity_service_url="http://localhost:3050")], "recursion_limit": 25},
+        config={"callbacks": [EqtyCallbackHandler()], "recursion_limit": 25},
     )
     print(result["answer"])
 
@@ -200,5 +187,5 @@ def main() -> None:
 if __name__ == "__main__":
     cfg = init_sdk()
     main()
-    # ctx = cfg.get_default_context()
-    # ctx.export(Path("./manifests/travel-assistant.json"))
+    ctx = cfg.get_default_context()
+    ctx.export(Path("./manifests/travel-assistant.json"))
