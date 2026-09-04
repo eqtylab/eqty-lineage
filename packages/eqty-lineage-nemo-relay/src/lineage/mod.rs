@@ -294,14 +294,31 @@ impl LineageSession {
     ///
     /// This is the same `generate_manifest` the Python SDK reaches through `Context.export()`, over
     /// the same `Statement` type, so the result verifies identically.
+    /// Build a manifest from what has been recorded so far, without consuming the session.
+    ///
+    /// Clones the statements and the blobs, so the cost scales with everything recorded up to this
+    /// point. That is affordable at the sizes a coding session produces -- the live manifests so far
+    /// are a few hundred kilobytes -- and it is the reason a snapshot is taken per turn rather than
+    /// per event.
+    pub async fn snapshot(&self) -> Result<Manifest> {
+        Self::build(self.statements.clone(), self.blobs.clone()).await
+    }
+
     pub async fn into_manifest(self) -> Result<Manifest> {
+        Self::build(self.statements, self.blobs).await
+    }
+
+    async fn build(
+        statements: Vec<Statement>,
+        blobs: HashMap<String, Vec<u8>>,
+    ) -> Result<Manifest> {
         // `InMemoryStore::put` is `unimplemented!()` upstream, which would panic if it were ever
         // called -- and this plugin runs in-process across a C ABI where a panic is undefined
         // behavior. It is never called: the map is populated directly as statements are made, and
         // `resolve_blobs` only reads. Constructing the struct rather than going through `put` is
         // what keeps that true.
-        let store: Arc<dyn BlobStore + Send + Sync> = Arc::new(InMemoryStore { blobs: self.blobs });
-        let blobs = resolve_blobs(&self.statements, store, BLOB_CONCURRENCY).await?;
-        generate_manifest(true, self.statements, blobs).await
+        let store: Arc<dyn BlobStore + Send + Sync> = Arc::new(InMemoryStore { blobs });
+        let resolved = resolve_blobs(&statements, store, BLOB_CONCURRENCY).await?;
+        generate_manifest(true, statements, resolved).await
     }
 }

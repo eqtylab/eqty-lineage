@@ -420,6 +420,21 @@ impl Recorder {
     /// Coverage goes inside the graph, signed, rather than into a log beside it. A reader who cannot
     /// see the gaps cannot weigh the evidence: "no failed tool calls" and "this capture path cannot
     /// observe tool failure" look identical from outside, and on Codex it is always the second.
+    /// A manifest of everything recorded so far, without the coverage node and without consuming
+    /// the recorder.
+    ///
+    /// The missing coverage node is the point, not an omission: coverage states what the recording
+    /// could not see, and that is only knowable once it has stopped. A manifest carrying one is
+    /// complete; a manifest without one was written while the session was still running.
+    pub async fn snapshot(&self) -> Result<Manifest> {
+        self.lineage.snapshot().await
+    }
+
+    /// How many statements exist, so a caller can skip a snapshot that would say nothing new.
+    pub fn statement_count(&self) -> usize {
+        self.lineage.statement_count()
+    }
+
     pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
         let coverage: Value = self
             .stats

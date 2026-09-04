@@ -17,7 +17,7 @@
 //! dropping the mailbox flushes every session still open.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
@@ -69,6 +69,14 @@ struct SessionState {
     /// The subagent currently doing the work, when one is.
     active_subagent: Option<AssetRef>,
     dropped_events: u64,
+    /// Where this session's manifest is written, resolved once when the session opens.
+    ///
+    /// Held rather than recomputed so that every write for one session lands on one file. Resolving
+    /// it per write would either clobber an unrelated session's manifest or, with the
+    /// never-overwrite rule, spray a numbered file per turn.
+    path: PathBuf,
+    /// Statement count at the last write, so an event that changed nothing writes nothing.
+    written_at: usize,
 }
 
 impl SessionState {
@@ -178,6 +186,8 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
             sessions.insert(
                 session_id.clone(),
                 SessionState {
+                    path: manifest_path(&manifest_dir, &session_id),
+                    written_at: 0,
                     recorder: Recorder::new(lineage, policy.clone()),
                     open_tools: HashMap::new(),
                     open_calls: HashMap::new(),
@@ -194,18 +204,25 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
             let Some(state) = sessions.get_mut(&session_id) else {
                 continue;
             };
-            runtime.block_on(apply(state, *event, &at))
+            let finished = runtime.block_on(apply(state, *event, &at));
+            if !finished {
+                runtime.block_on(checkpoint(state));
+            }
+            // Checkpoint. Without this the only manifest a session ever produces is written at the
+            // very end, so a crash, a kill, or a machine losing power takes the whole recording with
+            // it -- and nothing is visible while the agent is still working.
+            finished
         };
 
         if finished && let Some(state) = sessions.remove(&session_id) {
-            export(&runtime, state, &manifest_dir, &session_id);
+            export(&runtime, state);
         }
     }
 
     // The channel closed. Everything still open is a session whose agent never told us it ended --
     // which on Codex is every session.
-    for (session_id, state) in sessions {
-        export(&runtime, state, &manifest_dir, &session_id);
+    for (_session_id, state) in sessions {
+        export(&runtime, state);
     }
 }
 
@@ -591,21 +608,15 @@ async fn record_tool(
         .await;
 }
 
-fn export(
-    runtime: &tokio::runtime::Runtime,
-    state: SessionState,
-    manifest_dir: &PathBuf,
-    session_id: &str,
-) {
-    let dropped = state.dropped_events;
-    let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
-        return;
-    };
-    let _ = dropped;
-
-    if std::fs::create_dir_all(manifest_dir).is_err() {
-        return;
-    }
+/// Where one session's manifest lives, resolved once when the session opens.
+///
+/// Never clobbers an existing file. One session should produce one manifest, but "should" is doing
+/// work there: a stray `SessionEnded` makes the router forget the session, and everything after it
+/// lands in a fresh recorder writing under the same name. Overwriting turns that into silent data
+/// loss -- the survivor reads as a complete short session rather than the tail of a truncated one.
+/// A subagent scope end caused exactly that before it was fixed, and the next cause will not
+/// announce itself either.
+fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
     // Session ids come from the agent and end up in a path, so anything separator-shaped is
     // replaced rather than trusted.
     let safe: String = session_id
@@ -618,13 +629,6 @@ fn export(
             }
         })
         .collect();
-    // Never clobber an earlier manifest for the same session.
-    //
-    // One session should export once, but "should" is doing work there: a stray `SessionEnded`
-    // makes the router forget the session, and everything after it lands in a fresh recorder that
-    // exports under the same name. Overwriting turns that into silent data loss -- the file looks
-    // like a complete short session rather than the tail of a truncated one. A subagent scope end
-    // caused exactly this before it was fixed, and the next cause will not announce itself either.
     let mut path = manifest_dir.join(format!("{safe}.json"));
     for sequence in 1..1000 {
         if !path.exists() {
@@ -632,7 +636,58 @@ fn export(
         }
         path = manifest_dir.join(format!("{safe}.{sequence}.json"));
     }
+    path
+}
+
+/// Replace `path` with `bytes`, or leave what is already there untouched.
+///
+/// Written to a sibling and renamed, because a checkpoint runs while an agent is working and a
+/// reader may open the file at any moment. A partial write would hand them a truncated JSON
+/// document, which is worse than the slightly older complete one it replaced.
+fn write_atomically(path: &Path, bytes: &[u8]) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary = path.with_extension("json.writing");
+    if std::fs::write(&temporary, bytes).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return;
+    }
+    if std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+}
+
+/// Write what has been recorded so far, so the session is not all-or-nothing.
+///
+/// The checkpoint carries no coverage node. That is the signal a reader needs: coverage states what
+/// a recording could not see, which is only knowable once it has stopped, so a manifest without one
+/// was written mid-session and may still grow.
+async fn checkpoint(state: &mut SessionState) {
+    let count = state.recorder.statement_count();
+    if count == state.written_at {
+        return;
+    }
+    let Ok(manifest) = state.recorder.snapshot().await else {
+        return;
+    };
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        let _ = std::fs::write(path, json);
+        write_atomically(&state.path, &json);
+        state.written_at = count;
+    }
+}
+
+fn export(runtime: &tokio::runtime::Runtime, state: SessionState) {
+    let dropped = state.dropped_events;
+    let path = state.path.clone();
+    let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
+        return;
+    };
+    let _ = dropped;
+    if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
+        write_atomically(&path, &json);
     }
 }

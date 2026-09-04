@@ -1208,3 +1208,42 @@ fn a_second_export_never_overwrites_the_first() {
         assert!(!bytes.is_empty(), "neither manifest may be truncated");
     }
 }
+
+#[test]
+fn a_manifest_exists_before_the_session_ends() {
+    // The recording used to be all-or-nothing: one write, at the very end. A crash, a kill, or a
+    // machine losing power took the whole session with it, and nothing was visible while the agent
+    // was still working. Each event now checkpoints.
+    let into = TempDir::new().expect("a temp dir");
+    let events = full_session("01a040aa-0000-0000-0000-000000000095");
+    // Everything except the events that close the session, so nothing triggers a final export.
+    let mut mid = events;
+    mid.truncate(6);
+
+    let mailbox = Mailbox::start(into.path().to_path_buf(), policy(), signer_factory());
+    let mut router = SessionRouter::new();
+    for event in &mid {
+        let Some(session_id) = router.attribute(event) else {
+            continue;
+        };
+        if let Some(classified) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), classified);
+        }
+    }
+
+    // Give the worker a moment to drain, without dropping the mailbox -- dropping it would flush.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "a checkpoint should already be on disk");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&written[0]).unwrap()).expect("checkpoint is valid JSON");
+    assert!(
+        !manifest["statements"].as_object().unwrap().is_empty(),
+        "the checkpoint must carry the statements recorded so far"
+    );
+    assert!(
+        !decoded_blobs(&written[0]).contains("\"coverage\""),
+        "a mid-session checkpoint carries no coverage node -- that is how a reader tells it is not final"
+    );
+}
