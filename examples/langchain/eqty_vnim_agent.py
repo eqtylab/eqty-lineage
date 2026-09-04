@@ -24,7 +24,7 @@ from eqty_sdk import CID, Context, Signer, init, set_active_signer
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from eqty_lineage.langchain import EqtyCallbackHandler
-from eqty_lineage.vnim import ChatEqtyVnimOpenAI
+from eqty_lineage.vnim import ChatEqtyVnimOpenAI, IntegrityManifestResult
 
 
 DEFAULT_MODEL = "nvidia/llama-3.1-nemotron-nano-8b-v1"
@@ -107,24 +107,33 @@ def _vnim_transport_cids(manifest: dict[str, Any]) -> tuple[CID, CID]:
     return CID(request_cids[0]), CID(response_cids[0])
 
 
-def register_vnim_bridge(handler: EqtyCallbackHandler, manifest: dict[str, Any]) -> None:
+def register_vnim_bridge(handler: EqtyCallbackHandler, result: IntegrityManifestResult) -> None:
     """Connect the deferred local model call to independently attested vNIM I/O.
 
-    The vNIM manifest is deliberately not imported or rewritten here.  This computation is signed by
-    the local agent and references vNIM's existing canonical request-body and raw SSE response-body
-    CIDs, without claiming that the agent generated the vNIM evidence.
+    The vNIM manifest is deliberately not imported or rewritten here. ``result.local_request_cid`` and
+    ``result.local_response_cid`` were computed by this application from the literal bytes it sent and
+    received -- not copied from vNIM's manifest -- so the handler can independently confirm they match
+    vNIM's own claimed CIDs before linking them as the same evidence. A mismatch (e.g. a MITM tampering
+    with the request or response in transit) is recorded as a visible mismatch statement rather than
+    silently trusted; see ``EqtyCallbackHandler.register_external_chat_transport``.
     """
-    request_cid, response_cid = _vnim_transport_cids(manifest)
+    assert result.manifest is not None
+    vnim_request_cid, vnim_response_cid = _vnim_transport_cids(result.manifest)
     handler.register_external_chat_transport(
-        request_cid,
-        response_cid,
-        name="Travel Agent → vNIM inference",
+        local_request_cid=result.local_request_cid,
+        vnim_request_cid=vnim_request_cid,
+        vnim_response_cid=vnim_response_cid,
+        local_response_cid=result.local_response_cid,
+        name="Travel Agent -> vNIM inference",
     )
     logging.info(
-        "vNIM bridge registered context_id=%s request_cid=%s response_cid=%s",
+        "vNIM bridge registered context_id=%s local_request_cid=%s vnim_request_cid=%s "
+        "vnim_response_cid=%s local_response_cid=%s",
         handler.context.id,
-        request_cid,
-        response_cid,
+        result.local_request_cid,
+        vnim_request_cid,
+        vnim_response_cid,
+        result.local_response_cid,
     )
 
 
@@ -193,8 +202,8 @@ def run_agent(
     result = model.last_integrity_result
     if result is None:
         logging.warning("integrity manifest result was unavailable")
-    elif result.manifest is not None:
-        register_vnim_bridge(handler, result.manifest)
+    elif result.manifest is not None and result.local_request_cid is not None:
+        register_vnim_bridge(handler, result)
         statements = result.manifest.get("statements", {})
         blobs = result.manifest.get("blobs", {})
         logging.info(

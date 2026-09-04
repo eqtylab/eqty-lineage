@@ -37,7 +37,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, init
+from eqty_sdk import CID, Context, Custom, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, init
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
 
@@ -808,13 +808,31 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             run["node"].setdefault("child_outputs", []).append(output.cid)
 
     @_synchronized
-    def register_external_chat_transport(self, request_cid: CID, response_cid: CID, *, name: str) -> None:
+    def register_external_chat_transport(
+        self,
+        *,
+        local_request_cid: CID,
+        vnim_request_cid: CID,
+        vnim_response_cid: CID,
+        local_response_cid: Optional[CID] = None,
+        name: str,
+    ) -> None:
         """Replace one deferred chat-model computation with explicit, independently attested transport stages.
 
-        ``request_cid`` and ``response_cid`` must identify evidence created by the external service.
-        The three locally signed computations state only that this application serialized the model
-        input, invoked that external service, and processed its response; they do not alter or re-sign
-        the external service's manifest.
+        ``local_request_cid``/``local_response_cid`` must be computed by *this* application from the
+        literal bytes it sent/received -- never copied from the external manifest. ``vnim_request_cid``/
+        ``vnim_response_cid`` are the external service's own claims about those same bytes. Each pair is
+        compared before being linked: on a match the chain proceeds through the external service's CID as
+        before; on a mismatch a visible ``*_integrity_mismatch`` statement links the two disagreeing CIDs
+        instead, and the local chain does not pretend they are the same asset. A mismatch is logged loudly
+        but does not raise -- callers that must stop on mismatch should check ``handler.context`` for
+        recorded mismatch statements or inspect the return value in a future revision.
+
+        The locally signed computations state only that this application serialized the model input
+        and processed the external service's response; they do not claim this application performed
+        the inference itself, and they do not alter or re-sign the external service's manifest. The
+        request -> response computation is vNIM's own claim, taken from its (unmodified) merged-in
+        manifest rather than duplicated here.
         """
         if not self._defer_chat_model_computations:
             raise RuntimeError("external chat transport requires defer_chat_model_computations=True")
@@ -825,9 +843,68 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             )
 
         run = self._completed_chat_models.pop()
-        self._finalize(f"{name}: request", "external_request", run["inputs"], [request_cid])
-        self._finalize(name, "external_inference", [request_cid], [response_cid])
-        self._finalize(f"{name}: response", "external_response", [response_cid], [run["output"]])
+
+        # local_request_cid/local_response_cid were computed via get_cid_for_bytes directly, not
+        # through an Asset subclass, so they carry no name/asset-type Metadata -- unlike vNIM's own
+        # "Request Body"/"Response Body" nodes, which arrive named because vNIM's manifest statements
+        # are merged wholesale into the final bundle. Without this, the local side of the bridge is
+        # invisible in the graph even though the statements linking it are there.
+        self._asset_factory(Custom).from_cid(local_request_cid, name=f"{name}: Request Body (local)")
+        if local_response_cid is not None:
+            self._asset_factory(Custom).from_cid(local_response_cid, name=f"{name}: Response Body (local)")
+
+        # Always attest to what *this* app actually sent, independent of anything vNIM later claims.
+        self._finalize(f"{name}: request", "external_request", run["inputs"], [local_request_cid])
+
+        # No local "vNIM did inference" computation is recorded here: vNIM's own manifest already
+        # asserts that edge (its Request Body -> Response Body statement), and it is merged into the
+        # final bundle wholesale. Duplicating it locally would just be a second, redundant claim about
+        # a computation this app did not perform. On a match, local_request_cid == vnim_request_cid, so
+        # that merged-in statement already connects straight through to run["inputs"] via the edge above.
+        if local_request_cid != vnim_request_cid:
+            logger.error(
+                "eqty_vnim.request_integrity_mismatch name=%s local_request_cid=%s vnim_request_cid=%s "
+                "-- the request vNIM claims to have received does not match the bytes this app sent",
+                name,
+                local_request_cid,
+                vnim_request_cid,
+            )
+            self._finalize(
+                f"{name}: request integrity mismatch",
+                "request_integrity_mismatch",
+                [local_request_cid],
+                [vnim_request_cid],
+            )
+
+        if local_response_cid is None:
+            logger.warning(
+                "eqty_vnim.response_not_independently_verified name=%s vnim_response_cid=%s "
+                "-- no local response bytes were captured to compare against",
+                name,
+                vnim_response_cid,
+            )
+            self._finalize(
+                f"{name}: response", "external_response_unverified", [vnim_response_cid], [run["output"]]
+            )
+        elif local_response_cid == vnim_response_cid:
+            self._finalize(f"{name}: response", "external_response", [vnim_response_cid], [run["output"]])
+        else:
+            logger.error(
+                "eqty_vnim.response_integrity_mismatch name=%s local_response_cid=%s vnim_response_cid=%s "
+                "-- the response bytes this app received do not match what vNIM's manifest claims it sent",
+                name,
+                local_response_cid,
+                vnim_response_cid,
+            )
+            self._finalize(
+                f"{name}: response integrity mismatch",
+                "response_integrity_mismatch",
+                [vnim_response_cid],
+                [local_response_cid],
+            )
+            self._finalize(
+                f"{name}: response", "external_response_unverified", [local_response_cid], [run["output"]]
+            )
 
     @_synchronized
     def finalize_deferred_chat_models(self) -> None:

@@ -9,9 +9,19 @@ description = "LangChain chat model client for EQTY VNIM's OpenAI-compatible API
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "eqty-sdk",
     "httpx>=0.27",
     "langchain-openai==1.3.5",
 ]
+
+[tool.uv.sources]
+eqty-sdk = { index = "eqty" }
+
+[[tool.uv.index]]
+name = "eqty"
+url = "https://pypi.eqtylab.io/simple/"
+publish-url = "https://pypi.eqtylab.io/"
+explicit = true
 
 [tool.uv.build-backend]
 module-root = ""
