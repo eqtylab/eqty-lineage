@@ -531,6 +531,14 @@ async fn record_tool(
         }
     }
 
+    // Say so when a tool call told us nothing about files. Absence and silence look identical in a
+    // graph otherwise, and on Codex -- which has no read tool, so every read is a shell command --
+    // that is the difference between "read no files" and "its reads were invisible to us".
+
+    if observations.is_empty() {
+        state.recorder.note_no_file_observation();
+    }
+
     let mut inputs: Vec<AssetRef> = Vec::new();
     let mut outputs: Vec<AssetRef> = Vec::new();
 

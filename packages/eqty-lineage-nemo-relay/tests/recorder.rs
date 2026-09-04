@@ -425,3 +425,69 @@ async fn a_file_never_read_stays_distinct_per_path() {
         "unread files must not be merged on absence alone"
     );
 }
+
+#[tokio::test]
+async fn withheld_and_unknown_are_different_claims() {
+    // A node reporting both as `redacted` tells a reader the wrong one. A withheld file was seen and
+    // its bytes deliberately kept out; an unknown one was never established, so there was nothing to
+    // withhold. Codex makes this constant rather than occasional: every `apply_patch` `Update File`
+    // carries hunks and no post-image, so every one lands as unknown.
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/app/notes.md", Some(b"visible\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(
+        &seen("/app/.env", Some(b"TOKEN=aaa\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(&seen("/app/patched.md", None, FileMode::Wrote), true, None)
+        .await
+        .unwrap();
+
+    let json = serde_json::to_value(rec.finish(None).await.expect("manifest")).unwrap();
+    let mut states = std::collections::HashMap::new();
+    for blob in json["blobs"].as_object().expect("blobs").values() {
+        use base64::Engine as _;
+        let Ok(raw) =
+            base64::engine::general_purpose::STANDARD.decode(blob.as_str().unwrap_or_default())
+        else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if value["assetType"] == "Document" {
+            states.insert(
+                value["name"].as_str().unwrap_or_default().to_string(),
+                (
+                    value["contentState"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    value["redacted"].as_bool().unwrap_or(false),
+                ),
+            );
+        }
+    }
+    assert_eq!(
+        states.get("/app/notes.md"),
+        Some(&("stored".to_string(), false))
+    );
+    assert_eq!(
+        states.get("/app/.env"),
+        Some(&("withheld".to_string(), true)),
+        "policy withholding is redaction"
+    );
+    assert_eq!(
+        states.get("/app/patched.md"),
+        Some(&("unknown".to_string(), false)),
+        "content never established is not redaction -- nothing was withheld"
+    );
+}

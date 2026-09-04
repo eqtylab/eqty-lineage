@@ -1353,3 +1353,39 @@ fn subagent_scope(session: &str, uuid: &str, parent: &str, phase: &str, kind: &s
     }))
     .expect("a subagent scope")
 }
+
+#[test]
+fn a_tool_call_that_saw_no_files_says_so() {
+    // Absence and silence look identical in a graph. A Codex session reads through `sed` and `awk`
+    // because it has no read tool, so its manifest has no file nodes at all -- which reads exactly
+    // like a session that touched nothing. The count is what separates the two.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000093";
+    let root = "01a040aa-0000-0000-0000-000000000d00";
+    let tool = "01a040aa-0000-0000-0000-000000000d01";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "gpt" }),
+        ),
+        claude_read(
+            session,
+            tool,
+            root,
+            "start",
+            serde_json::json!({ "command": "awk 'END { print NR }' .env" }),
+        ),
+        claude_read(session, tool, root, "end", serde_json::json!("1")),
+    ];
+    replay(&events, &into);
+
+    let decoded = decoded_blobs(&manifests(&into)[0]);
+    assert!(
+        decoded.contains("ToolCallWithoutFileObservation"),
+        "a run that observed no files must record that it observed none:\n{decoded}"
+    );
+}

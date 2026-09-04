@@ -156,6 +156,18 @@ impl Recorder {
         };
         let withheld = disposition != Disposition::Store;
 
+        // "We refused to store this" and "we never had it" are different claims, and a node that
+        // reports both as `redacted` tells a reader the wrong one. A withheld file was seen and its
+        // bytes deliberately kept out; an unknown one was never established at all, so there was
+        // nothing to withhold. Codex makes the difference constant rather than occasional: every
+        // `apply_patch` `Update File` carries hunks and no post-image, so every one of them lands
+        // here as unknown.
+        let content_state = match (&data, withheld) {
+            (Some(_), false) => "stored",
+            (Some(_), true) => "withheld",
+            (None, _) => "unknown",
+        };
+
         let metadata = json!({
             "name": path,
             "assetType": "Document",
@@ -165,7 +177,9 @@ impl Recorder {
             "fileVersion": version,
             "observed": observed,
             "userModified": event.user_modified,
-            "redacted": withheld,
+            "contentState": content_state,
+            // Policy withholding only. Absent content is `contentState`, not redaction.
+            "redacted": data.is_some() && withheld,
             "reconstructed": basis,
             "content-cid": content_cid,
         });
@@ -367,6 +381,17 @@ impl Recorder {
     ///
     /// A run with no outputs is not recorded. It cannot be reached from any asset, so it is a node
     /// no reader can use, and the inputs it names are already attested by their own registrations.
+    /// Note a tool call that yielded no file observation at all.
+    ///
+    /// Not the same as "touched no files": `ls /nowhere` legitimately touches none, and a shell
+    /// command that rewrites a tree touches many. The counter says only what it can -- that this
+    /// activity told us nothing about files -- which is what lets a reader tell a session that read
+    /// nothing from one whose reads were invisible. On Codex that is every read, since it has no
+    /// read tool.
+    pub fn note_no_file_observation(&mut self) {
+        self.count("ToolCallWithoutFileObservation");
+    }
+
     pub async fn record_tool_run(
         &mut self,
         inputs: &[AssetRef],
