@@ -37,7 +37,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Tool, init
+from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, init
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
 
@@ -91,13 +91,20 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     _thread_contexts: Dict[Tuple[str, str], Context] = {}
     _thread_context_lock = threading.RLock()
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        *,
+        integrity_service_url: Optional[str] = None,
+    ) -> None:
         # when True, extra metadata is attached to the registered EQTY assets
         self.verbose = verbose
         # The application selects this root once with ``eqty_sdk.init(default_context=...)``. LangGraph
         # ``thread_id`` values are mapped to child contexts beneath it as callbacks begin.
         self._root_context = init().get_default_context()
         self._context = self._root_context
+        # Registration is opt-in. Service.new resolves its credentials exclusively from EQTY_API_KEY.
+        self._service = Service.new(integrity_service_url) if integrity_service_url else None
         if self.verbose:
             logger.info("EqtyCallbackHandler verbose node metadata enabled")
         # guards every mutation below; see _synchronized
@@ -146,11 +153,34 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         """The EQTY root or LangGraph-thread child context used by this handler's latest invocation."""
         return self._context
 
+    def _register_context(self, context: Optional[Context] = None) -> None:
+        """Push one graph invocation's context, when service registration is configured.
+
+        A LangGraph ``thread_id`` can span many user messages.  Registering here, rather than
+        waiting for that thread/session to end, makes the lineage from each ``invoke`` available
+        to Integrity Service immediately.
+        """
+        if self._service is None:
+            return
+        registered_context = context if context is not None else self._context
+        logger.info(
+            "integrity_service.registering context_id=%s context_name=%s",
+            registered_context.id,
+            registered_context.name,
+        )
+        registered_context.register(self._service)
+        logger.info(
+            "integrity_service.registered context_id=%s context_name=%s",
+            registered_context.id,
+            registered_context.name,
+        )
+
     def _activate_thread_context(self, metadata: Optional[Dict[str, Any]], agent_name: Optional[Any] = None) -> None:
         """Select the child context for this LangGraph thread, or the configured root without one."""
         thread_id = (metadata or {}).get("thread_id")
         if thread_id is None:
-            self._context = self._root_context
+            # Nested LangChain callbacks do not always propagate LangGraph's configurable metadata.
+            # Keep the context selected by their enclosing graph rather than falling back to root.
             return
 
         key = (str(self._root_context.id), str(thread_id))
@@ -162,6 +192,18 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                 context = Context.with_parent(self._root_context).new(f"{name}: {timestamp}")
                 self._thread_contexts[key] = context
         self._context = context
+
+    def _bind_context_to_root_run(self, parent_run_id: Optional[UUID]) -> None:
+        """Update the enclosing root run when a nested callback first reveals its thread context."""
+        current = parent_run_id
+        seen = set()
+        while current is not None and current not in seen:
+            seen.add(current)
+            run = self._runs.get(current)
+            if run is not None and run["parent"] is None:
+                run["context"] = self._context
+                return
+            current = self._parents.get(current)
 
     def _verbose_metadata(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Sanitize verbose fields into scalars safe to unpack into SDK asset constructors.
@@ -509,6 +551,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._activate_thread_context(metadata, agent_name=(metadata or {}).get("lc_agent_name") or name)
         self._note_framework(metadata)
         self._parents[run_id] = parent_run_id
+        self._bind_context_to_root_run(parent_run_id)
 
         # LangGraph emits many internal chain runs (channel reads/writes, task wrappers).
         # A node-level run is the one whose run name equals the "langgraph_node" metadata entry;
@@ -570,6 +613,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             "state_in": state_in.cid,
             "inputs": input_cids,
             "child_outputs": [],
+            # Registration must use the graph's context even if a later nested callback supplies
+            # incomplete metadata and changes the handler's active context.
+            "context": self._context,
         }
 
     @_synchronized
@@ -628,6 +674,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                 # hangs off nothing and the graph has a hole exactly where the work was handed over.
                 enclosing.setdefault("child_outputs", []).append(state_out.cid)
 
+        # ``parent is None`` identifies the graph invocation, not the browser/chat session.
+        # A thread can make many such calls, and each one is registered independently.
+        if run["parent"] is None:
+            self._register_context(run["context"])
+
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         _log_run_ended("chain", run_id, error)
@@ -635,6 +686,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
         self._record_failure(run, error)
+        if run is not None and run["parent"] is None:
+            self._register_context(run["context"])
 
     ################################################## Chain Calls #################################################
 
@@ -653,6 +706,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> None:
         logger.debug(run_id)
         self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         self._note_framework(metadata)
         params = kwargs.get("invocation_params") or {}
         model_name, provider = self._model_identity(serialized, params, metadata)
@@ -766,6 +820,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     ) -> None:
         logger.debug(run_id)
         self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         tool_name = (serialized or {}).get("name", "tool")
 
         # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
@@ -895,6 +950,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         """
         logger.debug(run_id)
         self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         self._note_framework(metadata)
         name = kwargs.get("name") or (serialized or {}).get("name") or "retriever"
         identity = self._retriever_identity(name, metadata, tags)

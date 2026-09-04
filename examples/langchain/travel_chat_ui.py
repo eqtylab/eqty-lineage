@@ -86,6 +86,8 @@ PAGE = """<!doctype html>
 
 class TravelChatHandler(BaseHTTPRequestHandler):
     app: Any
+    integrity_service_url: str | None = None
+    debug: bool = False
 
     def send_json(self, status: HTTPStatus, payload: dict[str, str]) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -156,7 +158,10 @@ class TravelChatHandler(BaseHTTPRequestHandler):
             logger.info("chat.started session_id=%s input_chars=%d", session_id, len(message))
 
             with lineage_lock:
-                lineage_handler = EqtyCallbackHandler()
+                lineage_handler = EqtyCallbackHandler(
+                    verbose=self.debug,
+                    integrity_service_url=self.integrity_service_url,
+                )
                 result = self.app.invoke(
                     {"messages": [HumanMessage(message)], "question": message, "answer": ""},
                     config={
@@ -198,20 +203,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically.")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose EQTY lineage logging and metadata.")
+    parser.add_argument(
+        "--integrity-service-url",
+        help="Optional Integrity Service base URL. When set, each chat request is registered immediately.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        # Keep HTTP/runtime dependencies quiet when EQTY debug logging is requested.
+        level=logging.WARNING if args.debug else os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if args.debug:
+        logging.getLogger("eqty").setLevel(logging.DEBUG)
+        logging.getLogger("eqty_sdk").setLevel(logging.DEBUG)
+        for logger_name in ("httpx", "httpcore", "urllib3", "openai", "hyper", "hyper_util"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
     init_sdk()  # The root context; EqtyCallbackHandler creates a child per UI thread_id.
     TravelChatHandler.app = build_graph(checkpointer=MemorySaver())
+    TravelChatHandler.integrity_service_url = args.integrity_service_url
+    TravelChatHandler.debug = args.debug
     server = ThreadingHTTPServer((args.host, args.port), TravelChatHandler)
     url = f"http://{args.host}:{args.port}"
     logger.info("server.started url=%s model=%s", url, os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+    if args.integrity_service_url:
+        logger.info("integrity_service.enabled url=%s api_key_source=EQTY_API_KEY", args.integrity_service_url)
     if not args.no_open:
         webbrowser.open(url)
     try:

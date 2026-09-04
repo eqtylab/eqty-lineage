@@ -21,6 +21,7 @@ Requires OPENAI_API_KEY.
 """
 
 import argparse
+import logging
 import os
 from uuid import UUID
 from pathlib import Path
@@ -177,10 +178,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.debug:
+        logging.basicConfig(
+            # Keep the root logger quiet: DEBUG here otherwise enables verbose HTTP/Rust runtime
+            # logging (for example ``hyper_util``) that obscures the lineage events.
+            level=logging.WARNING,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+        logging.getLogger("eqty").setLevel(logging.DEBUG)
+        logging.getLogger("eqty_sdk").setLevel(logging.DEBUG)
+        for logger_name in ("httpx", "httpcore", "urllib3", "openai", "hyper", "hyper_util"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
     app = build_graph()
     result = app.invoke(
         {"messages": [HumanMessage(args.question)], "question": args.question, "answer": ""},
-        config={"callbacks": [EqtyCallbackHandler(verbose=args.debug)], "recursion_limit": 25},
+        config={"callbacks": [EqtyCallbackHandler(verbose=args.debug, integrity_service_url="http://localhost:3050")], "recursion_limit": 25},
     )
     print(result["answer"])
 
@@ -188,5 +200,5 @@ def main() -> None:
 if __name__ == "__main__":
     cfg = init_sdk()
     main()
-    ctx = cfg.get_default_context()
-    ctx.export(Path("./manifests/travel-assistant.json"))
+    # ctx = cfg.get_default_context()
+    # ctx.export(Path("./manifests/travel-assistant.json"))

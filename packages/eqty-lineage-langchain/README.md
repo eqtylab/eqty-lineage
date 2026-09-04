@@ -48,6 +48,19 @@ app.invoke(state, config={"configurable": {"thread_id": conversation_id}, "callb
 handler.context.export("manifests/conversation.json")
 ```
 
+### Optional Integrity Service registration
+
+Pass `integrity_service_url` when constructing the handler to register the active EQTY context after **every
+top-level graph invocation**. This is intentionally per call, not per LangGraph thread/session, so each chat turn is
+available to the service as soon as it completes. The SDK resolves the service credential only from `EQTY_API_KEY`.
+
+```python
+handler = EqtyCallbackHandler(
+    integrity_service_url="https://integrity.example.com",
+)
+app.invoke(state, config={"callbacks": [handler], "configurable": {"thread_id": thread_id}})
+```
+
 ## `verbose` — extra metadata on assets
 
 ```python
