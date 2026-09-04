@@ -154,6 +154,21 @@ python3 /tmp/drive.py 2>&1 | tee /tmp/drive-out.txt
 is visible while it runs — and the checkpointing means the manifest *is* readable mid-session, which
 is how you tell early whether a fix held.
 
+**Wait for the export, not for the process.** The manifest is written from `Drop`, during shutdown,
+so the process stops matching `pgrep` *before* the file is final. Reading in that window returns a
+checkpoint — no coverage node, and whatever the last turn produced still missing — which looks
+exactly like a session that recorded almost nothing. Files on disk race the same way: a patch the
+agent has already applied may not be visible yet.
+
+That window produced two wrong readings and a plausible-sounding conclusion about Codex asserting
+writes it never made. Both readings were premature; the run was fine. Wait for the process to be
+*reaped*, then check that the manifest carries a coverage node before believing anything it says:
+
+```bash
+while pgrep -f "nemo-relay run" >/dev/null; do sleep 1; done
+sleep 2   # Drop still has the export to finish
+```
+
 Two turns Path B cannot drive, because they are interactive slash commands with no `-p` equivalent:
 `/compact` (exercises `Compaction`) and `/exit`. Run those by hand in Path A if you need them.
 
@@ -223,7 +238,10 @@ PY
 
 ### Reading the output
 
-**Check the prompt count and the manifest count first.** If fewer turns were captured than you sent,
+**Check for a coverage node before anything else.** A manifest without one is a checkpoint, not a
+finished recording — see the export race above. Every other number in it is a lower bound.
+
+**Then check the prompt count and the manifest count.** If fewer turns were captured than you sent,
 or there is more than one manifest, the session was split and every `MISSING` below is unexplained
 rather than informative.
 
