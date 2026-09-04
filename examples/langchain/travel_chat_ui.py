@@ -49,14 +49,14 @@ PAGE = """<!doctype html>
     .user { background: #155eef; margin-left: auto; } .assistant { background: #27364e; }
     form { position: fixed; bottom: 0; left: 0; right: 0; background: #101828; border-top: 1px solid #344054; padding: 12px; display: flex; gap: 8px; justify-content: center; }
     textarea { width: min(620px, 75vw); resize: vertical; min-height: 42px; padding: 10px; border-radius: 8px; border: 1px solid #475467; background: #182230; color: inherit; }
-    button { border: 0; border-radius: 8px; padding: 0 18px; background: #2e90fa; color: white; font-weight: 600; cursor: pointer; } #new-chat { min-height: 36px; background: #344054; white-space: nowrap; } #download-manifest { background: #344054; } button:disabled { opacity: .55; }
+    button { border: 0; border-radius: 8px; padding: 0 18px; background: #2e90fa; color: white; font-weight: 600; cursor: pointer; } #new-chat, #download-manifest { min-height: 36px; background: #344054; white-space: nowrap; } button:disabled { opacity: .55; }
   </style>
 </head>
 <body><main>
-  <header><div><h1>EQTY Travel Agent</h1><p>Each browser conversation is a separate LangGraph thread and EQTY child context.</p></div><div><button id="download-manifest" type="button" disabled>Download manifest</button><button id="new-chat" type="button">New chat</button></div></header>
+  <header><div><h1>EQTY Travel Agent</h1><p>Each browser conversation is a separate LangGraph thread and EQTY child context.</p></div><button id="new-chat" type="button">New chat</button></header>
   <section id="messages" aria-live="polite"></section>
 </main>
-<form id="chat"><textarea id="message" placeholder="Plan a weekend in Lisbon" required></textarea><button>Send</button></form>
+<form id="chat"><button id="download-manifest" type="button" disabled>Download manifest</button><textarea id="message" placeholder="Plan a weekend in Lisbon" required></textarea><button>Send</button></form>
 <script>
   const sessionKey = "eqty-travel-agent-session";
   let sessionId = sessionStorage.getItem(sessionKey) || crypto.randomUUID();
@@ -77,6 +77,9 @@ PAGE = """<!doctype html>
       add("assistant", payload.answer); downloadManifest.disabled = false;
     } catch (error) { add("assistant", `Error: ${error.message}`); }
     finally { button.disabled = false; input.focus(); }
+  });
+  input.addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); }
   });
 </script></body></html>"""
 
