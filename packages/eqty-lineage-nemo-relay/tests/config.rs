@@ -22,7 +22,7 @@ fn an_empty_config_is_valid_and_has_defaults() {
     );
     assert_eq!(config.manifest_dir.to_str(), Some(".eqty/manifests"));
     assert!(config.triples);
-    assert_eq!(config.max_content_bytes, 1_073_741_824);
+    assert_eq!(config.max_content_bytes, 104_857_600);
     assert!(config.deny_globs.iter().any(|glob| glob == ".env*"));
 }
 

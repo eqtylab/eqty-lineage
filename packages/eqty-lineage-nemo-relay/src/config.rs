@@ -21,7 +21,7 @@ const DEFAULT_MANIFEST_DIR: &str = ".eqty/manifests";
 /// the decision, so raising this trades manifest size for readable content, never for lineage:
 /// nothing is dropped from the graph either way. Size is the thing to weigh -- blobs are inlined
 /// into the manifest as base64, so a stored payload costs about 4/3 of its own length on disk.
-const DEFAULT_MAX_CONTENT_BYTES: u64 = 1_073_741_824;
+const DEFAULT_MAX_CONTENT_BYTES: u64 = 104_857_600;
 
 /// Paths whose *contents* never enter a manifest.
 ///
