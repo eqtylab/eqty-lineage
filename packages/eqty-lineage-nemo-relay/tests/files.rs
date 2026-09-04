@@ -189,3 +189,48 @@ fn a_patch_touching_several_files_yields_one_event_each() {
 fn text_that_is_not_a_patch_yields_nothing() {
     assert!(file_events_from_patch("just some output\n", Some("t9")).is_empty());
 }
+
+#[test]
+fn a_read_cut_off_mid_line_is_a_fragment() {
+    // Observed live, and the reason this exists: a 200 KB single-line file came back as 21 KB with
+    // `numLines == totalLines == 1`, because line counts cannot express a cut *within* a line. The
+    // line-count check therefore reads it as complete, and the manifest asserts a content CID for
+    // bytes that are not what is on disk -- a confident wrong claim in a signed document.
+    let result = serde_json::json!({
+        "file": {
+            "filePath": "/tmp/big.txt",
+            "content": "xxxxxxxxxx",
+            "numLines": 1,
+            "startLine": 1,
+            "totalLines": 1,
+            "truncatedByTokenCap": true
+        },
+        "type": "text"
+    });
+    let (events, _) = file_events_from_result(&result, Some("toolu_1"), true);
+    assert_eq!(events.len(), 1, "the path must still be recorded");
+    assert_eq!(
+        events[0].content, None,
+        "a truncated read must not claim the bytes it returned are the file"
+    );
+    assert_eq!(events[0].path, "/tmp/big.txt");
+}
+
+#[test]
+fn an_untruncated_read_still_carries_its_content() {
+    // The guard on the test above: the flag must gate the fragment path, not the whole extraction.
+    let result = serde_json::json!({
+        "file": {
+            "filePath": "/tmp/small.txt",
+            "content": "hello\n",
+            "numLines": 1,
+            "startLine": 1,
+            "totalLines": 1,
+            "truncatedByTokenCap": false
+        },
+        "type": "text"
+    });
+    let (events, _) = file_events_from_result(&result, Some("toolu_2"), true);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].content.as_deref(), Some(&b"hello\n"[..]));
+}

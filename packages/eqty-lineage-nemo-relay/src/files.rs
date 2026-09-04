@@ -205,21 +205,30 @@ fn read_events(
         return (Vec::new(), None);
     };
 
-    // Two independent signals that this is a slice: an offset read starts past line 1, and a bounded
-    // read returns fewer lines than the file has.
+    // Three independent signals that this is a slice: an offset read starts past line 1, a bounded
+    // read returns fewer lines than the file has, and the reader says outright that it cut the
+    // content short.
     let starts_past_the_top = match file_info.get("startLine").and_then(Json::as_i64) {
         Some(line) => line != 1,
         None => false,
     };
-    let truncated = match (
+    let fewer_lines_than_the_file = match (
         file_info.get("numLines").and_then(Json::as_i64),
         file_info.get("totalLines").and_then(Json::as_i64),
     ) {
         (Some(num), Some(total)) => num < total,
         _ => false,
     };
+    // A one-line file cut mid-line reports `numLines == totalLines == 1` and is a fragment anyway.
+    // Line counts cannot express a cut *within* a line, so without this a 200 KB single-line file
+    // read back as 21 KB is recorded as that file's complete content, under a CID matching nothing
+    // on disk. Observed live: `truncatedByTokenCap: true` with `numLines == totalLines == 1`.
+    let cut_short = file_info
+        .get("truncatedByTokenCap")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
 
-    if starts_past_the_top || truncated {
+    if starts_past_the_top || fewer_lines_than_the_file || cut_short {
         if !include_partial_reads {
             return (Vec::new(), None);
         }
