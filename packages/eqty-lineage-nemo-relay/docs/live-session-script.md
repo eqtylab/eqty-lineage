@@ -92,14 +92,19 @@ print('withheld  ', redacted)
 required = [
     ('FileRead',        'a file was read into the graph at all'),
     ('FileWritten',     'a file version was written'),
-    ('ContentRecovered','the _last_content replay chain ran'),
-    ('ContentUnknown',  'a partial read became an identity-only node'),
+    ('ContentUnknown',  'a fragment became an identity-only node'),
     ('ContentDenied',   'deny_globs withheld .env'),
-    ('ContentTooLarge', 'the configured ceiling was applied'),
-    ('Compaction',      'compaction was recorded'),
+]
+# Absent for principled reasons on Claude Code -- see below. Reported, not required.
+expected_absent = [
+    ('ContentRecovered','Edit states its new content, so the replay chain is never needed'),
+    ('ContentTooLarge', 'Read truncates near 21 KB and truncation is detected first'),
 ]
 for key, why in required:
     print(f'  {key:18} {"YES" if cov and key in cov else "MISSING":8} {why}')
+for key, why in expected_absent:
+    seen = cov and key in cov
+    print(f'  {key:18} {"YES" if seen else "absent":8} {"unexpected -- investigate" if seen else why}')
 print(f'  {"Document nodes":18} {"YES" if assets.get("Document") else "MISSING":8} file lineage produced nodes')
 print(f'  {"two agents":18} {"YES" if assets.get("Agent",0) >= 2 else "MISSING":8} a subagent was recorded')
 PY
@@ -117,9 +122,23 @@ Both happened on the first attempt: five of ten typed turns captured, no `sessio
 every file-write path read `MISSING` — not because those paths are broken, but because nothing about
 them was ever recorded.
 
-After that, `FileRead` and `FileWritten` are the ones to look at: neither has fired in any live
-session yet, which is the whole reason this script exists. `PayloadTooLarge` may also appear, since a
-small ceiling catches large tool results as well as files; it is not required.
+After that, `FileRead` and `FileWritten` are the ones to look at. `PayloadTooLarge` may also appear,
+since a small ceiling catches large tool results as well as files; it is not required.
+
+**Two counters are expected absent on Claude Code, and their absence is correct.**
+
+`ContentTooLarge` is unreachable through `Read`. The tool caps its own output near 21 KB, and a
+truncated read is detected *before* the size decision, so the node records no content and never
+reaches the ceiling at all. That is the right outcome -- a fragment's size says nothing about the
+file -- but it means no `Read` of any file, however large, can trip it. The ceiling still applies to
+prompts and tool results, which is what `PayloadTooLarge` counts.
+
+`ContentRecovered` is unreachable because Claude Code's `Edit` result states the new content, so the
+`_last_content` replay chain is never needed. The chain was ported because it recovered 5,863 of
+11,658 file versions on the corpus the Python recorder was measured against; it earns its place on
+Codex and on older hosts, not on this one.
+
+If either of these ever reports `YES`, something changed upstream and is worth understanding.
 
 ## What this deliberately cannot reach
 
