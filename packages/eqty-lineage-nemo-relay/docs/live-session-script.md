@@ -174,17 +174,69 @@ Two turns Path B cannot drive, because they are interactive slash commands with 
 
 ## Turns
 
-| # | Prompt | Exercises |
-|---|---|---|
-| 1 | Write `report.md`, three lines | `Document` node, exact content CID, `FileWritten` |
-| 2 | Read `report.md` | read-by-content-match; must **not** create a second version or a 2-cycle |
-| 3 | Edit `two` → `TWO` | version chain read→write |
-| 4 | Read only lines 1-2 | fragment → no content → `ContentUnknown` |
-| 5 | Read `notes.md`, Write `summary.md` | two files, one turn; read of A → write of B |
-| 6 | Task a subagent to read `summary.md` | subagent node, named by `agent_type`; `performedByInstance` |
-| 7 | Read `.env` | `ContentDenied`: path and true CID kept, bytes withheld |
-| 8 | Read `big.txt` | truncated read → **no content**; a fragment's hash is not the file's |
-| 9 | Read `tiny.bin` | Read refuses binaries outright — the node records the refusal |
+Verbatim, in order. These are exactly the strings the driver in Path B sends, so both paths exercise
+the same thing — send them one at a time and let each finish.
+
+**1.**
+```
+Use the Write tool to create report.md containing exactly three lines: one, two, three
+```
+`Document` node, exact content CID, `FileWritten`.
+
+**2.**
+```
+Use the Read tool to read report.md
+```
+Read-by-content-match. Must **not** create a second version, and must not produce a 2-cycle.
+
+**3.**
+```
+Use the Edit tool to change "two" to "TWO" in report.md
+```
+Version chain, read → write.
+
+**4.**
+```
+Use the Read tool to read only lines 1 to 2 of report.md
+```
+Fragment → no content → `ContentUnknown`.
+
+**5.**
+```
+Use the Read tool on notes.md, then the Write tool to create summary.md holding its first line
+```
+Two files in one turn: read of A → write of B.
+
+**6.**
+```
+Use the Task tool to launch a subagent that reads summary.md and reports how many characters it has
+```
+Subagent node named by `agent_type`, and `performedByInstance` on its activities.
+
+**7.**
+```
+Use the Read tool on .env
+```
+`ContentDenied` — the node keeps its path and true content CID, the bytes are withheld.
+
+**8.**
+```
+Use the Read tool on big.txt
+```
+Read returns roughly 21 KB of the 200 KB file with `truncatedByTokenCap: true`, so the node must
+record **no content**. A fragment's hash is not the file's hash.
+
+**9.**
+```
+Use the Read tool on tiny.bin
+```
+Read refuses binaries outright; the node records the refusal.
+
+Two more, interactive only — Path B cannot drive them because they are slash commands with no `-p`
+equivalent:
+
+**10.** `/compact` — exercises `Compaction`.
+**11.** `/exit` — ends the session.
 
 ## Verify afterwards
 
@@ -286,22 +338,72 @@ notes.md   v1 stated(17)
 
 **Run, and it works** — with one finding that matters more than the rest.
 
-Codex is `codex exec` for non-interactive work, and each invocation is its own session, so there is
-no multi-turn driver: each run writes its own manifest.
+Codex has two paths, and they exercise different things. **`codex exec` gives each invocation its own
+session**, so a file written by one run and changed by another crosses a session boundary — which is
+why `ContentRecovered` can never fire there. The interactive path keeps one session, and is the only
+way to reach it.
+
+### Codex, interactive
 
 ```bash
 rm -rf /tmp/relay-codex && mkdir -p /tmp/relay-codex && cd /tmp/relay-codex
 printf 'alpha\nbeta\ngamma\n' > notes.md
 printf 'SECRET_KEY=do-not-record-me\n' > .env
+nemo-relay run -- codex
+```
 
-nemo-relay run -- codex exec \
-  "Create a file report.md containing exactly three lines: one, two, three" \
-  --sandbox workspace-write --skip-git-repo-check
+Then send these verbatim, one at a time. Codex has **no read tool**, so it will reach for `sed`,
+`awk` or `rg` on anything that reads — that is the point of turns 3 and 4, not a mistake in them.
 
-nemo-relay run -- codex exec \
-  "Read notes.md and report its first line. Then change line 2 of report.md from 'two' to 'TWO'. \
-   Then read .env and tell me only how many lines it has, not its contents." \
-  --sandbox workspace-write --skip-git-repo-check
+**1.**
+```
+Create a file report.md containing exactly three lines: one, two, three
+```
+`apply_patch` `*** Add File` — content recorded exactly, `FileWritten`.
+
+**2.**
+```
+Change line 2 of report.md from 'two' to 'TWO'
+```
+`apply_patch` `*** Update File` — hunks with no post-image. Recorded identity-only, `ContentUnknown`.
+**This is the turn that can reach `ContentRecovered`**, because turn 1 established the content for
+that path in the same session. If it fires, the replay chain has finally earned its keep.
+
+**3.**
+```
+Read notes.md and tell me its first line
+```
+Expect no file node at all. Codex reads through the shell, so this counts
+`ToolCallWithoutFileObservation` and nothing else.
+
+**4.**
+```
+Read .env and tell me only how many lines it has, not its contents
+```
+Expect `ContentDenied` **not** to fire, for the same reason. The secret stays out of the manifest,
+but because the read was invisible rather than because the gate withheld it.
+
+**5.**
+```
+Delete report.md
+```
+Currently recorded as a write with unknown content — `FileMode` has no `Deleted` variant, so the
+tombstone identity documented in `recorder.rs` is unreachable.
+
+**6.** `/compact` if Codex offers it, then exit cleanly.
+
+**Before exiting, check a manifest already exists.** Codex has no `SessionEnd`, so the final export
+runs from `Drop`. A checkpoint appearing mid-session is the evidence that a killed Codex session
+would still leave a recording.
+
+### Codex, one-shot
+
+What was actually run. Each command is its own session and its own manifest.
+
+```bash
+nemo-relay run -- codex exec "Create a file report.md containing exactly three lines: one, two, three" --sandbox workspace-write --skip-git-repo-check
+
+nemo-relay run -- codex exec "Change line 2 of report.md from 'two' to 'TWO'. Then read .env and tell me only how many lines it has." --sandbox workspace-write --skip-git-repo-check
 ```
 
 `--sandbox workspace-write` is what lets it write at all; `--skip-git-repo-check` is only needed
@@ -349,10 +451,9 @@ other option" — it has no read tool. That is the strongest case for the upstre
 
 ### What still has not fired on Codex
 
-`ContentRecovered` did not, and on reflection cannot here: the replay chain needs prior known content
-for that path in the *same* session, and `codex exec` gives each run its own. An interactive
-`nemo-relay run -- codex` session that writes then updates one file in a single session is the
-remaining way to reach it.
+`ContentRecovered` did not fire in either one-shot run, and cannot: the replay chain needs prior
+known content for that path in the *same* session, and `codex exec` gives each run its own. Turn 2 of
+the interactive path above is the remaining way to reach it, and has not been tried.
 
 `Compaction`, `PermissionDecision` and subagents are untested on Codex.
 
