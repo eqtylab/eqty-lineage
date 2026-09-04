@@ -25,8 +25,8 @@
     "max_content_bytes": {
       "type": "integer",
       "exclusiveMinimum": 0,
-      "default": 1048576,
-      "description": "Content larger than this is recorded by CID and metadata, without storing its bytes."
+      "default": 1073741824,
+      "description": "Content larger than this is recorded by CID and metadata, without storing its bytes. Blobs are inlined into the manifest as base64, so a stored payload costs about 4/3 of its length."
     },
     "executor": {
       "type": "object",

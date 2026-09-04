@@ -14,7 +14,14 @@ use serde_json::Map;
 const DEFAULT_MANIFEST_DIR: &str = ".eqty/manifests";
 
 /// Content larger than this is recorded by CID and metadata but its bytes are not stored.
-const DEFAULT_MAX_CONTENT_BYTES: u64 = 1_048_576;
+///
+/// Override per host with `max_content_bytes` in the component's config block.
+///
+/// A withheld node still carries the path and the true content CID computed from the bytes before
+/// the decision, so raising this trades manifest size for readable content, never for lineage:
+/// nothing is dropped from the graph either way. Size is the thing to weigh -- blobs are inlined
+/// into the manifest as base64, so a stored payload costs about 4/3 of its own length on disk.
+const DEFAULT_MAX_CONTENT_BYTES: u64 = 1_073_741_824;
 
 /// Paths whose *contents* never enter a manifest.
 ///
