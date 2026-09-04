@@ -5,12 +5,17 @@
 //! Python recorder rather than redesigned -- the semantics below each exist for a measured reason,
 //! and several of them look like over-thinking until the case that motivated them shows up.
 //!
-//! # File identity is `(path, content CID)`, never path alone
+//! # File identity is content. The path is metadata
 //!
 //! Keying on path would make `read → edit → read` either hide every edit or produce a cycle, since
-//! the same node would be both an input and an output of the same activity. Keying on content alone
-//! would merge two different files that happen to hold the same bytes. The pair is what makes a
-//! version.
+//! the same node would be both an input and an output of the same activity. So a node is its
+//! content, addressed by the CID of the bytes, and the path travels in the metadata beside it.
+//!
+//! The consequence is deliberate: one file copied or moved to a second location is **one node with
+//! two things said about it**, not two nodes. Two files that happen to hold identical bytes are also
+//! one node -- which is the same statement, since under content addressing they are the same thing.
+//! `(path, content CID)` is still the in-session dedup key, because a path is how a *version chain*
+//! is followed, but it never reaches the graph as identity.
 //!
 //! # There are three ways not to know, and they must not collapse
 //!
@@ -20,6 +25,10 @@
 //!
 //! Collapsing the last two would let a deletion deduplicate against a failed read of the same path,
 //! and the graph would then assert the file was removed when nobody ever saw it removed.
+//!
+//! The last two are path-derived, and unavoidably so: with no content there is nothing else to be
+//! identical about, and two unread files cannot be shown to be the same file. Only nodes whose
+//! content was established obey the content-identity rule above.
 //!
 //! # Identity is computed before redaction, never after
 //!
@@ -163,9 +172,10 @@ impl Recorder {
 
         let asset = match (&data, withheld) {
             (Some(bytes), false) => self.lineage.register_content(bytes, metadata, at).await?,
-            // Identity-only. The descriptor is canonical and derived from the path and the true
-            // content CID, so the node is deterministic across runs -- an entity would mint a fresh
-            // UUID each time and two recordings of the same withheld file would not join.
+            // Identity-only. The descriptor is canonical and derived from the true content CID
+            // alone, so the node is deterministic across runs and independent of where the file sat
+            // -- an entity would mint a fresh UUID each time and two recordings of the same withheld
+            // file would not join.
             _ => {
                 if withheld && data.is_some() {
                     self.count(match disposition {
@@ -175,7 +185,7 @@ impl Recorder {
                 } else {
                     self.count("ContentUnknown");
                 }
-                let descriptor = canonical_descriptor(&path, &content_cid, withheld);
+                let descriptor = canonical_descriptor(&content_cid, withheld);
                 self.lineage
                     .register_content(&descriptor, metadata, at)
                     .await?
@@ -227,7 +237,7 @@ impl Recorder {
 
         if withheld {
             self.count("PayloadTooLarge");
-            let descriptor = canonical_descriptor(name, &content_cid, true);
+            let descriptor = canonical_descriptor(&content_cid, true);
             return self
                 .lineage
                 .register_content(&descriptor, metadata, at)
@@ -442,7 +452,16 @@ impl Recorder {
 /// same withheld file in two recordings hashes to the same identity and the graphs join. This is a
 /// JSON envelope rather than a content hash, which is exactly why the node's metadata marks it
 /// `redacted` -- a reader must be able to tell which nodes are content-addressed and which are not.
-fn canonical_descriptor(path: &str, content_cid: &str, withheld: bool) -> Vec<u8> {
-    format!(r#"{{"content-cid":"{content_cid}","path":"{path}","withheld":{withheld}}}"#)
-        .into_bytes()
+///
+/// **The path is deliberately not in here.** Identity is content, and the path is metadata, so one
+/// file copied or moved to a second location is one node with two things said about it. Hashing the
+/// path in would split the withheld nodes -- exactly the files, secrets and large artifacts, where
+/// knowing two recordings saw the same bytes is worth the most.
+///
+/// When content was never established the caller passes `unknown:{path}` as `content_cid`, so the
+/// path does still determine identity there. That is unavoidable rather than intended: with no
+/// content there is nothing else to be identical about, and two unread files cannot be shown to be
+/// the same file.
+fn canonical_descriptor(content_cid: &str, withheld: bool) -> Vec<u8> {
+    format!(r#"{{"content-cid":"{content_cid}","withheld":{withheld}}}"#).into_bytes()
 }

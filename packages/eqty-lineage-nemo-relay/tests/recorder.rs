@@ -346,3 +346,82 @@ async fn a_session_exports_a_manifest_stating_its_own_coverage() {
         "coverage should carry the counts a reader needs to weigh the graph"
     );
 }
+
+#[tokio::test]
+async fn one_file_at_two_paths_is_one_node() {
+    // Identity is content; the path is metadata. A file copied or moved is the same bytes, so it is
+    // one node with two things said about it -- not two nodes that no reader can join.
+    let mut rec = recorder();
+    let here = rec
+        .observe_file(
+            &seen("/src/config.toml", Some(b"port = 8080\n"), FileMode::Read),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    let there = rec
+        .observe_file(
+            &seen(
+                "/backup/config.toml",
+                Some(b"port = 8080\n"),
+                FileMode::Read,
+            ),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        here, there,
+        "the same bytes are the same node, wherever they sit"
+    );
+}
+
+#[tokio::test]
+async fn one_withheld_file_at_two_paths_is_one_node() {
+    // The case that actually broke: content we refuse to store is stood in for by a canonical
+    // descriptor, and hashing the path into that descriptor split exactly the nodes -- secrets and
+    // large artifacts -- where knowing two recordings saw the same bytes is worth the most.
+    let mut rec = recorder();
+    let here = rec
+        .observe_file(
+            &seen("/app/.env", Some(b"TOKEN=aaa\n"), FileMode::Read),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    let there = rec
+        .observe_file(
+            &seen("/deploy/.env", Some(b"TOKEN=aaa\n"), FileMode::Read),
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        here, there,
+        "a withheld file is identified by the bytes it withheld, not by where it sat"
+    );
+}
+
+#[tokio::test]
+async fn a_file_never_read_stays_distinct_per_path() {
+    // The deliberate exception. With no content established there is nothing else to be identical
+    // about, so identity falls back to `unknown:{path}`. Two files nobody read cannot be shown to be
+    // the same file, and claiming they are would be an assertion the recording never observed.
+    let mut rec = recorder();
+    let here = rec
+        .observe_file(&seen("/src/a.txt", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+    let there = rec
+        .observe_file(&seen("/src/b.txt", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+    assert_ne!(
+        here, there,
+        "unread files must not be merged on absence alone"
+    );
+}
