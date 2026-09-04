@@ -22,8 +22,9 @@ Requires OPENAI_API_KEY.
 
 import argparse
 import os
+from uuid import UUID
 from pathlib import Path
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from eqty_lineage.langchain import EqtyCallbackHandler, eqty_tool
 from eqty_sdk import Context, Signer, init, set_active_signer
@@ -114,7 +115,7 @@ class AgentState(TypedDict):
     answer: str
 
 
-def build_graph(model=None):
+def build_graph(model=None, checkpointer: Any = None):
     if model is None:
         model = ChatOpenAI(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
@@ -145,11 +146,11 @@ def build_graph(model=None):
     graph.add_conditional_edges("agent", route_after_agent, ["tools", "summarize"])
     graph.add_edge("tools", "agent")
     graph.add_edge("summarize", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 def init_sdk():
-    ctx = Context.new("Travel Assistant")
+    ctx = Context.from_uuid(UUID("11111111-2222-3333-4444-555555555555"))
     cfg = init(default_context=ctx).set_store_all_blobs(True)
     signer = Signer.new(name="travel_assistant", _load_if_exists=True)
     set_active_signer(signer)

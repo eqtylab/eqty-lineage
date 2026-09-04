@@ -20,6 +20,34 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 Only `langchain-core` is required at runtime, so the handler works with plain LangChain runnables as well as LangGraph
 graphs. Use one handler instance per invocation.
 
+### Session isolation
+
+Set the application/tenant root context once when initializing the SDK. The handler automatically creates
+and reuses one child context per LangGraph `thread_id`; every asset and statement from that thread is
+recorded beneath that child. A `run_id` identifies one execution, not a multi-turn user session.
+
+```python
+root_context = Context.new("travel-agent")
+eqty_sdk.init(default_context=root_context)
+
+app.invoke(
+    state,
+    config={"configurable": {"thread_id": conversation_id}, "callbacks": [EqtyCallbackHandler()]},
+)
+```
+
+Use one handler instance per invocation. The thread-context cache is shared by handlers in the process, so
+later turns of the same `thread_id` reuse its child context.
+
+After an invocation, export that handler's thread context—not the SDK root—to retrieve only that chat's
+lineage manifest:
+
+```python
+handler = EqtyCallbackHandler()
+app.invoke(state, config={"configurable": {"thread_id": conversation_id}, "callbacks": [handler]})
+handler.context.export("manifests/conversation.json")
+```
+
 ## `verbose` — extra metadata on assets
 
 ```python

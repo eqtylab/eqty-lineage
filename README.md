@@ -28,6 +28,12 @@ before/after lineage comparison you can run with `just langchain-diff-demo`. For
 plus [a survey of the upstream DeepAgents examples](packages/eqty-lineage-deepagents/EXAMPLES.md) showing how to
 instrument each one.
 
+For a browser chat example around the LangChain travel agent, run:
+
+```bash
+OPENAI_API_KEY=... uv run python examples/langchain/travel_chat_ui.py
+```
+
 ## Develop
 
 ```bash
