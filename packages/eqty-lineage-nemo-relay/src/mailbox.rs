@@ -618,7 +618,20 @@ fn export(
             }
         })
         .collect();
-    let path = manifest_dir.join(format!("{safe}.json"));
+    // Never clobber an earlier manifest for the same session.
+    //
+    // One session should export once, but "should" is doing work there: a stray `SessionEnded`
+    // makes the router forget the session, and everything after it lands in a fresh recorder that
+    // exports under the same name. Overwriting turns that into silent data loss -- the file looks
+    // like a complete short session rather than the tail of a truncated one. A subagent scope end
+    // caused exactly this before it was fixed, and the next cause will not announce itself either.
+    let mut path = manifest_dir.join(format!("{safe}.json"));
+    for sequence in 1..1000 {
+        if !path.exists() {
+            break;
+        }
+        path = manifest_dir.join(format!("{safe}.{sequence}.json"));
+    }
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
         let _ = std::fs::write(path, json);
     }

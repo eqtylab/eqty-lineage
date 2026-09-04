@@ -184,3 +184,45 @@ fn a_guessed_correlation_is_not_an_observation() {
         "agent_fallback is Relay guessing, and must not be recorded as observed"
     );
 }
+
+/// An `agent`-category scope end, with a chosen parent.
+fn agent_scope_end(uuid: &str, parent: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "name": "agent",
+        "category": "agent",
+        "scope_category": "end",
+        "attributes": [],
+        "timestamp": "2026-09-04T11:30:00Z",
+        "metadata": { "session_id": "s-1" }
+    }))
+    .expect("an agent scope end")
+}
+
+#[test]
+fn only_the_root_agent_scope_ends_the_session() {
+    // A subagent -- Claude Code's `Task` tool -- opens a scope in this same category. Treating its
+    // end as the session's ends the recording mid-session: the manifest is exported, the router
+    // forgets the session, and the turns after it accumulate in a fresh recorder that overwrites the
+    // file. Measured live on a nine-turn session, which lost turns 1-6 exactly this way.
+    let root = "01a040aa-0000-0000-0000-0000000000e0";
+    let child = "01a040aa-0000-0000-0000-0000000000e1";
+
+    assert!(
+        matches!(
+            classify(&agent_scope_end(root, root)),
+            Some(LineageEvent::SessionEnded)
+        ),
+        "the self-parented root scope is the session"
+    );
+    assert!(
+        !matches!(
+            classify(&agent_scope_end(child, root)),
+            Some(LineageEvent::SessionEnded)
+        ),
+        "a subagent finishing must not end the session"
+    );
+}

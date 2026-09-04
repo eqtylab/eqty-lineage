@@ -1185,3 +1185,26 @@ fn a_tool_run_records_what_it_was_invoked_with() {
         "the arguments must be an input to the run that used them"
     );
 }
+
+#[test]
+fn a_second_export_never_overwrites_the_first() {
+    // A session should end once. When it does not -- and a subagent scope end made that happen on a
+    // real nine-turn session -- overwriting means the surviving file looks like a complete short
+    // session instead of the tail of a truncated one. The turns that vanished were the only
+    // evidence anything was wrong.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000096";
+    replay(&full_session(session), &into);
+    replay(&full_session(session), &into);
+
+    let written = manifests(&into);
+    assert_eq!(
+        written.len(),
+        2,
+        "the second export must sit beside the first, not on top of it"
+    );
+    for path in &written {
+        let bytes = fs::read(path).expect("each manifest is readable");
+        assert!(!bytes.is_empty(), "neither manifest may be truncated");
+    }
+}

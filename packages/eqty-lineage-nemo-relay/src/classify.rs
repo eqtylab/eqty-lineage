@@ -213,7 +213,21 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
             Some(LineageEvent::PromptSubmitted { text })
         }
 
-        ("agent", true) => Some(LineageEvent::SessionEnded),
+        // Only the *root* agent scope ends the session. A subagent -- Claude Code's `Task` tool --
+        // opens its own scope in this same category, and treating its end as the session's ends the
+        // recording while the session is still going: the manifest is exported, the router forgets
+        // the session, and everything after it accumulates in a fresh recorder that overwrites the
+        // file on the way out. Measured live: a nine-turn session lost turns 1-6 that way, and the
+        // surviving manifest looked like a recorder that had attached late.
+        //
+        // The root scope is self-parented; a subagent's is not.
+        ("agent", true)
+            if event
+                .parent_uuid()
+                .is_none_or(|parent| parent == event.uuid()) =>
+        {
+            Some(LineageEvent::SessionEnded)
+        }
 
         _ => None,
     }
