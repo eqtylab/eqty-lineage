@@ -68,6 +68,14 @@ struct SessionState {
     subagents: HashMap<String, AssetRef>,
     /// The subagent currently doing the work, when one is.
     active_subagent: Option<AssetRef>,
+    /// Which *instance* of that subagent is running.
+    ///
+    /// The node is the subagent's kind, deduplicated by name so `general-purpose` is one node across
+    /// every session that used one -- which is what makes "what did this kind of agent do" a graph
+    /// question. Two parallel workers of the same kind therefore share it, so the instance travels
+    /// on each activity instead. Without this a session that fans out to four identical subagents
+    /// records four indistinguishable performers.
+    active_subagent_instance: Option<String>,
     dropped_events: u64,
     /// Where this session's manifest is written, resolved once when the session opens.
     ///
@@ -90,6 +98,16 @@ impl SessionState {
             .as_ref()
             .or(self.agent.as_ref())
             .map(|asset| asset.as_str().to_string())
+    }
+
+    /// Which instance of the acting subagent, when one is acting.
+    ///
+    /// `None` for the root agent: there is only ever one of it, so an instance would say nothing.
+    fn actor_instance(&self) -> Option<String> {
+        self.active_subagent
+            .as_ref()
+            .and(self.active_subagent_instance.as_ref())
+            .cloned()
     }
 }
 
@@ -195,6 +213,7 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
                     turn_prompt: None,
                     subagents: HashMap::new(),
                     active_subagent: None,
+                    active_subagent_instance: None,
                     dropped_events: 0,
                 },
             );
@@ -273,7 +292,9 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                     "Agent",
                     &label,
                     &format!("The subagent '{label}', running inside this session."),
-                    serde_json::json!({ "subagentId": subagent_id, "role": "subagent" }),
+                    // No instance id here: this node is the subagent's *kind*, and naming one
+                    // instance on a node that stands for several would be false.
+                    serde_json::json!({ "role": "subagent" }),
                     at,
                 )
                 .await
@@ -281,12 +302,14 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 // Delegated work is attributed to the subagent that did it, not to the root agent.
                 // A manifest that credited everything to the root would say one actor did work that
                 // several actors did, which is the thing a provenance record exists to prevent.
-                state.subagents.insert(subagent_id, asset.clone());
+                state.subagents.insert(subagent_id.clone(), asset.clone());
                 state.active_subagent = Some(asset);
+                state.active_subagent_instance = Some(subagent_id);
             }
         }
         LineageEvent::SubagentEnded { .. } => {
             state.active_subagent = None;
+            state.active_subagent_instance = None;
         }
         LineageEvent::Compacted => {
             // A compaction is a real transformation of the agent's context: everything before it has
@@ -456,6 +479,7 @@ async fn record_model_call(
                 "computation_type": "model_call",
                 "model": model,
                 "performedBy": state.actor_name(),
+                "performedByInstance": state.actor_instance(),
                 "observed": observed,
             }),
             observed,
@@ -592,6 +616,7 @@ async fn record_tool(
     // Who performed it. The active subagent when one is running, otherwise the root agent -- so
     // delegated work is credited to the actor that did it rather than to the session as a whole.
     let performed_by = state.actor_name();
+    let performed_by_instance = state.actor_instance();
     let _ = state
         .recorder
         .record_tool_run(
@@ -601,6 +626,7 @@ async fn record_tool(
                 "computation_type": "tool_call",
                 "tool": open.as_ref().map(|open| open.name.clone()),
                 "performedBy": performed_by,
+                "performedByInstance": performed_by_instance,
                 "observed": observed,
             }),
             at,

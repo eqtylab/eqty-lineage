@@ -1247,3 +1247,109 @@ fn a_manifest_exists_before_the_session_ends() {
         "a mid-session checkpoint carries no coverage node -- that is how a reader tells it is not final"
     );
 }
+
+#[test]
+fn two_subagents_of_one_kind_share_a_node_but_not_an_identity() {
+    // Naming a subagent by its kind is what makes "what did a general-purpose agent do" answerable
+    // across sessions -- but `record_actor` deduplicates by name, so parallel workers of the same
+    // kind share the node. A live session fanned out to four identical subagents; without the
+    // instance on each activity they become four indistinguishable performers.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000094";
+    let root = "01a040aa-0000-0000-0000-000000000b00";
+    let turn = "01a040aa-0000-0000-0000-000000000b01";
+
+    let mut events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        turn_scope(session, turn, root, "start"),
+    ];
+    // Two subagents of the same kind, one after the other, each doing one tool call.
+    for (index, uuid) in [
+        "01a040aa-0000-0000-0000-000000000b10",
+        "01a040aa-0000-0000-0000-000000000b20",
+    ]
+    .iter()
+    .enumerate()
+    {
+        events.push(subagent_scope(
+            session,
+            uuid,
+            turn,
+            "start",
+            "general-purpose",
+        ));
+        let tool = format!("01a040aa-0000-0000-0000-000000000c{index}0");
+        events.push(claude_read(
+            session,
+            &tool,
+            uuid,
+            "start",
+            serde_json::json!({ "file_path": format!("/work/{index}.md") }),
+        ));
+        events.push(claude_read(
+            session,
+            &tool,
+            uuid,
+            "end",
+            serde_json::json!({ "file": { "filePath": format!("/work/{index}.md"),
+                "content": format!("body {index}\n"), "numLines": 1, "startLine": 1,
+                "totalLines": 1 }, "type": "text" }),
+        ));
+        events.push(subagent_scope(
+            session,
+            uuid,
+            turn,
+            "end",
+            "general-purpose",
+        ));
+    }
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let blobs: Vec<serde_json::Value> = blob_objects(path);
+    let kinds = blobs
+        .iter()
+        .filter(|blob| blob["assetType"] == "Agent" && blob["name"] == "general-purpose")
+        .count();
+    assert_eq!(
+        kinds, 1,
+        "one kind of subagent is one node, however many ran"
+    );
+    let instances: std::collections::HashSet<String> = blobs
+        .iter()
+        .filter_map(|blob| blob.get("performedByInstance")?.as_str())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        instances.len(),
+        2,
+        "but the two instances stay distinguishable on the activities they performed: {instances:?}"
+    );
+}
+
+/// A synthesized subagent scope, as Relay emits one: `agent` category, parented to the turn.
+fn subagent_scope(session: &str, uuid: &str, parent: &str, phase: &str, kind: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "name": format!("subagent:{uuid}"),
+        "category": "agent",
+        "scope_category": phase,
+        "attributes": [],
+        "timestamp": "2026-09-04T12:00:00Z",
+        "metadata": {
+            "session_id": session,
+            "nemo_relay_scope_role": "subagent",
+            "agent_type": kind
+        }
+    }))
+    .expect("a subagent scope")
+}

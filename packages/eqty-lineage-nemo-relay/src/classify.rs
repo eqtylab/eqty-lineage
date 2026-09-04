@@ -225,13 +225,17 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
         //
         // Reading the end of one of these as the session ending truncated a nine-turn live session
         // to its last three turns.
-        ("agent", false) if !is_root_scope(event) => Some(LineageEvent::SubagentStarted {
-            subagent_id: event.uuid().to_string(),
-            name: Some(event.name().to_string()).filter(|name| !name.is_empty()),
-        }),
-        ("agent", true) if !is_root_scope(event) => Some(LineageEvent::SubagentEnded {
-            subagent_id: event.uuid().to_string(),
-        }),
+        ("agent", false) if is_subagent_scope(event, metadata) => {
+            Some(LineageEvent::SubagentStarted {
+                subagent_id: event.uuid().to_string(),
+                name: subagent_name(event, metadata),
+            })
+        }
+        ("agent", true) if is_subagent_scope(event, metadata) => {
+            Some(LineageEvent::SubagentEnded {
+                subagent_id: event.uuid().to_string(),
+            })
+        }
         ("agent", true) => Some(LineageEvent::SessionEnded),
 
         _ => None,
@@ -264,14 +268,34 @@ fn terminal_status(metadata: Option<&Json>) -> Option<bool> {
 /// Relay spells this differently depending on where it recovered the identity from, and falls back
 /// to the scope UUID when the payload named no subagent at all -- which still gives the session a
 /// stable handle for the actor, even though it says nothing about what kind of actor it was.
-/// Whether this scope is the session's own agent scope rather than a subagent within it.
+/// Whether this `agent` scope is a subagent rather than the session's own root scope.
 ///
-/// The root is self-parented. Relay parents a synthesized subagent scope to the scope that spawned
-/// it, so anything with a different parent is nested work.
-fn is_root_scope(event: &Event) -> bool {
-    event
+/// Relay says so outright. When it synthesizes a subagent scope it merges
+/// `{"nemo_relay_scope_role": "subagent"}` into the metadata, exactly as it spells the turn role a
+/// few arms above. Prefer the stated role over any inference from it.
+///
+/// The parent check is the fallback for a host that omits the role: the root scope is
+/// self-parented and a subagent is parented to the scope that spawned it. Keeping both means a
+/// Relay that stops setting the role degrades to a working heuristic rather than to silence.
+fn is_subagent_scope(event: &Event, metadata: Option<&Json>) -> bool {
+    if string_at(metadata, "nemo_relay_scope_role") == Some("subagent") {
+        return true;
+    }
+    !event
         .parent_uuid()
         .is_none_or(|parent| parent == event.uuid())
+}
+
+/// What to call a subagent in the graph.
+///
+/// Relay's scope name is `subagent:{id}` -- unique and stable, but it tells a reader nothing about
+/// what kind of subagent ran. The hook's own metadata is merged into that scope, so the agent type
+/// travels with it when the host reports one, and that is the name worth showing.
+fn subagent_name(event: &Event, metadata: Option<&Json>) -> Option<String> {
+    string_at(metadata, "agent_type")
+        .or_else(|| string_at(metadata, "subagent_type"))
+        .map(str::to_string)
+        .or_else(|| Some(event.name().to_string()).filter(|name| !name.is_empty()))
 }
 
 fn subagent_id(event: &Event, metadata: Option<&Json>) -> Option<String> {

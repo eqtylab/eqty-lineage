@@ -269,3 +269,72 @@ fn only_the_root_agent_scope_ends_the_session() {
         "a subagent finishing must not end the session"
     );
 }
+
+#[test]
+fn a_subagent_is_named_for_what_it_is() {
+    // Relay names the scope `subagent:{id}` -- unique and stable, and it tells a reader nothing.
+    // The hook's own metadata is merged into that scope, so the agent type travels with it. One
+    // live session produced four anonymous subagents; the type is the difference between counting
+    // them and asking what they were.
+    let scope = |extra: serde_json::Value| -> Event {
+        let mut metadata = serde_json::json!({ "session_id": "s-1" });
+        if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        serde_json::from_value(serde_json::json!({
+            "atof_version": "0.1",
+            "kind": "scope",
+            "uuid": "01a040aa-0000-0000-0000-0000000000f5",
+            "parent_uuid": "01a040aa-0000-0000-0000-0000000000f4",
+            "name": "subagent:abc123",
+            "category": "agent",
+            "scope_category": "start",
+            "attributes": [],
+            "timestamp": "2026-09-04T12:00:00Z",
+            "metadata": metadata
+        }))
+        .expect("an agent scope")
+    };
+
+    match classify(&scope(
+        serde_json::json!({ "agent_type": "general-purpose" }),
+    )) {
+        Some(LineageEvent::SubagentStarted { name, .. }) => {
+            assert_eq!(name.as_deref(), Some("general-purpose"))
+        }
+        other => panic!("expected a named subagent, got {other:?}"),
+    }
+    // Without a type, Relay's scope name is still better than nothing.
+    match classify(&scope(serde_json::json!({}))) {
+        Some(LineageEvent::SubagentStarted { name, .. }) => {
+            assert_eq!(name.as_deref(), Some("subagent:abc123"))
+        }
+        other => panic!("expected a fallback name, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_stated_role_beats_the_tree_shape() {
+    // Relay marks a synthesized subagent scope with `nemo_relay_scope_role: "subagent"`, exactly as
+    // it spells the turn role. Prefer what it states over what the parent chain implies -- a
+    // self-parented scope that says it is a subagent is one.
+    let event: Event = serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "uuid": "01a040aa-0000-0000-0000-0000000000f6",
+        "parent_uuid": "01a040aa-0000-0000-0000-0000000000f6",
+        "name": "subagent:xyz",
+        "category": "agent",
+        "scope_category": "start",
+        "attributes": [],
+        "timestamp": "2026-09-04T12:00:00Z",
+        "metadata": { "session_id": "s-1", "nemo_relay_scope_role": "subagent" }
+    }))
+    .expect("a self-parented scope that states its role");
+    assert!(
+        matches!(classify(&event), Some(LineageEvent::SubagentStarted { .. })),
+        "the stated role must win over the parent check"
+    );
+}
