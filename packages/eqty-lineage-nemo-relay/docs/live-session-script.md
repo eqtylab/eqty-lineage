@@ -266,56 +266,77 @@ notes.md   v1 stated(17)
 
 ## Running it against Codex
 
-**Not yet done.** Everything in this section is derived from Relay's source and from a committed
-Codex capture, not from a live Codex run. Treat it as a plan to be corrected by the first attempt.
+**Run, and it works** — with one finding that matters more than the rest.
 
-Codex differs from Claude Code in ways that change what this script tests:
-
-**The export trigger is different, and it is the whole risk.** Codex's plugin hook schema has no
-`SessionEnd`, so Relay never emits a root agent scope end and `SessionEnded` never fires. The manifest
-is written from `Drop` — when the Relay process exits. A Codex session that is killed rather than
-exited cleanly may write nothing at all. Since checkpointing landed, a partial manifest should exist
-regardless; **confirming that is the single most valuable thing a first Codex run can establish.**
-
-**File edits arrive as `apply_patch`, not `Write`/`Edit`.** `Add File` carries the full content and is
-recorded exactly. `Update File` carries hunks and no pre-image, so it is recorded identity-only —
-reconstructing from hunks would content-address a state the file may never have had. `Delete File`
-currently records as a write with unknown content, because `FileMode` has no `Deleted` variant.
-
-**`ContentRecovered` may become reachable here**, unlike on Claude Code, if Codex omits post-images.
-That is worth watching: it is the one host where the replay chain earns its keep.
-
-### What a human has to do
+Codex is `codex exec` for non-interactive work, and each invocation is its own session, so there is
+no multi-turn driver: each run writes its own manifest.
 
 ```bash
-# 1. Install Codex, and check whether it has a non-interactive mode.
-codex --help | grep -iE "exec|--print|-p\b"
-
-# 2. Same staging as above, then:
 rm -rf /tmp/relay-codex && mkdir -p /tmp/relay-codex && cd /tmp/relay-codex
-printf 'alpha\nbeta\n' > notes.md
+printf 'alpha\nbeta\ngamma\n' > notes.md
 printf 'SECRET_KEY=do-not-record-me\n' > .env
-nemo-relay run -- codex
+
+nemo-relay run -- codex exec \
+  "Create a file report.md containing exactly three lines: one, two, three" \
+  --sandbox workspace-write --skip-git-repo-check
+
+nemo-relay run -- codex exec \
+  "Read notes.md and report its first line. Then change line 2 of report.md from 'two' to 'TWO'. \
+   Then read .env and tell me only how many lines it has, not its contents." \
+  --sandbox workspace-write --skip-git-repo-check
 ```
 
-Then, by hand:
+`--sandbox workspace-write` is what lets it write at all; `--skip-git-repo-check` is only needed
+because `/tmp` is not a repository. Relay requires codex-cli >= 0.143.0.
 
-| # | Ask Codex to | Exercises |
-|---|---|---|
-| 1 | create `report.md` with three lines | `apply_patch` `Add File` — exact content |
-| 2 | read `report.md` back | `FileRead` |
-| 3 | change one line in `report.md` | `apply_patch` `Update File` — identity-only, and possibly `ContentRecovered` |
-| 4 | read `.env` | `ContentDenied` |
-| 5 | delete `report.md` | currently recorded as a write with unknown content — see above |
+### What the two runs established
 
-**Exit Codex cleanly**, then run the same verification block against
-`/tmp/relay-codex/.eqty/manifests/`. Before exiting, check that a manifest already exists — that is
-the checkpointing claim, and on Codex it is the difference between a recording and nothing.
+**Export from `Drop` alone works.** Relay's Codex descriptor has ten hook events and no `SessionEnd`,
+so `SessionEnded` never fires and the manifest is written when the Relay process exits. This was the
+largest unknown about Codex and it is settled: both runs produced a manifest.
 
-Expect `Compaction` and the `Agent`/subagent rows to differ: Codex's subagent model is not Claude
-Code's, and Relay aligns it through a different path.
+**Both `apply_patch` branches are proven.**
 
----
+| patch | recorded |
+| --- | --- |
+| `*** Add File` | exactly — `report.md` v1, 14 bytes, `reconstructed: "stated"` |
+| `*** Update File` | identity-only — v1, no content, `ContentUnknown` |
+
+`Update File` carries hunks and no pre-image, so the node keeps the path and records no content.
+Reconstructing from the hunks would content-address a state the file may never have had.
+
+**Two sessions, two manifests, neither clobbered.**
+
+### The finding: Codex has no read tool
+
+Every read went through the shell:
+
+```
+Bash input: sed -n '1p' notes.md && sed -n '1,4p' report.md
+Bash input: awk 'END { print NR }' .env
+Bash input: pwd && rg --files -g 'notes.md' -g 'report.md' -g '.env'
+```
+
+So `FileRead` is **0**, `notes.md` never became a node despite being read, and — the part worth
+sitting with — **`ContentDenied` never fired**. `.env` *was* read, by `awk`, and the redaction gate
+never saw it, because we never saw the file.
+
+The secret did not reach the manifest, but not because the gate withheld it: because the read was
+invisible. On Claude Code `.env` produces a node carrying its path and true content CID with the
+bytes withheld, which is a claim a reader can act on. On Codex it produces nothing at all, which is
+indistinguishable from the file never having been touched.
+
+Claude Code's version of this gap is "the agent sometimes chooses `Bash`". Codex's is "there is no
+other option" — it has no read tool. That is the strongest case for the upstream proposal.
+
+### What still has not fired on Codex
+
+`ContentRecovered` did not, and on reflection cannot here: the replay chain needs prior known content
+for that path in the *same* session, and `codex exec` gives each run its own. An interactive
+`nemo-relay run -- codex` session that writes then updates one file in a single session is the
+remaining way to reach it.
+
+`Compaction`, `PermissionDecision` and subagents are untested on Codex.
 
 ## What this deliberately cannot reach
 
