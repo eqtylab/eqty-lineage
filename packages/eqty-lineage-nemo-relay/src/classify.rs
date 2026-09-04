@@ -213,21 +213,26 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
             Some(LineageEvent::PromptSubmitted { text })
         }
 
-        // Only the *root* agent scope ends the session. A subagent -- Claude Code's `Task` tool --
-        // opens its own scope in this same category, and treating its end as the session's ends the
-        // recording while the session is still going: the manifest is exported, the router forgets
-        // the session, and everything after it accumulates in a fresh recorder that overwrites the
-        // file on the way out. Measured live: a nine-turn session lost turns 1-6 that way, and the
-        // surviving manifest looked like a recorder that had attached late.
+        // An `agent` scope is either the session itself or a subagent inside it, and `parent_uuid`
+        // separates them: the root is self-parented, a subagent is not.
         //
-        // The root scope is self-parented; a subagent's is not.
-        ("agent", true)
-            if event
-                .parent_uuid()
-                .is_none_or(|parent| parent == event.uuid()) =>
-        {
-            Some(LineageEvent::SessionEnded)
-        }
+        // Relay does not forward `SubagentStart` as a mark. It consumes the hook and synthesizes a
+        // scope -- `push_scope(name: subagent_name, scope_type: ScopeType::Agent, parent:
+        // parent_scope)` in its session manager -- so the subagent *is* the scope, and the
+        // hook-name arm in `classify_mark` never fires on Claude Code. Verified two ways: a hook
+        // probe against Claude Code 2.1.236 shows SubagentStart and SubagentStop firing, and no
+        // mark carrying either name ever reaches a subscriber.
+        //
+        // Reading the end of one of these as the session ending truncated a nine-turn live session
+        // to its last three turns.
+        ("agent", false) if !is_root_scope(event) => Some(LineageEvent::SubagentStarted {
+            subagent_id: event.uuid().to_string(),
+            name: Some(event.name().to_string()).filter(|name| !name.is_empty()),
+        }),
+        ("agent", true) if !is_root_scope(event) => Some(LineageEvent::SubagentEnded {
+            subagent_id: event.uuid().to_string(),
+        }),
+        ("agent", true) => Some(LineageEvent::SessionEnded),
 
         _ => None,
     }
@@ -259,6 +264,16 @@ fn terminal_status(metadata: Option<&Json>) -> Option<bool> {
 /// Relay spells this differently depending on where it recovered the identity from, and falls back
 /// to the scope UUID when the payload named no subagent at all -- which still gives the session a
 /// stable handle for the actor, even though it says nothing about what kind of actor it was.
+/// Whether this scope is the session's own agent scope rather than a subagent within it.
+///
+/// The root is self-parented. Relay parents a synthesized subagent scope to the scope that spawned
+/// it, so anything with a different parent is nested work.
+fn is_root_scope(event: &Event) -> bool {
+    event
+        .parent_uuid()
+        .is_none_or(|parent| parent == event.uuid())
+}
+
 fn subagent_id(event: &Event, metadata: Option<&Json>) -> Option<String> {
     string_at(metadata, "subagent_id")
         .or_else(|| string_at(metadata, "agent_id"))

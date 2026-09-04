@@ -185,6 +185,49 @@ fn a_guessed_correlation_is_not_an_observation() {
     );
 }
 
+/// An `agent`-category scope, in a chosen phase, with a chosen parent.
+fn agent_scope(uuid: &str, parent: &str, phase: &str, name: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "name": name,
+        "category": "agent",
+        "scope_category": phase,
+        "attributes": [],
+        "timestamp": "2026-09-04T11:30:00Z",
+        "metadata": { "session_id": "s-1" }
+    }))
+    .expect("an agent scope")
+}
+
+#[test]
+fn a_subagent_scope_is_a_subagent() {
+    // Relay does not forward `SubagentStart` as a mark. It consumes the hook and synthesizes an
+    // `agent`-category scope named for the subagent, parented to the scope that spawned it -- so the
+    // scope *is* the subagent, and the hook-name path never fires on Claude Code.
+    let root = "01a040aa-0000-0000-0000-0000000000f0";
+    let child = "01a040aa-0000-0000-0000-0000000000f1";
+
+    match classify(&agent_scope(child, root, "start", "researcher")) {
+        Some(LineageEvent::SubagentStarted { subagent_id, name }) => {
+            assert_eq!(subagent_id, child);
+            assert_eq!(name.as_deref(), Some("researcher"));
+        }
+        other => panic!("a nested agent scope start is a subagent, got {other:?}"),
+    }
+    match classify(&agent_scope(child, root, "end", "researcher")) {
+        Some(LineageEvent::SubagentEnded { subagent_id }) => assert_eq!(subagent_id, child),
+        other => panic!("a nested agent scope end ends that subagent, got {other:?}"),
+    }
+    // And the root is still the session, in both directions.
+    assert!(matches!(
+        classify(&agent_scope(root, root, "end", "agent")),
+        Some(LineageEvent::SessionEnded)
+    ));
+}
+
 /// An `agent`-category scope end, with a chosen parent.
 fn agent_scope_end(uuid: &str, parent: &str) -> Event {
     serde_json::from_value(serde_json::json!({
