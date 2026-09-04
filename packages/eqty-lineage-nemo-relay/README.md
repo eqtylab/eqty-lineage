@@ -43,9 +43,9 @@ here verifies exactly as one produced by the Python SDK today.
 
 ## Status
 
-Phase 2 of [the plan](../../../eqty-lineage-nemo-relay-plugin-plan.md): the plugin loads, validates
-its configuration, and classifies a real event stream. It does **not** yet build a lineage graph —
-statement generation is Phase 3.
+Phases 2 and 3 of [the plan](../../../eqty-lineage-nemo-relay-plugin-plan.md). The plugin loads,
+validates its configuration, classifies a real event stream, and writes a signed manifest whose
+statement and asset types match the shipped DeepAgents and deep-research manifests.
 
 | | |
 |---|---|
@@ -62,7 +62,8 @@ statement generation is Phase 3.
 | model calls recorded from typed payloads | yes — `tests/end_to_end.rs` |
 | prompts, subagents, compaction, `apply_patch` | yes |
 | same document shape as the shipped integrations | yes — see below |
-| a live session writes a manifest | **not yet run** — needs Relay installed |
+| a live session writes a manifest | yes — two Claude Code sessions |
+| a live session writes **file** lineage | **not yet** — see `docs/live-session-script.md` |
 
 ## The completeness bar, set by evidence
 
@@ -129,19 +130,42 @@ Three rules, each of which looks like over-thinking until the case that motivate
 
 **`(path, content)` is the dedup key; content alone is the identity.** The same bytes are one asset
 wherever they live — the path travels as metadata, which is the property
-`eqty-lineage-deepagents@0.2.0` shipped. But each path keeps its own version record, because keying
-versions on content alone would lose the fact that two files were touched.
+`eqty-lineage-deepagents@0.2.0` shipped. A file copied or moved is one node with two things said
+about it. But each path keeps its own version record, because keying versions on content alone would
+lose the fact that two files were touched.
+
+The exception is the identities below that have no content: `unknown:{path}` is path-derived because
+with no bytes there is nothing else to be identical about, and two files nobody read cannot be shown
+to be the same file.
 
 **There are three ways not to know, and they must not collapse.** A real content CID means we hold
 the bytes. `unknown:{path}` means we saw the path and never established its content. `deleted:{path}`
 means the file is gone. Merging the last two would let a deletion deduplicate against a failed read
 of the same path, and the graph would assert a removal nobody observed.
 
+`deleted:{path}` is **not reachable yet**: `FileMode` has only `Read` and `Wrote`, so nothing
+constructs it. A Codex `Delete File` currently records as a write whose content is unknown, which is
+a weaker and different claim. Claude Code has no delete tool at all — deletions go through `Bash`,
+where no file effect is observable in the first place.
+
 **Identity is computed before redaction, never after.** Two different secrets at one path scrub to
 the same placeholder; hashing what was stored rather than what was seen would merge them into one
 version. Content withheld by policy still becomes a node carrying its path and its true content CID —
-provenance does not require publication — and that node is deterministic across runs, so two
-recordings that both read the same secret join on it.
+provenance does not require publication — and that node is content-addressed on the true CID alone,
+so it is deterministic across runs *and* independent of where the file sat. Two recordings that read
+the same secret join on it whatever path each saw it at.
+
+## Running it against a live session
+
+`docs/live-session-script.md` is a twelve-turn script that drives every path this recorder can record
+today — file versions and the replay chain, partial reads, subagents, redaction, the size ceiling,
+non-UTF-8 content, a failing tool, and compaction — plus a verification block that prints `YES` or
+`MISSING` per capability.
+
+It exists because the first two live sessions reached for `Bash` almost exclusively and therefore
+exercised roughly a third of the recorder: no `Document` nodes, no subagents, and none of
+`ContentRecovered`, `ContentUnknown`, `Compaction` or `PayloadTooLarge`. Fixtures cover those; a real
+session had not.
 
 ## `src/lineage/` is written to be liftable
 
@@ -229,11 +253,24 @@ Note that `[integrity] sha256` is **NVIDIA's** artifact digest and has nothing t
 ## Installing into Relay
 
 ```bash
-nemo-relay plugins validate ./relay-plugin.toml
-nemo-relay plugins add --user ./relay-plugin.toml
+just nemo-relay-package                                            # stage dist/relay-plugin
+nemo-relay plugins validate ./dist/relay-plugin/relay-plugin.toml
+nemo-relay plugins add --user ./dist/relay-plugin/relay-plugin.toml
 nemo-relay plugins inspect eqty.lineage
 nemo-relay plugins enable  eqty.lineage
 ```
 
+**Install from the staged directory, never from this package.** Relay copies the whole directory
+containing `relay-plugin.toml` into an activation snapshot against a 512 MiB budget; from the package
+root that closure is `src/` + `tests/` + `target/` + `abi-test/target/`, and the gateway refuses to
+start citing an unrelated file. `just nemo-relay-package` stages a directory holding only the dylib,
+its signature and the config schema, and stamps the digest into the staged copy.
+
+**It also signs, and that is not optional.** `plugins add` evaluates trust with attestation
+defaulting to `integrity_only`, but every activation path hardens it to `signature_required` first —
+so an unsigned plugin installs cleanly, validates cleanly, and then will not start. The recipe prints
+the `[plugins.policy.overrides."eqty.lineage"]` block to paste into `plugins.toml`.
+
 `enable` changes lifecycle state only — it does not load code. Relay validates and loads enabled
-plugins when the gateway starts, so a change takes effect on the next sidecar start.
+plugins when the gateway starts, so a change takes effect on the next sidecar start. A clean
+`validate` is **not** an activation dry-run: it evaluates the un-hardened policy.
