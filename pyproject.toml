@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "eqty-lineage-langchain",
     "eqty-lineage-deepagents",
-    "eqty-lineage-openai-vnim",
+    "eqty-lineage-vnim",
 ]
 
 [dependency-groups]
@@ -28,7 +28,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 eqty-lineage-langchain = { workspace = true }
 eqty-lineage-deepagents = { workspace = true }
-eqty-lineage-openai-vnim = { workspace = true }
+eqty-lineage-vnim = { workspace = true }
 eqty-sdk = { index = "eqty" }
 
 [[tool.uv.index]]
@@ -43,7 +43,7 @@ explicit = true
 testpaths = [
     "packages/eqty-lineage-langchain/tests",
     "packages/eqty-lineage-deepagents/tests",
-    "packages/eqty-lineage-openai-vnim/tests",
+    "packages/eqty-lineage-vnim/tests",
 ]
 
 [tool.mypy]

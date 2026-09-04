@@ -5,7 +5,7 @@ By default this connects to a local SSH-tunnel sidecar:
     uv run python examples/langchain/eqty_vnim_agent.py
 
 Set ``OPENAI_API_KEY`` when the VNIM deployment requires one. Each complete response
-retrieves the server-side integrity manifest through ``ChatEqtyOpenAI``; the response
+retrieves the server-side integrity manifest through ``ChatEqtyVnimOpenAI``; the response
 bytes themselves are never reconstructed.
 """
 
@@ -24,7 +24,7 @@ from eqty_sdk import CID, Context, Signer, init, set_active_signer
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from eqty_lineage.langchain import EqtyCallbackHandler
-from eqty_lineage.openai import ChatEqtyOpenAI
+from eqty_lineage.vnim import ChatEqtyVnimOpenAI
 
 
 DEFAULT_MODEL = "nvidia/llama-3.1-nemotron-nano-8b-v1"
@@ -164,7 +164,7 @@ def export_bundle(context: Context, path: Path, vnim_manifest: dict[str, Any] | 
 
 
 def run_agent(
-    model: ChatEqtyOpenAI, prompt: str, handler: EqtyCallbackHandler, thread_id: str
+    model: ChatEqtyVnimOpenAI, prompt: str, handler: EqtyCallbackHandler, thread_id: str
 ) -> tuple[AIMessage, dict[str, Any] | None]:
     """Run the one-shot travel-planning agent and report manifest retrieval status."""
     messages: list[BaseMessage] = [
@@ -233,7 +233,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     init_sdk(args.root_context_id)
-    model = ChatEqtyOpenAI(
+    model = ChatEqtyVnimOpenAI(
         model=args.model,
         base_url=args.base_url,
         # A local tunnel may not require authentication, but the OpenAI client requires a value.

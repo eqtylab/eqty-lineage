@@ -8,7 +8,7 @@ integration lives under `packages/` as its own distribution sharing the
 | --- | --- | --- |
 | `eqty-lineage-langchain` | `eqty_lineage.langchain` | Callback handler registering LangChain/LangGraph runs as EQTY lineage |
 | `eqty-lineage-deepagents` | `eqty_lineage.deepagents` | The same, extended with a deep agent's filesystem, plan, subagents and skills |
-| `eqty-lineage-openai-vnim` | `eqty_lineage.openai` | `ChatOpenAI` implementation for working with LLM's in Eqty's vNIM|
+| `eqty-lineage-vnim` | `eqty_lineage.vnim` | `ChatOpenAI` implementation for working with LLMs in EQTY vNIM |
 
 Future integrations (e.g. `eqty-lineage-mcp`, `eqty-lineage-llamaindex`) follow
 the same pattern. Because `eqty_lineage` is an implicit namespace package, no

@@ -3,8 +3,8 @@ requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "eqty-lineage-openai-vnim"
-version = "0.0.0"
+name = "eqty-lineage-vnim"
+version = "0.1.0rc1"
 description = "LangChain chat model client for EQTY VNIM's OpenAI-compatible API."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,4 +15,4 @@ dependencies = [
 
 [tool.uv.build-backend]
 module-root = ""
-module-name = "eqty_lineage.openai"
+module-name = "eqty_lineage.vnim"

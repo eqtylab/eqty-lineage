@@ -5,6 +5,7 @@ import logging
 import time
 from copy import deepcopy
 from collections.abc import Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -33,27 +34,39 @@ class IntegrityManifestResult:
     duration_ms: int = 0
 
 
-class ChatEqtyOpenAI(ChatOpenAI):
-    """ChatOpenAI client for EQTY VNIM models and their integrity manifests."""
+class ChatEqtyVnimOpenAI(ChatOpenAI):
+    """Streaming ChatOpenAI client for EQTY VNIM models and their integrity manifests.
+
+    ``streaming`` is enabled by default because vNIM's request ID is available on a streamed response
+    header. ``last_integrity_result`` and ``last_request_payload`` are scoped to the current thread or
+    async task, so callers sharing a model instance must read them from the same invocation context.
+    """
 
     streaming: bool = True
     include_response_headers: bool = True
     manifest_base_url: str | None = Field(default_factory=from_env("VNIM_INTEGRITY_BASE_URL", default=None))
-    _last_integrity_result: IntegrityManifestResult | None = PrivateAttr(default=None)
-    _last_request_payload: dict[str, Any] | None = PrivateAttr(default=None)
+    _last_integrity_result: ContextVar[IntegrityManifestResult | None] = PrivateAttr(
+        default_factory=lambda: ContextVar("last_integrity_result", default=None)
+    )
+    _last_request_payload: ContextVar[dict[str, Any] | None] = PrivateAttr(
+        default_factory=lambda: ContextVar("last_request_payload", default=None)
+    )
 
     @property
     def last_integrity_result(self) -> IntegrityManifestResult | None:
-        """Manifest retrieval result for the most recently completed invocation."""
-        return self._last_integrity_result
+        """Manifest retrieval result for this thread or async task's most recent invocation."""
+        return self._last_integrity_result.get()
 
     @property
     def last_request_payload(self) -> dict[str, Any] | None:
         """The exact OpenAI-compatible request payload handed to the upstream client."""
-        return deepcopy(self._last_request_payload)
+        payload = self._last_request_payload.get()
+        return deepcopy(payload) if payload is not None else None
 
     @model_validator(mode="after")
     def _require_response_headers_for_integrity(self) -> Self:
+        if "include_response_headers" in self.model_fields_set and not self.include_response_headers:
+            logger.warning("include_response_headers=False is ignored because vNIM integrity retrieval requires it")
         self.include_response_headers = True
         return self
 
@@ -74,7 +87,11 @@ class ChatEqtyOpenAI(ChatOpenAI):
                 return UUID(str(value)), None
             except (TypeError, ValueError, AttributeError):
                 return None, "X-EQTY-Request-ID is not a valid UUID"
-        logger.info("eqty_vnim.request_id_headers response_metadata=%s generation_info=%s", request_id_values[0], request_id_values[1])
+        logger.info(
+            "eqty_vnim.request_id_headers response_metadata=%s generation_info=%s",
+            request_id_values[0],
+            request_id_values[1],
+        )
         return None, None
 
     def _fetch_integrity_manifest(self, request_id: UUID) -> IntegrityManifestResult:
@@ -88,35 +105,92 @@ class ChatEqtyOpenAI(ChatOpenAI):
                 response = httpx.get(url, timeout=10.0)
             except httpx.HTTPError as error:
                 duration_ms = round((time.monotonic() - started) * 1000)
-                logger.warning("eqty_integrity_manifest.fetch_failed request_id=%s attempts=%d duration_ms=%d error=%s", request_id, attempts, duration_ms, type(error).__name__)
-                return IntegrityManifestResult(request_id=request_id, error=f"manifest request failed: {type(error).__name__}", attempts=attempts, duration_ms=duration_ms)
+                logger.warning(
+                    "eqty_integrity_manifest.fetch_failed request_id=%s attempts=%d duration_ms=%d error=%s",
+                    request_id,
+                    attempts,
+                    duration_ms,
+                    type(error).__name__,
+                )
+                return IntegrityManifestResult(
+                    request_id=request_id,
+                    error=f"manifest request failed: {type(error).__name__}",
+                    attempts=attempts,
+                    duration_ms=duration_ms,
+                )
             status, duration_ms = response.status_code, round((time.monotonic() - started) * 1000)
-            logger.info("eqty_integrity_manifest.fetch request_id=%s attempt=%d status=%d duration_ms=%d", request_id, attempts, status, duration_ms)
+            logger.info(
+                "eqty_integrity_manifest.fetch request_id=%s attempt=%d status=%d duration_ms=%d",
+                request_id,
+                attempts,
+                status,
+                duration_ms,
+            )
             if 200 <= status < 300:
                 try:
                     manifest = response.json()
                 except (ValueError, json.JSONDecodeError):
-                    return IntegrityManifestResult(request_id=request_id, fetch_status=status, error="manifest response is not valid JSON", attempts=attempts, duration_ms=duration_ms)
+                    return IntegrityManifestResult(
+                        request_id=request_id,
+                        fetch_status=status,
+                        error="manifest response is not valid JSON",
+                        attempts=attempts,
+                        duration_ms=duration_ms,
+                    )
                 if not isinstance(manifest, dict):
-                    return IntegrityManifestResult(request_id=request_id, fetch_status=status, error="manifest response must be a JSON object", attempts=attempts, duration_ms=duration_ms)
+                    return IntegrityManifestResult(
+                        request_id=request_id,
+                        fetch_status=status,
+                        error="manifest response must be a JSON object",
+                        attempts=attempts,
+                        duration_ms=duration_ms,
+                    )
                 statements, blobs = manifest.get("statements"), manifest.get("blobs")
-                logger.info("eqty_integrity_manifest.received request_id=%s attempts=%d status=%d duration_ms=%d statements=%d blobs=%d", request_id, attempts, status, duration_ms, len(statements) if isinstance(statements, (dict, list)) else 0, len(blobs) if isinstance(blobs, (dict, list)) else 0)
-                return IntegrityManifestResult(request_id=request_id, manifest=manifest, fetch_status=status, attempts=attempts, duration_ms=duration_ms)
+                logger.info(
+                    "eqty_integrity_manifest.received request_id=%s attempts=%d status=%d duration_ms=%d statements=%d blobs=%d",
+                    request_id,
+                    attempts,
+                    status,
+                    duration_ms,
+                    len(statements) if isinstance(statements, (dict, list)) else 0,
+                    len(blobs) if isinstance(blobs, (dict, list)) else 0,
+                )
+                return IntegrityManifestResult(
+                    request_id=request_id,
+                    manifest=manifest,
+                    fetch_status=status,
+                    attempts=attempts,
+                    duration_ms=duration_ms,
+                )
             if status != 404:
-                return IntegrityManifestResult(request_id=request_id, fetch_status=status, error=f"manifest request returned HTTP {status}", attempts=attempts, duration_ms=duration_ms)
+                return IntegrityManifestResult(
+                    request_id=request_id,
+                    fetch_status=status,
+                    error=f"manifest request returned HTTP {status}",
+                    attempts=attempts,
+                    duration_ms=duration_ms,
+                )
             remaining = 45.0 - (time.monotonic() - started)
             if remaining <= 0:
-                return IntegrityManifestResult(request_id=request_id, fetch_status=status, error="manifest was not available within 45 seconds", attempts=attempts, duration_ms=duration_ms)
+                return IntegrityManifestResult(
+                    request_id=request_id,
+                    fetch_status=status,
+                    error="manifest was not available within 45 seconds",
+                    attempts=attempts,
+                    duration_ms=duration_ms,
+                )
             time.sleep(min(3.0, remaining))
 
-    def _finish_integrity_result(self, request_id: UUID | None, header_error: str | None = None) -> IntegrityManifestResult:
+    def _finish_integrity_result(
+        self, request_id: UUID | None, header_error: str | None = None
+    ) -> IntegrityManifestResult:
         if header_error:
             result = IntegrityManifestResult(request_id=None, error=header_error)
         elif request_id is None:
             result = IntegrityManifestResult(request_id=None, error="X-EQTY-Request-ID header was not received")
         else:
             result = self._fetch_integrity_manifest(request_id)
-        self._last_integrity_result = result
+        self._last_integrity_result.set(result)
         return result
 
     @staticmethod
@@ -133,12 +207,12 @@ class ChatEqtyOpenAI(ChatOpenAI):
     def _get_request_payload(self, *args: Any, **kwargs: Any) -> dict:
         """Retain the finalized payload so it can be registered as the vNIM request input."""
         payload = super()._get_request_payload(*args, **kwargs)
-        self._last_request_payload = deepcopy(payload)
+        self._last_request_payload.set(deepcopy(payload))
         return payload
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         """Preserve the upstream SSE stream and enrich only its final parsed chunk."""
-        self._last_integrity_result = None
+        self._last_integrity_result.set(None)
         request_id, header_error, pending = None, None, None
         try:
             for chunk in super()._stream(*args, **kwargs):
@@ -148,10 +222,16 @@ class ChatEqtyOpenAI(ChatOpenAI):
                     yield pending
                 pending = chunk
         except Exception:
-            self._last_integrity_result = IntegrityManifestResult(request_id=request_id, error="upstream stream did not complete")
+            if pending is not None:
+                yield pending
+            self._last_integrity_result.set(
+                IntegrityManifestResult(request_id=request_id, error="upstream stream did not complete")
+            )
             raise
         if pending is None:
-            self._last_integrity_result = IntegrityManifestResult(request_id=None, error="upstream stream produced no chunks")
+            self._last_integrity_result.set(
+                IntegrityManifestResult(request_id=None, error="upstream stream produced no chunks")
+            )
             return
         result = self._finish_integrity_result(request_id, header_error)
         self._attach_integrity_metadata(pending, result)
@@ -159,8 +239,14 @@ class ChatEqtyOpenAI(ChatOpenAI):
             pending.message.chunk_position = "last"
         yield pending
 
-    def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None, run_manager: CallbackManagerForLLMRun | None = None, **kwargs: Any) -> ChatResult:
-        self._last_integrity_result = None
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        self._last_integrity_result.set(None)
         result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         if result.generations:
             generation = result.generations[0]

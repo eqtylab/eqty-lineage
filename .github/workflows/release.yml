@@ -52,8 +52,8 @@ jobs:
           package="${RELEASE_TAG%@*}"
           version="${RELEASE_TAG##*@}"
 
-          if [[ "$package" == "$RELEASE_TAG" || "$package" == *"@"* || "$version" == *"@"* || ! "$package" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "Release tag must use PACKAGE@MAJOR.MINOR.PATCH format (for example, eqty-lineage-langchain@1.2.3): $RELEASE_TAG" >&2
+          if [[ "$package" == "$RELEASE_TAG" || "$package" == *"@"* || "$version" == *"@"* || ! "$package" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)((a|b|rc)[1-9][0-9]*)?$ ]]; then
+            echo "Release tag must use PACKAGE@MAJOR.MINOR.PATCH or a PEP 440 prerelease suffix (for example, eqty-lineage-vnim@0.1.0rc1): $RELEASE_TAG" >&2
             exit 1
           fi
 

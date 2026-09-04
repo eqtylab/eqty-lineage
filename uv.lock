@@ -13,7 +13,7 @@ members = [
     "eqty-lineage",
     "eqty-lineage-deepagents",
     "eqty-lineage-langchain",
-    "eqty-lineage-openai-vnim",
+    "eqty-lineage-vnim",
 ]
 
 [[package]]
@@ -375,7 +375,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "eqty-lineage-deepagents" },
     { name = "eqty-lineage-langchain" },
-    { name = "eqty-lineage-openai-vnim" },
+    { name = "eqty-lineage-vnim" },
 ]
 
 [package.dev-dependencies]
@@ -390,7 +390,7 @@ dev = [
 requires-dist = [
     { name = "eqty-lineage-deepagents", editable = "packages/eqty-lineage-deepagents" },
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
-    { name = "eqty-lineage-openai-vnim", editable = "packages/eqty-lineage-openai-vnim" },
+    { name = "eqty-lineage-vnim", editable = "packages/eqty-lineage-vnim" },
 ]
 
 [package.metadata.requires-dev]
@@ -434,9 +434,9 @@ requires-dist = [
 ]
 
 [[package]]
-name = "eqty-lineage-openai-vnim"
-version = "0.0.0"
-source = { editable = "packages/eqty-lineage-openai-vnim" }
+name = "eqty-lineage-vnim"
+version = "0.1.0rc1"
+source = { editable = "packages/eqty-lineage-vnim" }
 dependencies = [
     { name = "httpx" },
     { name = "langchain-openai" },
