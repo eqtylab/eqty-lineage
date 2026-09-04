@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "eqty-lineage-langchain",
     "eqty-lineage-deepagents",
+    "eqty-lineage-openai-vnim",
 ]
 
 [dependency-groups]
@@ -27,6 +28,7 @@ members = ["packages/*"]
 [tool.uv.sources]
 eqty-lineage-langchain = { workspace = true }
 eqty-lineage-deepagents = { workspace = true }
+eqty-lineage-openai-vnim = { workspace = true }
 eqty-sdk = { index = "eqty" }
 
 [[tool.uv.index]]
@@ -38,7 +40,11 @@ explicit = true
 [tool.pytest.ini_options]
 # Anchors rootdir at the workspace root, so the shared `sdk` fixture in the root conftest.py stays in
 # scope even when pytest is invoked from inside one package's directory.
-testpaths = ["packages/eqty-lineage-langchain/tests", "packages/eqty-lineage-deepagents/tests"]
+testpaths = [
+    "packages/eqty-lineage-langchain/tests",
+    "packages/eqty-lineage-deepagents/tests",
+    "packages/eqty-lineage-openai-vnim/tests",
+]
 
 [tool.mypy]
 python_executable = ".venv/bin/python"

@@ -96,6 +96,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         verbose: bool = False,
         *,
         integrity_service_url: Optional[str] = None,
+        defer_chat_model_computations: bool = False,
     ) -> None:
         # when True, extra metadata is attached to the registered EQTY assets
         self.verbose = verbose
@@ -105,6 +106,10 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._context = self._root_context
         # Registration is opt-in. Service.new resolves its credentials exclusively from EQTY_API_KEY.
         self._service = Service.new(integrity_service_url) if integrity_service_url else None
+        # An integration that has separately attested transport evidence (such as EQTY vNIM) can
+        # replace the default Prompt+Model -> Reasoning statement with explicit transport stages.
+        self._defer_chat_model_computations = defer_chat_model_computations
+        self._completed_chat_models: List[Dict[str, Any]] = []
         if self.verbose:
             logger.info("EqtyCallbackHandler verbose node metadata enabled")
         # guards every mutation below; see _synchronized
@@ -792,10 +797,44 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
         )
 
-        self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
+        if self._defer_chat_model_computations:
+            self._completed_chat_models.append(
+                {"name": run["name"], "inputs": run["inputs"], "output": output.cid}
+            )
+        else:
+            self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
 
         if run["node"] is not None:
             run["node"].setdefault("child_outputs", []).append(output.cid)
+
+    @_synchronized
+    def register_external_chat_transport(self, request_cid: CID, response_cid: CID, *, name: str) -> None:
+        """Replace one deferred chat-model computation with explicit, independently attested transport stages.
+
+        ``request_cid`` and ``response_cid`` must identify evidence created by the external service.
+        The three locally signed computations state only that this application serialized the model
+        input, invoked that external service, and processed its response; they do not alter or re-sign
+        the external service's manifest.
+        """
+        if not self._defer_chat_model_computations:
+            raise RuntimeError("external chat transport requires defer_chat_model_computations=True")
+        if len(self._completed_chat_models) != 1:
+            raise RuntimeError(
+                "external chat transport requires exactly one completed deferred chat-model run; "
+                f"found {len(self._completed_chat_models)}"
+            )
+
+        run = self._completed_chat_models.pop()
+        self._finalize(f"{name}: request", "external_request", run["inputs"], [request_cid])
+        self._finalize(name, "external_inference", [request_cid], [response_cid])
+        self._finalize(f"{name}: response", "external_response", [response_cid], [run["output"]])
+
+    @_synchronized
+    def finalize_deferred_chat_models(self) -> None:
+        """Record ordinary lineage for deferred calls that produced no external transport evidence."""
+        while self._completed_chat_models:
+            run = self._completed_chat_models.pop()
+            self._finalize(run["name"], "chat_model", run["inputs"], [run["output"]])
 
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
