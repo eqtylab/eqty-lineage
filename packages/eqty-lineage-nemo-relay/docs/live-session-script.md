@@ -339,7 +339,9 @@ notes.md   v1 stated(17)
 
 ## Running it against Codex
 
-**Run, and it works** — with one finding that matters more than the rest.
+**Run, and it works.** Four things came out of doing it that are worth more than the runs: Codex has
+no read tool, both `apply_patch` branches record correctly, the replay chain reaches its first live
+use here, and a `-c` in the wrong place silently disables recording entirely.
 
 Codex has two paths, and they exercise different things. **`codex exec` gives each invocation its own
 session**, so a file written by one run and changed by another crosses a session boundary — which is
@@ -399,11 +401,17 @@ Delete report.md
 Currently recorded as a write with unknown content — `FileMode` has no `Deleted` variant, so the
 tombstone identity documented in `recorder.rs` is unreachable.
 
-**6.** `/compact` if Codex offers it, then exit cleanly.
+**6.** Exit cleanly. There is no `/compact` on Codex — compaction is reached by shrinking the
+context window instead, which has its own recipe below.
 
-**Before exiting, check a manifest already exists.** Codex has no `SessionEnd`, so the final export
-runs from `Drop`. A checkpoint appearing mid-session is the evidence that a killed Codex session
-would still leave a recording.
+**Before exiting, check a manifest already exists**, which shows checkpointing is working. Codex has
+no `SessionEnd`, so the final export runs from `Drop`.
+
+**A killed session still records.** Measured, rather than inferred from the checkpoint: a session
+`SIGTERM`ed 25 seconds in, after writing three files, left a manifest with 84 statements,
+`FileWritten: 3`, all three files `stored` — **and a coverage node**, so that was the final export
+rather than a surviving checkpoint. Relay tears the process group down cleanly and `Drop` runs. A
+`SIGKILL` would not give it that chance, and the last checkpoint is what you would get instead.
 
 ### Codex, one-shot
 
@@ -417,6 +425,8 @@ nemo-relay run -- codex exec "Change line 2 of report.md from 'two' to 'TWO'. Th
 
 `--sandbox workspace-write` is what lets it write at all; `--skip-git-repo-check` is only needed
 because `/tmp` is not a repository. Relay requires codex-cli >= 0.143.0.
+
+Neither command passes `-c`, which is deliberate — see the `-c` rule below before adding one.
 
 ### What the two runs established
 
