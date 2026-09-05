@@ -458,7 +458,102 @@ indistinguishable from the file never having been touched.
 Claude Code's version of this gap is "the agent sometimes chooses `Bash`". Codex's is "there is no
 other option" — it has no read tool. That is the strongest case for the upstream proposal.
 
+### Codex subagents
+
+Codex delegates when asked, and it is recorded. `multi_agent` is a stable feature and on by default;
+`codex features list | grep multi_agent` confirms it for a given install.
+
+```bash
+rm -rf /tmp/relay-cxsub && mkdir -p /tmp/relay-cxsub && cd /tmp/relay-cxsub
+printf 'alpha\nbeta\ngamma\n' > notes.md
+
+nemo-relay run -- codex exec "Delegate to a subagent: have it read notes.md and report how many lines it has. Use a subagent for this rather than doing it yourself." --sandbox workspace-write --skip-git-repo-check
+```
+
+Result:
+
+```
+agents  : ['codex', 'default']
+tools   : ['Bash', 'spawn_agent', 'multi_agent_v1wait_agent']
+coverage: {'Activity': 3, 'Agent': 2, 'Model': 1, 'ModelCall': 6, 'Tool': 3,
+           'ToolCallWithoutFileObservation': 3}
+```
+
+The subagent is its own actor, named `default` — Codex's agent type, arriving through the same
+`agent_type` metadata that yields `Explore` on Claude Code, so the naming needs nothing host-specific.
+Codex's delegation tools show up as ordinary tool scopes beside Relay's synthesized `agent` scope;
+both are recorded, and they are two views of one delegation rather than two delegations.
+
+### A `-c` after `exec` silently disables recording
+
+**Read this before the compaction recipe, which needs a config override and is where it bites.**
+
+```
+nemo-relay run -- codex -c key=value exec "..."     hooks 6    manifest written
+nemo-relay run -- codex exec "..." -c key=value     hooks 0    nothing at all
+```
+
+Any `-c`, not just the one below — `model_reasoning_effort=low` does it too. Codex runs perfectly:
+correct output, exit 0, files written as asked. The only casualty is the instrumentation, and
+nothing anywhere says so.
+
+Relay injects its own config immediately after `codex`, at the top level, in
+`agents/codex/launch.rs`:
+
+```rust
+let mut args = vec![
+    "--config", "features.hooks=true",
+    "--config", "model_provider=\"nemo-relay-openai\"",
+    // ... plus one --config per hook event ...
+];
+insert_after_host(&mut launch.argv, launch.host_index, args);
+```
+
+A `-c` at the `exec` level shadows those rather than merging with them, taking `features.hooks=true`
+and every `hooks.*` override with it. No hooks register, so no events reach the subscriber, so there
+is no session to export.
+
+**Put every config override before the subcommand.** A run that produces no manifest while Codex
+looks entirely happy is this, until proven otherwise.
+
+### Codex compaction
+
+There is no `/compact` and no flag: compaction happens when the context window fills, so the lever is
+to shrink the window. Note where the flag goes.
+
+```bash
+rm -rf /tmp/relay-cxc && mkdir -p /tmp/relay-cxc && cd /tmp/relay-cxc
+python3 -c "
+words = ['provenance','manifest','lineage','statement','credential','attestation']
+open('doc.txt','w').write('\n'.join(' '.join(words[(i+j) % len(words)] for j in range(10)) for i in range(150)) + '\n')
+"
+
+nemo-relay run -- codex -c model_context_window=8000 exec "Read doc.txt with cat, then tell me its last word." --sandbox workspace-write --skip-git-repo-check
+```
+
+Result:
+
+```
+hooks 26, and Codex logged 'context compacted' twice
+coverage: {'Activity': 2, 'Agent': 1, 'Compaction': 4, 'Model': 1, 'ModelCall': 5,
+           'Tool': 1, 'ToolCallWithoutFileObservation': 2}
+```
+
+**`Compaction` counts compaction *events*, not compactions.** Relay forwards `PreCompact` and
+`PostCompact`, and both classify as `Compacted`, so two compactions read as four. Consistent with how
+the counter is defined, and misleading if you expect otherwise.
+
+**Match the file to the window.** 15 KB against 8000 tokens compacts twice and finishes inside a
+minute. An earlier attempt used 36 KB against 6000, compacted nine times in three and a half minutes
+and still had not finished — Codex kept re-reading and re-compacting until it found a cheaper
+approach. That is real spend on a real account: raise the window or shrink the file if a run passes a
+couple of minutes.
+
 ### What still has not fired on Codex
+
+Subagents and compaction both do now — see above. What is left is `PermissionDecision`, which is
+classified on both hosts and is a graph node on neither.
+
 
 `ContentRecovered` did not fire in either one-shot run, and cannot: the replay chain needs prior
 known content for that path in the *same* session, and `codex exec` gives each run its own. Turn 2 of
