@@ -174,6 +174,9 @@ Two turns Path B cannot drive, because they are interactive slash commands with 
 
 ## Turns
 
+**For Claude Code.** Codex has its own list further down, and they are not interchangeable — each
+names tools the other host does not have.
+
 Verbatim, in order. These are exactly the strings the driver in Path B sends, so both paths exercise
 the same thing — send them one at a time and let each finish.
 
@@ -351,6 +354,12 @@ printf 'alpha\nbeta\ngamma\n' > notes.md
 printf 'SECRET_KEY=do-not-record-me\n' > .env
 nemo-relay run -- codex
 ```
+
+**Use these turns, not the ones above.** The Claude Code turns name `Write`, `Read`, `Edit` and
+`Task`; Codex has none of them. Sending "Use the Write tool to create report.md" makes Codex spend a
+turn discovering the tool does not exist before falling back to `apply_patch` — the file still gets
+written, but the run carries two extra shell probes that are an artefact of the wrong prompt rather
+than anything about the recorder.
 
 Then send these verbatim, one at a time. Codex has **no read tool**, so it will reach for `sed`,
 `awk` or `rg` on anything that reads — that is the point of turns 3 and 4, not a mistake in them.
