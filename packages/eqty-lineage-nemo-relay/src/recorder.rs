@@ -122,7 +122,11 @@ impl Recorder {
             && let Some(previous) = self.last_content.get(&path)
         {
             let previous = String::from_utf8_lossy(previous).into_owned();
-            if let Some(replayed) = apply_edit(
+            // An edit that cannot promise its own uniqueness must find exactly one match, or the
+            // replay is a guess about which occurrence the tool meant.
+            if edit.unique_only && previous.matches(&edit.old).count() != 1 {
+                self.count("EditTooAmbiguousToReplay");
+            } else if let Some(replayed) = apply_edit(
                 Some(&previous),
                 Some(&edit.old),
                 Some(&edit.new),

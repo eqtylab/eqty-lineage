@@ -234,3 +234,60 @@ fn an_untruncated_read_still_carries_its_content() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].content.as_deref(), Some(&b"hello\n"[..]));
 }
+
+#[test]
+fn an_update_hunk_becomes_a_replayable_edit() {
+    // The post-image is never in an `apply_patch` update, so before this the node was always
+    // identity-only. But the hunk is exactly the pair `apply_edit` takes, and on Codex `Update File`
+    // is how every edit arrives -- so every Codex edit recorded a file whose content we declined to
+    // work out despite holding everything needed.
+    let patch = "*** Begin Patch\n\
+                 *** Update File: /work/report.md\n\
+                 @@\n\
+                 one\n\
+                 -two\n\
+                 +TWO\n\
+                 three\n\
+                 *** End Patch";
+    let events = file_events_from_patch(patch, Some("call-1"));
+    assert_eq!(events.len(), 1);
+    let edit = events[0].edit.as_ref().expect("the hunk is an edit");
+    assert_eq!(events[0].path, "/work/report.md");
+    assert_eq!(
+        events[0].content, None,
+        "the post-image is still not stated"
+    );
+    assert!(
+        edit.old.contains("two") && edit.new.contains("TWO"),
+        "the halves carry the change: {edit:?}"
+    );
+
+    assert!(
+        edit.unique_only,
+        "a patch hunk carries no promise of uniqueness, so the replay must demand one"
+    );
+
+    // Against a pre-image where the removed text occurs once, the replay is exact.
+    let replayed = apply_edit(
+        Some("one\ntwo\nthree\n"),
+        Some(&edit.old),
+        Some(&edit.new),
+        edit.replace_all,
+    );
+    assert_eq!(replayed.as_deref(), Some("one\nTWO\nthree\n"));
+}
+
+#[test]
+fn a_context_free_hunk_stays_identity_only() {
+    // Without context or removals there is nothing to anchor a literal replacement against, and
+    // guessing would content-address a state the file may never have had.
+    let patch = "*** Begin Patch\n\
+                 *** Update File: /work/report.md\n\
+                 @@\n\
+                 +appended\n\
+                 *** End Patch";
+    let events = file_events_from_patch(patch, Some("call-2"));
+    assert_eq!(events.len(), 1);
+    assert!(events[0].edit.is_none(), "no anchor, no replay");
+    assert_eq!(events[0].content, None);
+}

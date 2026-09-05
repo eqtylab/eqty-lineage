@@ -716,12 +716,32 @@ async fn checkpoint(state: &mut SessionState) {
 
 fn export(runtime: &tokio::runtime::Runtime, state: SessionState) {
     let dropped = state.dropped_events;
-    let path = state.path.clone();
+    // A session that never registered an agent is not a session anyone ran.
+    //
+    // Codex issues an ancillary model call to title the conversation, through a different provider
+    // and under a session id of its own, so one interactive session produced two manifests: 432
+    // statements of work, and 20 statements holding `{"title":"Create report.md"}`. Counting
+    // manifests to count sessions gets the wrong answer, and the fragment attests a model call
+    // performed by nobody -- it has no agent, so every computation in it lacks `performedBy`.
+    //
+    // It is still written, under a name that says what it is. Dropping it would lose a real model
+    // call, and would silently record nothing at all if a host ever stopped emitting
+    // `session.start` -- the failure this recorder is least willing to have.
+    let path = if state.agent.is_none() {
+        state.path.with_extension("unattributed.json")
+    } else {
+        state.path.clone()
+    };
+    let checkpoint = state.path.clone();
     let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
         return;
     };
     let _ = dropped;
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
         write_atomically(&path, &json);
+        // The checkpoints went to the session-shaped name before we knew this was a fragment.
+        if path != checkpoint {
+            let _ = std::fs::remove_file(&checkpoint);
+        }
     }
 }

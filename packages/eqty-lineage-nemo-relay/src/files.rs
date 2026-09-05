@@ -40,6 +40,14 @@ pub struct EditAttempt {
     pub old: String,
     pub new: String,
     pub replace_all: bool,
+    /// Refuse the replay unless `old` occurs exactly once.
+    ///
+    /// Claude Code's `Edit` guarantees its own uniqueness -- the tool errors when `old_string`
+    /// matches more than once and `replace_all` is unset -- so a first-occurrence replacement there
+    /// is the edit that happened. A Codex `apply_patch` hunk carries no such promise: the real patch
+    /// that prompted this was `-two` / `+TWO` with no context lines at all, and replacing the first
+    /// `two` in a file containing several would content-address a version the file never had.
+    pub unique_only: bool,
 }
 
 /// One observed file version.
@@ -107,6 +115,13 @@ pub fn apply_edit(
 pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<FileObserved> {
     let mut events = Vec::new();
     let mut adding: Option<(String, Vec<String>)> = None;
+    // An update in progress: its path, and the before/after halves of its hunks.
+    //
+    // A patch hunk is exactly the pair `apply_edit` wants. Context lines belong in both halves, so
+    // the replacement is anchored rather than matching the first bare occurrence of a changed line
+    // -- `-two` alone would match the word anywhere in the file, and `apply_edit` replaces
+    // literally.
+    let mut updating: Option<(String, Vec<String>, Vec<String>)> = None;
 
     let flush = |adding: &mut Option<(String, Vec<String>)>, events: &mut Vec<FileObserved>| {
         if let Some((path, lines)) = adding.take() {
@@ -128,23 +143,73 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
     for line in patch.lines() {
         if let Some(path) = line.strip_prefix("*** Add File: ") {
             flush(&mut adding, &mut events);
+            flush_update(&mut updating, &mut events, tool_use_id);
             adding = Some((path.trim().to_string(), Vec::new()));
         } else if let Some(path) = line.strip_prefix("*** Update File: ") {
             flush(&mut adding, &mut events);
-            events.push(identity_only(path.trim(), FileMode::Wrote, tool_use_id));
+            flush_update(&mut updating, &mut events, tool_use_id);
+            updating = Some((path.trim().to_string(), Vec::new(), Vec::new()));
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
             flush(&mut adding, &mut events);
+            flush_update(&mut updating, &mut events, tool_use_id);
             events.push(identity_only(path.trim(), FileMode::Wrote, tool_use_id));
         } else if line.starts_with("*** End Patch") {
             flush(&mut adding, &mut events);
+            flush_update(&mut updating, &mut events, tool_use_id);
         } else if let Some((_, lines)) = adding.as_mut()
             && let Some(added) = line.strip_prefix('+')
         {
             lines.push(added.to_string());
+        } else if let Some((_, before, after)) = updating.as_mut() {
+            // `@@` headers carry no content. Everything else is a context, removed or added line.
+            if let Some(removed) = line.strip_prefix('-') {
+                before.push(removed.to_string());
+            } else if let Some(added) = line.strip_prefix('+') {
+                after.push(added.to_string());
+            } else if let Some(context) = line.strip_prefix(' ') {
+                before.push(context.to_string());
+                after.push(context.to_string());
+            }
         }
     }
     flush(&mut adding, &mut events);
+    flush_update(&mut updating, &mut events, tool_use_id);
     events
+}
+
+/// Emit an update, as a replayable edit when its hunks permit one.
+///
+/// The post-image is never in the patch, so the node is identity-only unless the session already
+/// established this path's content -- which `observe_file` checks, and refuses when the `old` half
+/// does not occur in what it holds. That refusal is the safety: a hunk that does not match what we
+/// think the file contained means our belief is stale, and inventing a version from it would
+/// content-address a state the file never had.
+fn flush_update(
+    updating: &mut Option<(String, Vec<String>, Vec<String>)>,
+    events: &mut Vec<FileObserved>,
+    tool_use_id: Option<&str>,
+) {
+    let Some((path, before, after)) = updating.take() else {
+        return;
+    };
+    // Nothing to anchor against, so nothing to replay from.
+    if before.is_empty() || before == after {
+        events.push(identity_only(&path, FileMode::Wrote, tool_use_id));
+        return;
+    }
+    events.push(FileObserved {
+        path,
+        content: None,
+        mode: FileMode::Wrote,
+        tool_use_id: tool_use_id.map(str::to_string),
+        user_modified: false,
+        edit: Some(EditAttempt {
+            old: before.join("\n"),
+            new: after.join("\n"),
+            replace_all: false,
+            unique_only: true,
+        }),
+    });
 }
 
 /// A file we know was touched and whose content we could not establish.
@@ -310,6 +375,8 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
             old: old.to_string(),
             new: new.to_string(),
             replace_all,
+            // The tool guarantees its own uniqueness; see `EditAttempt::unique_only`.
+            unique_only: false,
         }),
         _ => None,
     };

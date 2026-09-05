@@ -1389,3 +1389,33 @@ fn a_tool_call_that_saw_no_files_says_so() {
         "a run that observed no files must record that it observed none:\n{decoded}"
     );
 }
+
+#[test]
+fn a_session_with_no_agent_is_not_counted_as_one() {
+    // Codex issues an ancillary model call to title the conversation, under a session id of its own.
+    // One interactive session therefore produced two manifests: 432 statements of work, and 20
+    // holding `{"title":"Create report.md"}`. Counting manifests to count sessions gets the wrong
+    // answer, and the fragment attests a model call performed by nobody.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000092";
+
+    // A model call and nothing else -- no `session.start`, so no agent is ever registered.
+    let events = one_model_call(
+        session,
+        "openai.responses",
+        serde_json::json!([{ "role": "user", "content": "title this conversation" }]),
+        "{\"title\":\"Create report.md\"}",
+    );
+    replay(&events, &into);
+
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "the call is still recorded, not dropped");
+    let name = written[0]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(
+        name.ends_with(".unattributed.json"),
+        "a manifest with no agent must say so in its name, got {name}"
+    );
+}

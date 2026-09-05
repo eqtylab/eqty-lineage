@@ -154,6 +154,7 @@ async fn an_edit_is_replayed_against_what_the_session_already_knows() {
         old: "x = 1".into(),
         new: "x = 2".into(),
         replace_all: false,
+        unique_only: false,
     });
     rec.observe_file(&edit, true, None).await.unwrap();
 
@@ -182,6 +183,7 @@ async fn a_replay_against_the_wrong_pre_image_is_refused() {
         old: "x = 1".into(),
         new: "x = 2".into(),
         replace_all: false,
+        unique_only: false,
     });
     rec.observe_file(&edit, true, None).await.unwrap();
 
@@ -489,5 +491,74 @@ async fn withheld_and_unknown_are_different_claims() {
         states.get("/app/patched.md"),
         Some(&("unknown".to_string(), false)),
         "content never established is not redaction -- nothing was withheld"
+    );
+}
+
+#[tokio::test]
+async fn an_ambiguous_patch_hunk_is_refused_rather_than_guessed() {
+    // Codex emits `apply_patch` hunks with no context lines -- the patch that prompted this was
+    // `-two` / `+TWO` and nothing else. Replaying that against a file containing "two" twice would
+    // rewrite the first occurrence and content-address a version the file never had.
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/work/report.md", Some(b"two\none\ntwo\n"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut update = seen("/work/report.md", None, FileMode::Wrote);
+    update.edit = Some(EditAttempt {
+        old: "two".into(),
+        new: "TWO".into(),
+        replace_all: false,
+        unique_only: true,
+    });
+    rec.observe_file(&update, true, None).await.unwrap();
+
+    let stats = rec.stats();
+    assert_eq!(
+        stats.get("EditTooAmbiguousToReplay"),
+        Some(&1),
+        "an ambiguous hunk must be refused and counted: {stats:?}"
+    );
+    assert!(
+        !stats.contains_key("ContentRecovered"),
+        "and must not be replayed: {stats:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unambiguous_patch_hunk_is_replayed() {
+    // The guard is uniqueness, not patches. When the removed text occurs once the replay is exact,
+    // which is the case that makes Codex's edits recordable at all.
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen(
+            "/work/report.md",
+            Some(b"one\ntwo\nthree\n"),
+            FileMode::Wrote,
+        ),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut update = seen("/work/report.md", None, FileMode::Wrote);
+    update.edit = Some(EditAttempt {
+        old: "two".into(),
+        new: "TWO".into(),
+        replace_all: false,
+        unique_only: true,
+    });
+    rec.observe_file(&update, true, None).await.unwrap();
+
+    assert_eq!(
+        rec.stats().get("ContentRecovered"),
+        Some(&1),
+        "a unique hunk replays: {:?}",
+        rec.stats()
     );
 }
