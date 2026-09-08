@@ -57,8 +57,16 @@ jobs:
       - name: Build
         run: just build-python
 
+  # One leg per Cargo workspace. They have separate Cargo.locks and separate target directories, so
+  # unlike a lint/test split they share no compiled artifact and duplicate no compile. A matrix
+  # rather than two copied jobs, so the job id stays `rust` for `needs:` below.
   rust:
     runs-on: ubuntu-latest
+    strategy:
+      # Both results are wanted; a failure in one workspace should not hide the other's.
+      fail-fast: false
+      matrix:
+        suite: [plugin, plugin-abi]
     steps:
       - name: Install Nix
         uses: eqtylab-actions/install-nix-action@v31
@@ -104,6 +112,9 @@ jobs:
           workspaces: |
             packages/eqty-lineage-nemo-relay -> target
             packages/eqty-lineage-nemo-relay/abi-test -> target
+          # `add-job-id-key` keys on the job id, which both legs of a matrix share -- without this
+          # they would compute one key and race to write it.
+          key: ${{ matrix.suite }}
           env-vars: NIX_RUSTC_VERSION
           # Without this the cache is saved only when the whole job succeeds, so a pull request with
           # failing clippy recompiles the world on every push -- the loop where a cache is worth
@@ -112,13 +123,14 @@ jobs:
       - name: Disk after cache restore
         shell: bash -e {0}
         run: df -h / | tail -1 | xargs echo "free after restore:"
+      # Needs no dependency tree, so running it in both legs costs nothing worth splitting.
       - name: Format
         run: just fmt-check-rust
       # Before the tests, so the dependency tree clippy compiles is the one `cargo test` reuses.
       - name: Lint
-        run: just lint-rust
+        run: just lint-rust-${{ matrix.suite }}
       - name: Test
-        run: just test-rust
+        run: just test-rust-${{ matrix.suite }}
       # `always()`, because the reading matters most on the run that failed for want of space.
       - name: Disk after build
         if: always()

@@ -54,10 +54,21 @@ test-python *ARGS:
   uv run --no-sync pytest "$@"
 
 # Run the Rust test suites
-test-rust:
+test-rust: test-rust-plugin test-rust-plugin-abi
+
+# Run the plugin's own test suite
+test-rust-plugin:
   cd packages/eqty-lineage-nemo-relay && cargo test
-  # Its own crate, with its own dependency graph: it needs Relay's core, which cannot coexist with
-  # `integrity`. See packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml.
+
+# Its own crate with its own dependency graph: it needs Relay's core, which cannot coexist with
+# `integrity`. See packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml.
+#
+# `build_cdylib` inside this suite builds the plugin into the plugin's *own* target directory, so
+# running `test-rust-plugin` first leaves the dependencies it needs already compiled. Running this
+# one on its own compiles that tree from nothing.
+#
+# Run the ABI load test
+test-rust-plugin-abi:
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo test
 
 # Compare the LangChain lineage the handler produces now against a released one (default: newest tag)
@@ -122,8 +133,17 @@ lint-python:
 # "only our code"; the cost is compiling two deliberately incompatible dependency graphs from scratch.
 #
 # Clippy over both Rust crates
-lint-rust:
+lint-rust: lint-rust-plugin lint-rust-plugin-abi
+
+# Split per workspace for the same reason as the test recipes: CI runs the two in separate jobs, and
+# a job that lints both needs both dependency trees, which is the duplication the split removes.
+#
+# Lint the plugin
+lint-rust-plugin:
   cd packages/eqty-lineage-nemo-relay && cargo clippy --all-targets -- -D warnings
+
+# Lint the ABI load test
+lint-rust-plugin-abi:
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo clippy --all-targets -- -D warnings
 
 # Stage a signed, installable Relay plugin into dist/relay-plugin.
