@@ -38,16 +38,14 @@ defaults:
 # worth having.
 #
 # This file used to say caching did not fit the 10 GB per-repository budget, because one clean debug
-# tree is 10.9 GB. That was the wrong comparison: the budget counts the compressed archive, and rust
-# artifacts compress well. Measured with zstd over this dependency tree, 1.57 GB of `deps` becomes
-# 0.38 GB -- 4.1x -- which puts both workspaces and the cargo registry at roughly 2.8 GB. It is an
-# upper bound, since `rust-cache` drops `incremental/` (0.9 GB) and the workspace crates' own
-# artifacts before saving.
+# tree is 10.9 GB. That was the wrong comparison: the budget counts the compressed archive, not the
+# directory. Run 34274120849 saved 1.27 GB -- `rust-cache` prunes the registry sources, `incremental/`
+# and the workspace crates' own artifacts, then zstd handles the rest, which compresses rust debug
+# output about 4x. Roughly seven entries fit.
 #
-# At 2.8 GB an entry, roughly three fit. `rust-cache` writes one entry per job, lockfile and
-# toolchain rather than one per push, so that is about `main` plus two active pull requests before
-# GitHub evicts the least recently used. If that starts thrashing, `save-if:` limited to
-# `refs/heads/main` trades warm caches on PR branches for one authoritative entry.
+# `rust-cache` writes one entry per job, lockfile and toolchain rather than one per push, so seven is
+# about `main` plus a healthy number of active pull requests. If it ever starts evicting, `save-if:`
+# limited to `refs/heads/main` trades warm caches on PR branches for one authoritative entry.
 jobs:
   python:
     runs-on: ubuntu-latest
@@ -118,9 +116,10 @@ jobs:
           df -h / | tail -1
       # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
       # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
-      # image's rustup toolchain rather than the dev shell's nixpkgs one. This step does run in the
-      # dev shell, and hands the real version over as a key input below -- so a nixpkgs bump misses
-      # the cache instead of restoring artifacts the current compiler will reject.
+      # image's rustup toolchain rather than the dev shell's nixpkgs one. Its own log says so --
+      # `Rust Version: 1.98.0` against the `rustc 1.96.1` we actually compile with. This step does
+      # run in the dev shell and hands the real version over as a key input below, so a nixpkgs bump
+      # misses the cache instead of restoring artifacts the current compiler will reject.
       - name: Identify the dev shell's toolchain
         run: echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
       # `rust-cache` rather than `actions/cache`, matching `eqtylab/integrity`. The difference that
