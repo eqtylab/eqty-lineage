@@ -2,6 +2,11 @@ name: CI
 description: "General CI code check. Runs on every PR"
 
 on:
+  # A cache written on a branch can be read from that branch and from pull requests that target it,
+  # and from nowhere else. Without this trigger nothing ever writes a cache on `main`, so every pull
+  # request would start cold however the cache step below is configured -- it would be inert.
+  push:
+    branches: [main]
   pull_request:
     # `opened` matters: without it a pull request created directly as ready-for-review gets no run at
     # all until someone pushes to it, and reads as "no checks" rather than "not checked yet".
@@ -27,14 +32,22 @@ defaults:
 # separate Rust jobs took 10m17s and 27m32s, because each compiled the debug dependency tree from
 # nothing -- `integrity`, with iroh and ssi beneath it. Inside one job clippy compiles those
 # dependencies and `cargo test` reuses them: clippy only wraps workspace crates, so everything
-# beneath is ordinary rustc output and cache-identical. Wall clock barely moved for nearly double
-# the CPU, so they are back together.
+# beneath is ordinary rustc output and cache-identical. Merging them cost about two minutes of wall
+# clock (27m32s -> 29m18s, because lint and test now run in sequence) to save about nine minutes of
+# CPU -- and left one dependency tree to cache instead of three, which is what makes the step below
+# worth having.
 #
-# Nothing caches cargo artifacts between runs, which is why any of this is measured in minutes.
-# Caching is the real fix and does not fit yet: one clean debug tree here is 10.9 GB against a 10 GB
-# per-repository cache budget, and `eqtylab-actions/cache@v3.3.2` depends on the client for the cache
-# service GitHub retired. Shrinking what has to be cached comes first -- this job is half of that,
-# and `build_cdylib` reusing the plugin's target directory is the other half.
+# This file used to say caching did not fit the 10 GB per-repository budget, because one clean debug
+# tree is 10.9 GB. That was the wrong comparison: the budget counts the compressed archive, and rust
+# artifacts compress well. Measured with zstd over this dependency tree, 1.57 GB of `deps` becomes
+# 0.38 GB -- 4.1x -- which puts both workspaces and the cargo registry at roughly 2.8 GB. It is an
+# upper bound, since `rust-cache` drops `incremental/` (0.9 GB) and the workspace crates' own
+# artifacts before saving.
+#
+# At 2.8 GB an entry, roughly three fit. `rust-cache` writes one entry per job, lockfile and
+# toolchain rather than one per push, so that is about `main` plus two active pull requests before
+# GitHub evicts the least recently used. If that starts thrashing, `save-if:` limited to
+# `refs/heads/main` trades warm caches on PR branches for one authoritative entry.
 jobs:
   python:
     runs-on: ubuntu-latest
@@ -91,11 +104,11 @@ jobs:
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
       # This job ran out of disk, not time: `No space left on device` while compiling
-      # `netlink-packet-route`. `just test-rust` needs the plugin's dependency tree, `abi-test`'s
-      # separate one, and a third for the cdylib `abi-test` dlopens -- three full trees with iroh and
-      # ssi in two of them. `build_cdylib` used to make a fresh one per test, which was the fourth;
-      # that is fixed in the test itself. This buys headroom for the three that remain, and prints
-      # `df` either side so the next failure says whether space was still the problem.
+      # `netlink-packet-route`. `just test-rust` needs the plugin's dependency tree and `abi-test`'s
+      # separate one, with iroh and ssi in both. `build_cdylib` used to make a fresh third one per
+      # test; that is fixed in the test itself. Restoring a cache makes this step matter more, not
+      # less -- the runner starts with 14 GB free and the cache unpacks to about 11 GB of it. `df`
+      # prints either side so the next failure says whether space was still the problem.
       - name: Free runner disk
         shell: bash -e {0}
         run: |
@@ -103,6 +116,30 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
             "$AGENT_TOOLSDIRECTORY" || true
           df -h / | tail -1
+      # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
+      # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
+      # image's rustup toolchain rather than the dev shell's nixpkgs one. This step does run in the
+      # dev shell, and hands the real version over as a key input below -- so a nixpkgs bump misses
+      # the cache instead of restoring artifacts the current compiler will reject.
+      - name: Identify the dev shell's toolchain
+        run: echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
+      # `rust-cache` rather than `actions/cache`, matching `eqtylab/integrity`. The difference that
+      # matters is what it saves: it prunes the target directory to dependency artifacts, dropping
+      # `incremental/` and our own crates' output, so the cache holds the part that actually costs
+      # the nine minutes and not the part that is rebuilt every run regardless.
+      - name: Rust Cache
+        uses: eqtylab-actions/rust-cache@v2
+        with:
+          # Two Cargo workspaces, both under `packages/`, each with its own Cargo.lock and target
+          # directory. The default is a workspace at the repository root, which is neither of them.
+          workspaces: |
+            packages/eqty-lineage-nemo-relay -> target
+            packages/eqty-lineage-nemo-relay/abi-test -> target
+          env-vars: NIX_RUSTC_VERSION
+          # Without this the cache is saved only when the whole job succeeds, so a pull request with
+          # failing clippy recompiles the world on every push -- the loop where a cache is worth
+          # most. A partial target directory is safe to restore; cargo fingerprints what it finds.
+          cache-on-failure: true
       - name: Format
         run: just fmt-check-rust
       # Before the tests, so the dependency tree clippy compiles is the one `cargo test` reuses.
