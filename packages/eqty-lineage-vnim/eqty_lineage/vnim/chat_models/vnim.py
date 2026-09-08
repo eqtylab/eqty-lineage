@@ -11,6 +11,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+from eqty_sdk import get_cid_for_bytes
 from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.messages import AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
@@ -20,6 +21,56 @@ from pydantic import Field, PrivateAttr, model_validator
 from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
+
+
+class _ResponseBodyCapturingStream(httpx.SyncByteStream):
+    """Tee an HTTP response stream without changing the bytes seen by LangChain."""
+
+    def __init__(self, stream: httpx.SyncByteStream, on_complete: Any) -> None:
+        self._stream = stream
+        self._on_complete = on_complete
+        self._body = bytearray()
+        self._recorded = False
+
+    def _record_if_complete(self) -> None:
+        if self._recorded:
+            return
+        body = bytes(self._body)
+        # The OpenAI SDK stops consuming as soon as it sees the SSE terminal event,
+        # then closes the HTTPX response instead of exhausting the transport iterator.
+        # That is nevertheless a complete vNIM response body; retain the bytes exactly
+        # as received and use the marker only to decide whether recording is safe.
+        if body.rstrip().endswith(b"data: [DONE]"):
+            self._recorded = True
+            self._on_complete(body)
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            for chunk in self._stream:
+                self._body.extend(chunk)
+                yield chunk
+        finally:
+            self._record_if_complete()
+
+    def close(self) -> None:
+        self._record_if_complete()
+        self._stream.close()
+
+
+class _ResponseBodyCapturingTransport(httpx.BaseTransport):
+    """Wrap the existing HTTPX transport to observe raw response bytes verbatim."""
+
+    def __init__(self, transport: httpx.BaseTransport, on_complete: Any) -> None:
+        self._transport = transport
+        self._on_complete = on_complete
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = self._transport.handle_request(request)
+        response.stream = _ResponseBodyCapturingStream(response.stream, self._on_complete)
+        return response
+
+    def close(self) -> None:
+        self._transport.close()
 
 
 @dataclass(frozen=True)
@@ -55,6 +106,9 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
     _last_request_payload: ContextVar[dict[str, Any] | None] = PrivateAttr(
         default_factory=lambda: ContextVar("last_request_payload", default=None)
     )
+    _last_response_cid: ContextVar[str | None] = PrivateAttr(
+        default_factory=lambda: ContextVar("last_response_cid", default=None)
+    )
 
     @property
     def last_integrity_result(self) -> IntegrityManifestResult | None:
@@ -72,7 +126,26 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         if "include_response_headers" in self.model_fields_set and not self.include_response_headers:
             logger.warning("include_response_headers=False is ignored because vNIM integrity retrieval requires it")
         self.include_response_headers = True
+        self._install_response_body_capture()
         return self
+
+    def _install_response_body_capture(self) -> None:
+        """Observe raw upstream bytes before HTTPX and LangChain parse the SSE stream."""
+        client = getattr(getattr(self, "root_client", None), "_client", None)
+        transport = getattr(client, "_transport", None)
+        if transport is not None and not isinstance(transport, _ResponseBodyCapturingTransport):
+            client._transport = _ResponseBodyCapturingTransport(transport, self._record_response_body)
+
+    def _record_response_body(self, body: bytes) -> None:
+        """Save the raw-binary CID of a fully consumed upstream response body."""
+        try:
+            cid = str(get_cid_for_bytes(body))
+            self._last_response_cid.set(cid)
+            logger.info("eqty_vnim.response_body_received cid=%s bytes=%d", cid, len(body))
+        except RuntimeError as error:
+            # The SDK may be deliberately uninitialized when this class is used without
+            # lineage capture.  Do not change normal ChatOpenAI behavior in that case.
+            logger.warning("eqty_vnim.response_body_cid_unavailable error=%s", error)
 
     @staticmethod
     def _eqty_request_id_from_chunk(chunk: ChatGenerationChunk) -> tuple[UUID | None, str | None]:
@@ -205,6 +278,9 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
             # This is the final Python request body produced by ChatOpenAI and handed to the OpenAI
             # client. It is intentionally separate from the raw HTTP bytes, which are transport evidence.
             metadata["eqty_openai_request_payload"] = request_payload
+        response_cid = self._last_response_cid.get()
+        if response_cid is not None:
+            metadata["eqty_openai_response_cid"] = response_cid
         if result.request_id is not None:
             metadata["eqty_request_id"] = str(result.request_id)
         if result.manifest is not None:
@@ -221,7 +297,11 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         """Preserve the upstream SSE stream and enrich only its final parsed chunk."""
+        # ChatOpenAI creates its root OpenAI client in its own validation hook.  Install
+        # here as well so the wrapper is present even when validator ordering changes.
+        self._install_response_body_capture()
         self._last_integrity_result.set(None)
+        self._last_response_cid.set(None)
         request_id, header_error, pending = None, None, None
         try:
             for chunk in super()._stream(*args, **kwargs):
@@ -255,7 +335,9 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self._install_response_body_capture()
         self._last_integrity_result.set(None)
+        self._last_response_cid.set(None)
         result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         if result.generations:
             generation = result.generations[0]

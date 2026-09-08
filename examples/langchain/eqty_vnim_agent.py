@@ -25,7 +25,6 @@ from eqty_lineage.vnim import ChatEqtyVnimOpenAI
 DEFAULT_MODEL = "nvidia/llama-3.1-nemotron-nano-8b-v1"
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_MANIFEST_BASE_URL = "http://127.0.0.1:8000"
-DEFAULT_ROOT_CONTEXT_ID = "11111111-2222-3333-4444-555555555557"
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--root-context-id",
-        default=os.environ.get("EQTY_ROOT_CONTEXT_ID", DEFAULT_ROOT_CONTEXT_ID),
+        default=os.environ.get("EQTY_ROOT_CONTEXT_ID", uuid4()),
         help="EQTY root context UUID; child context is created automatically for this invocation.",
     )
     parser.add_argument("--manifest-out", type=Path, help="Where to write the merged EQTY manifest.")

@@ -476,6 +476,22 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                     return payload
         return None
 
+    @staticmethod
+    def _openai_response_cid(response: LLMResult) -> Optional[CID]:
+        """Return the raw SSE response-body CID supplied by a compatible OpenAI client."""
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                value = metadata.get("eqty_openai_response_cid") if isinstance(metadata, dict) else None
+                if not isinstance(value, str):
+                    continue
+                try:
+                    return CID(value)
+                except (TypeError, ValueError) as error:
+                    logger.warning("ignoring invalid raw OpenAI response CID: %s", error)
+        return None
+
     def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
         """Record a failed activity and link it to whatever was waiting on it.
 
@@ -901,7 +917,26 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                 )
                 inference_request = wire_request.cid
 
-        self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [response_body.cid])
+        openai_response_cid = self._openai_response_cid(response)
+        if openai_response_cid is None:
+            self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [response_body.cid])
+        else:
+            wire_response = self._asset_factory(Document).from_cid(
+                openai_response_cid,
+                name=f"{run['name']}: OpenAI response",
+                description=(
+                    "Raw SSE response body received by ChatOpenAI, identified with a raw-binary CID "
+                    "to match vNIM Response Body assets."
+                ),
+                **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+            )
+            self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [wire_response.cid])
+            self._finalize(
+                f"{run['name']}: ChatOpenAI SSE parse",
+                "chat_openai_sse_parse",
+                [wire_response.cid],
+                [response_body.cid],
+            )
         self._finalize(run["name"], run["kind"], [response_body.cid], [output.cid])
         self._import_integrity_manifests(response)
 
