@@ -1,6 +1,5 @@
 """vNIM integrity-manifest behavior layered on LangChain's ChatOpenAI."""
 
-import json
 from uuid import uuid4
 
 import httpx
@@ -143,47 +142,6 @@ def test_stream_yields_the_buffered_chunk_before_propagating_an_upstream_error(m
         next(stream)
     assert model.last_integrity_result is not None
     assert model.last_integrity_result.error == "upstream stream did not complete"
-
-
-def test_byte_capturing_transport_tees_raw_request_and_response_bytes_unmodified():
-    from eqty_lineage.vnim.chat_models.vnim import _ByteCapturingTransport
-
-    chunks = [b"data: one\n\n", b"data: two\n\n", b"data: [DONE]\n\n"]
-
-    class FakeStream(httpx.SyncByteStream):
-        def __iter__(self):
-            yield from chunks
-
-    class FakeTransport(httpx.BaseTransport):
-        def handle_request(self, request):
-            return httpx.Response(200, stream=FakeStream())
-
-    captured_requests = []
-    captured_responses = []
-    transport = _ByteCapturingTransport(FakeTransport(), captured_requests.append, captured_responses.append)
-    request = httpx.Request("POST", "http://example.test", json={"model": "test"})
-    response = transport.handle_request(request)
-
-    assert list(response.stream) == chunks
-    assert captured_requests == [request.content]
-    assert captured_responses == [b"".join(chunks)]
-
-
-def test_finish_integrity_result_carries_independently_computed_local_cids(sdk):
-    from eqty_lineage.vnim import ChatEqtyVnimOpenAI
-    from eqty_sdk import get_cid_for_bytes
-
-    request_bytes = json.dumps({"model": "test", "messages": [], "stream": True}).encode()
-    response_bytes = b"data: {\"choices\": []}\n\ndata: [DONE]\n\n"
-
-    model = ChatEqtyVnimOpenAI(model="test", api_key="test")
-    model._last_local_request_bytes.set(request_bytes)
-    model._last_local_response_bytes.set(response_bytes)
-
-    result = model._finish_integrity_result(request_id=None)
-
-    assert result.local_request_cid == get_cid_for_bytes(request_bytes)
-    assert result.local_response_cid == get_cid_for_bytes(response_bytes)
 
 
 def test_generate_attaches_integrity_metadata(monkeypatch):

@@ -8,7 +8,7 @@ to the graph invocation::
 The handler listens to the runs LangGraph emits and turns them into EQTY lineage:
 
 - every graph node run   -> input/output Dataset assets + a computation statement
-- every chat model call  -> Prompt + Model assets in, Reasoning asset out + computation
+- every chat model call  -> Prompt + Model assets, normalized request/response Documents, and Reasoning output
 - every tool call        -> Tool + input Dataset in, output Dataset out + computation
 
 ``pathlib.Path`` values in graph state get special treatment: if the path exists on disk, the file or directory it
@@ -29,7 +29,9 @@ import json
 import logging
 import re
 import threading
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -37,9 +39,10 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Context, Custom, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, init
+from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, get_cid_for_bytes, init
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
+from rfc8785 import dumps as jcs_dumps
 
 from eqty_lineage.langchain._serialize import UNCLAIMED, _to_jsonable
 from eqty_lineage.langchain._tools import _registered_tool_sources, eqty_tool
@@ -96,7 +99,6 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         verbose: bool = False,
         *,
         integrity_service_url: Optional[str] = None,
-        defer_chat_model_computations: bool = False,
     ) -> None:
         # when True, extra metadata is attached to the registered EQTY assets
         self.verbose = verbose
@@ -106,10 +108,6 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._context = self._root_context
         # Registration is opt-in. Service.new resolves its credentials exclusively from EQTY_API_KEY.
         self._ig_service = Service.new(integrity_service_url) if integrity_service_url else None
-        # An integration that has separately attested transport evidence (such as EQTY vNIM) can
-        # replace the default Prompt+Model -> Reasoning statement with explicit transport stages.
-        self._defer_chat_model_computations = defer_chat_model_computations
-        self._completed_chat_models: List[Dict[str, Any]] = []
         if self.verbose:
             logger.info("EqtyCallbackHandler verbose node metadata enabled")
         # guards every mutation below; see _synchronized
@@ -205,7 +203,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         while current is not None and current not in seen:
             seen.add(current)
             run = self._runs.get(current)
-            if run is not None and run["parent"] is None:
+            if run is not None and run.get("parent") is None:
                 run["context"] = self._context
                 return
             current = self._parents.get(current)
@@ -424,6 +422,59 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         Metadata(name=name, computation_type=kind, framework=self._framework or "langchain").create_statement(
             statement_ids[0], None, self._context
         )
+
+    def _import_integrity_manifests(self, response: LLMResult) -> None:
+        """Import external integrity evidence attached by a model without making it a handler prerequisite.
+
+        ``ChatEqtyVnimOpenAI`` adds ``eqty_integrity_manifest`` to the final AI message's response
+        metadata after its stream is consumed. The handler records its own normalized request and
+        response assets regardless; if a model supplies this optional evidence, it is imported as an
+        additional set of independently signed nodes in the same session context.
+        """
+        manifests: Dict[str, Dict[str, Any]] = {}
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                manifest = metadata.get("eqty_integrity_manifest") if isinstance(metadata, dict) else None
+                if not isinstance(manifest, dict):
+                    continue
+                try:
+                    key = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                except (TypeError, ValueError):
+                    logger.warning("ignoring non-serializable external integrity manifest")
+                    continue
+                manifests.setdefault(key, manifest)
+
+        for manifest in manifests.values():
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as manifest_file:
+                    json.dump(manifest, manifest_file)
+                    manifest_file.flush()
+                    self._context.import_manifest(Path(manifest_file.name))
+            except Exception as error:  # noqa: BLE001 - provenance import must not break the LLM response
+                logger.warning("external integrity manifest import failed: %s", error)
+                continue
+            statements = manifest.get("statements")
+            blobs = manifest.get("blobs")
+            logger.info(
+                "external integrity manifest imported context_id=%s statements=%d blobs=%d",
+                self._context.id,
+                len(statements) if isinstance(statements, dict) else 0,
+                len(blobs) if isinstance(blobs, dict) else 0,
+            )
+
+    @staticmethod
+    def _openai_request_payload(response: LLMResult) -> Optional[Dict[str, Any]]:
+        """Return the finalized OpenAI request payload a compatible client attached to its response."""
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                payload = metadata.get("eqty_openai_request_payload") if isinstance(metadata, dict) else None
+                if isinstance(payload, dict):
+                    return payload
+        return None
 
     def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
         """Record a failed activity and link it to whatever was waiting on it.
@@ -769,11 +820,31 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             if enclosing_input is not None:
                 input_cids.append(enclosing_input)
 
+        # This is the handler's own normalized request record. It deliberately represents the
+        # LangChain invocation rather than claiming to be byte-identical to any provider's HTTP body.
+        request_payload: Dict[str, Any] = {"messages": _to_jsonable(messages), "model": model_name}
+        if sampling:
+            request_payload["sampling"] = _to_jsonable(sampling)
+        request = self._asset_factory(Document).from_object(
+            request_payload,
+            name=f"{model_name}: LangChain request",
+            description="Normalized LangChain chat-model request constructed by EqtyCallbackHandler.",
+            **self._verbose_metadata(
+                {
+                    "callback": "on_chat_model_start",
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                }
+            ),
+        )
+
         self._runs[run_id] = {
             "name": model_name,
             "kind": "chat_model",
             "state_in": prompt.cid,
             "inputs": input_cids,
+            "model": model.cid,
+            "request": request.cid,
             "child_outputs": [],
             "node": node,
         }
@@ -790,6 +861,12 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             _to_jsonable(getattr(gen, "message", None) or gen.text) for batch in response.generations for gen in batch
         ]
 
+        response_body = self._asset_factory(Document).from_object(
+            {"generations": generations},
+            name=f"{run['name']}: response body",
+            description="Normalized chat-model response envelope received by EqtyCallbackHandler.",
+            **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+        )
         output = self._asset_factory(Reasoning).from_object(
             generations,
             name=f"{run['name']}: response",
@@ -797,121 +874,39 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
         )
 
-        if self._defer_chat_model_computations:
-            self._completed_chat_models.append(
-                {"name": run["name"], "inputs": run["inputs"], "output": output.cid}
-            )
-        else:
-            self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
+        self._finalize(f"{run['name']}: request", "chat_request", run["inputs"], [run["request"]])
+        openai_request = self._openai_request_payload(response)
+        inference_request = run["request"]
+        if openai_request is not None:
+            try:
+                canonical_request_bytes = jcs_dumps(openai_request)
+                wire_request_cid = get_cid_for_bytes(canonical_request_bytes)
+            except (TypeError, ValueError) as error:
+                logger.warning("could not JCS-canonicalize ChatOpenAI request payload: %s", error)
+            else:
+                wire_request = self._asset_factory(Document).from_cid(
+                    wire_request_cid,
+                    name=f"{run['name']}: OpenAI request",
+                    description=(
+                        "JCS-canonicalized final OpenAI-compatible request payload produced by ChatOpenAI, "
+                        "identified with a raw-binary CID to match vNIM Request Body assets."
+                    ),
+                    **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+                )
+                self._finalize(
+                    f"{run['name']}: ChatOpenAI XForm",
+                    "chat_openai_transform",
+                    [run["request"]],
+                    [wire_request.cid],
+                )
+                inference_request = wire_request.cid
+
+        self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [response_body.cid])
+        self._finalize(run["name"], run["kind"], [response_body.cid], [output.cid])
+        self._import_integrity_manifests(response)
 
         if run["node"] is not None:
             run["node"].setdefault("child_outputs", []).append(output.cid)
-
-    @_synchronized
-    def register_external_chat_transport(
-        self,
-        *,
-        local_request_cid: CID,
-        vnim_request_cid: CID,
-        vnim_response_cid: CID,
-        local_response_cid: Optional[CID] = None,
-        name: str,
-    ) -> None:
-        """Replace one deferred chat-model computation with explicit, independently attested transport stages.
-
-        ``local_request_cid``/``local_response_cid`` must be computed by *this* application from the
-        literal bytes it sent/received -- never copied from the external manifest. ``vnim_request_cid``/
-        ``vnim_response_cid`` are the external service's own claims about those same bytes. Each pair is
-        compared before being linked: on a match the chain proceeds through the external service's CID as
-        before; on a mismatch a visible ``*_integrity_mismatch`` statement links the two disagreeing CIDs
-        instead, and the local chain does not pretend they are the same asset. A mismatch is logged loudly
-        but does not raise -- callers that must stop on mismatch should check ``handler.context`` for
-        recorded mismatch statements or inspect the return value in a future revision.
-
-        The locally signed computations state only that this application serialized the model input
-        and processed the external service's response; they do not claim this application performed
-        the inference itself, and they do not alter or re-sign the external service's manifest. The
-        request -> response computation is vNIM's own claim, taken from its (unmodified) merged-in
-        manifest rather than duplicated here.
-        """
-        if not self._defer_chat_model_computations:
-            raise RuntimeError("external chat transport requires defer_chat_model_computations=True")
-        if len(self._completed_chat_models) != 1:
-            raise RuntimeError(
-                "external chat transport requires exactly one completed deferred chat-model run; "
-                f"found {len(self._completed_chat_models)}"
-            )
-
-        run = self._completed_chat_models.pop()
-
-        # local_request_cid/local_response_cid were computed via get_cid_for_bytes directly, not
-        # through an Asset subclass, so they carry no name/asset-type Metadata -- unlike vNIM's own
-        # "Request Body"/"Response Body" nodes, which arrive named because vNIM's manifest statements
-        # are merged wholesale into the final bundle. Without this, the local side of the bridge is
-        # invisible in the graph even though the statements linking it are there.
-        self._asset_factory(Custom).from_cid(local_request_cid, name=f"{name}: Request Body (local)")
-        if local_response_cid is not None:
-            self._asset_factory(Custom).from_cid(local_response_cid, name=f"{name}: Response Body (local)")
-
-        # Always attest to what *this* app actually sent, independent of anything vNIM later claims.
-        self._finalize(f"{name}: request", "external_request", run["inputs"], [local_request_cid])
-
-        # No local "vNIM did inference" computation is recorded here: vNIM's own manifest already
-        # asserts that edge (its Request Body -> Response Body statement), and it is merged into the
-        # final bundle wholesale. Duplicating it locally would just be a second, redundant claim about
-        # a computation this app did not perform. On a match, local_request_cid == vnim_request_cid, so
-        # that merged-in statement already connects straight through to run["inputs"] via the edge above.
-        if local_request_cid != vnim_request_cid:
-            logger.error(
-                "eqty_vnim.request_integrity_mismatch name=%s local_request_cid=%s vnim_request_cid=%s "
-                "-- the request vNIM claims to have received does not match the bytes this app sent",
-                name,
-                local_request_cid,
-                vnim_request_cid,
-            )
-            self._finalize(
-                f"{name}: request integrity mismatch",
-                "request_integrity_mismatch",
-                [local_request_cid],
-                [vnim_request_cid],
-            )
-
-        if local_response_cid is None:
-            logger.warning(
-                "eqty_vnim.response_not_independently_verified name=%s vnim_response_cid=%s "
-                "-- no local response bytes were captured to compare against",
-                name,
-                vnim_response_cid,
-            )
-            self._finalize(
-                f"{name}: response", "external_response_unverified", [vnim_response_cid], [run["output"]]
-            )
-        elif local_response_cid == vnim_response_cid:
-            self._finalize(f"{name}: response", "external_response", [vnim_response_cid], [run["output"]])
-        else:
-            logger.error(
-                "eqty_vnim.response_integrity_mismatch name=%s local_response_cid=%s vnim_response_cid=%s "
-                "-- the response bytes this app received do not match what vNIM's manifest claims it sent",
-                name,
-                local_response_cid,
-                vnim_response_cid,
-            )
-            self._finalize(
-                f"{name}: response integrity mismatch",
-                "response_integrity_mismatch",
-                [vnim_response_cid],
-                [local_response_cid],
-            )
-            self._finalize(
-                f"{name}: response", "external_response_unverified", [local_response_cid], [run["output"]]
-            )
-
-    @_synchronized
-    def finalize_deferred_chat_models(self) -> None:
-        """Record ordinary lineage for deferred calls that produced no external transport evidence."""
-        while self._completed_chat_models:
-            run = self._completed_chat_models.pop()
-            self._finalize(run["name"], "chat_model", run["inputs"], [run["output"]])
 
     @_synchronized
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:

@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "eqty-sdk",
     "langchain-core>=0.3",
+    "rfc8785>=0.1",
 ]
 
 [tool.uv.sources]

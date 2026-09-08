@@ -4,7 +4,7 @@ EQTY lineage callback handler for LangChain and LangGraph. Registers graph nodes
 EQTY data assets and computation statements, threaded together into one end-to-end lineage flow:
 
 - every graph node run → input/output Dataset assets + a computation statement
-- every chat model call → Prompt + Model assets in, Reasoning asset out + computation
+- every chat model call → Prompt + Model assets, normalized request/response Documents, and a Reasoning output
 - every tool call → Tool + input Dataset in, output Dataset out + computation
 - every retrieval → Tool + query Prompt in, one Document asset per retrieved document out
 - every subagent → its own `agent` computation, linked to the tool that delegated to it
@@ -19,6 +19,11 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 
 Only `langchain-core` is required at runtime, so the handler works with plain LangChain runnables as well as LangGraph
 graphs. Use one handler instance per invocation.
+
+When a compatible client adds `eqty_openai_request_payload` to its final response metadata, the handler records that
+payload as an OpenAI-request Document and links it from the normalized LangChain request with a `ChatOpenAI XForm`
+computation. That payload is RFC 8785 (JCS) canonicalized, then given a raw-binary CID so it can join the current
+vNIM `Request Body` representation. `ChatEqtyVnimOpenAI` provides this metadata automatically.
 
 ### Session isolation
 

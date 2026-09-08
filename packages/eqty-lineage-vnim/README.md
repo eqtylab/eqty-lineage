@@ -42,6 +42,12 @@ The final chunk's `response_metadata` includes `eqty_request_id` and, on success
 `eqty_integrity_manifest`. It never reconstructs or alters upstream SSE bytes; the manifest is a
 separate artifact.
 
+When used with `EqtyCallbackHandler`, no vNIM bridge setup is required. The handler records its own
+normalized LangChain request and response assets for the invocation. It also records a
+`ChatOpenAI XForm` computation to the final OpenAI-compatible request payload supplied by this client,
+then automatically imports the optional vNIM manifest from the completed response as additional
+independently attested lineage.
+
 `ChatEqtyVnimOpenAI` subclasses the pinned `langchain-openai==1.3.5` `ChatOpenAI` implementation and
 adds only VNIM-specific integrity-manifest behavior. It enables `streaming=True` by default, unlike
 LangChain's `ChatOpenAI`, so it can retain the upstream request ID until stream completion.
