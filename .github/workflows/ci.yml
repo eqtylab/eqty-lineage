@@ -88,19 +88,18 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # A runner starts with 14 GB free and the plugin leg wants 11.5 GB of it: 7.7 GB for the dev
-      # shell and the restored cache, then 3.8 GB of build on top. Run 34281709425 ran without this
-      # step and finished at 2.5 GB, which is 97% and too thin to leave.
+      # A step here used to delete the android SDK for headroom. Under `line-tables-only` a leg wants
+      # 8 GB of the 14 GB a runner starts with -- run 34290244618 measured 7 GB of nix store and
+      # restored cache, then 1 GB of build -- so it was freeing 11 GB that nothing used. It also cost
+      # between 19s and 217s for the same `rm`, and on that run it was the largest item in the whole
+      # run. The readings below are what makes removing it safe to try: if a leg does run out they
+      # say which phase took the space, and `cache-on-failure` means the run still leaves a cache.
       #
-      # The android SDK alone is most of what used to be deleted here, and deleting only it keeps the
-      # step short. The rest of the old list, if this margin ever tightens again:
-      #   /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-      - name: Free runner disk
+      #   sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+      #     "$AGENT_TOOLSDIRECTORY" || true
+      - name: Disk at start
         shell: bash -e {0}
-        run: |
-          df -h / | tail -1 | xargs echo "free at start:"
-          sudo rm -rf /usr/local/lib/android || true
-          df -h / | tail -1 | xargs echo "free after cleanup:"
+        run: df -h / | tail -1 | xargs echo "free at start:"
       # `rust-cache` is a node action and does not run through `defaults.run.shell`, so left alone it
       # keys the cache on the runner image's rustup toolchain -- a compiler we never build with. That
       # pool is not homogeneous: 1.98.0 and 1.98.1 both appear, the key flipped between them, and a
