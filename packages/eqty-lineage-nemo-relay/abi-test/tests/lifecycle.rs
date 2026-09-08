@@ -113,54 +113,74 @@ fn config(value: serde_json::Value) -> Map<String, serde_json::Value> {
     value.as_object().cloned().expect("config is an object")
 }
 
-/// Build this crate's cdylib **once**, into a scratch target directory shared by every test here.
+/// Build the plugin's cdylib **once**, into the plugin's **own** target directory.
 ///
-/// A separate `--target-dir` keeps the build out of the one the test binary itself was built into,
-/// which would otherwise contend on cargo's lock. It does not need to be a *fresh* directory per
-/// test, and making it one compiled the plugin's entire dependency tree -- `integrity`, and iroh and
-/// ssi beneath it -- once for every test in this file. Together with this crate's own tree and the
-/// plugin's `cargo test` tree, already on disk in the same CI job, that was four full trees at once
-/// and the runner ran out of *space* rather than time:
+/// Both halves of that matter, and each was learned from a CI failure.
+///
+/// *Once*: a fresh scratch directory per test compiled the plugin's entire dependency tree --
+/// `integrity`, and iroh and ssi beneath it -- for every test in this file.
+///
+/// *The plugin's own*: a scratch directory anywhere compiles that tree from nothing even when the
+/// identical artifacts already exist. `just test-rust` runs the plugin's `cargo test` immediately
+/// before this crate's, so `../target/debug` is already full of exactly the dependencies this build
+/// needs and only the cdylib itself has to be linked. A scratch tree was the difference between
+/// reusing that work and doing it again -- and with this crate's own tree beside it, enough to run
+/// the runner out of *space* rather than time:
 ///
 /// ```text
 /// error: failed to write .../lib.rmeta: No space left on device (os error 28)
 /// ```
 ///
-/// The `TempDir` is held in the `OnceLock` rather than returned, so it lives as long as the test
-/// binary. Handing it back would let the first test to finish drop it and delete the library the
-/// others are still loading.
+/// It is also the only version of this that a cache can help: a `TempDir` is a new path every run,
+/// so nothing restored into it is ever found.
+///
+/// **`--target-dir` is still explicit, and must stay that way.** Cargo holds a lock per target
+/// directory. This runs *inside* `cargo test`, which already holds the lock on this crate's own
+/// target directory -- and `CARGO_TARGET_DIR`, which `just linux-check` sets, would otherwise point
+/// both at the same place and make the nested build wait on a lock its own parent is holding. The
+/// flag beats the environment variable, which is what keeps that from happening.
 fn build_cdylib() -> &'static Path {
-    static BUILT: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
-    let (_target, library) = BUILT.get_or_init(|| {
-        let target = TempDir::new().expect("build target directory");
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "--manifest-path"])
-            .arg(manifest)
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT.get_or_init(|| {
+        let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let output = Command::new(env!("CARGO"))
+            .args(["build", "--lib", "--message-format=json-render-diagnostics"])
+            .arg("--manifest-path")
+            .arg(plugin.join("Cargo.toml"))
             .arg("--target-dir")
-            .arg(target.path())
-            .status()
+            .arg(plugin.join("target"))
+            .output()
             .expect("cargo build should start");
         assert!(
-            status.success(),
-            "cargo build should produce the native library"
+            output.status.success(),
+            "cargo build should produce the native library: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
 
-        let library = target.path().join("debug").join(library_name());
-        assert!(library.exists(), "expected {}", library.display());
-        (target, library)
-    });
-    library
-}
+        // Cargo names the artifact per platform and puts it wherever the profile says, so it is
+        // asked rather than guessed -- the same reason `just nemo-relay-package` reads this stream.
+        let library = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| message["reason"] == "compiler-artifact")
+            .filter(|message| message["target"]["name"] == "eqty_lineage_nemo_relay")
+            .flat_map(|message| {
+                message["filenames"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+            })
+            .filter_map(|name| name.as_str().map(PathBuf::from))
+            .find(|name| {
+                name.extension()
+                    .is_some_and(|kind| kind == "dylib" || kind == "so" || kind == "dll")
+            })
+            .expect("cargo should report a cdylib for eqty_lineage_nemo_relay");
 
-fn library_name() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "eqty_lineage_nemo_relay.dll"
-    } else if cfg!(target_os = "macos") {
-        "libeqty_lineage_nemo_relay.dylib"
-    } else {
-        "libeqty_lineage_nemo_relay.so"
-    }
+        assert!(library.exists(), "expected {}", library.display());
+        library
+    })
 }
 
 /// Write a manifest carrying the artifact's real digest.

@@ -20,16 +20,21 @@ defaults:
   run:
     shell: nix develop --command bash -e {0}
 
-# Three jobs rather than one sequential job, so Python feedback does not wait behind Rust. Measured
-# on run 34253208393: lint 387s, release build 107s and still going when cancelled, tests never
-# reached. Almost all of that is compiling two deliberately incompatible Rust dependency graphs --
-# `integrity` for the plugin, Relay's core for `abi-test` -- from scratch, since nothing caches
-# cargo artifacts between runs. Clippy never lints those dependencies; it only needs their types.
+# Two jobs: Python feedback should not wait behind Rust, and Rust's own steps should not pay for the
+# same compile twice.
 #
-# The honest cost of the split: `rust-lint` and `rust-test` no longer share the debug dependency
-# build they shared inside one job, so total CPU nearly doubles to buy roughly 90s of wall clock.
-# Collapsing them back into one `rust` job that runs `just lint-rust && just test-rust` is the
-# cheaper shape if CPU minutes matter more than latency; caching cargo would make the question moot.
+# The split was briefly three, and the measurement said that was wrong. On run 34260626670 the two
+# separate Rust jobs took 10m17s and 27m32s, because each compiled the debug dependency tree from
+# nothing -- `integrity`, with iroh and ssi beneath it. Inside one job clippy compiles those
+# dependencies and `cargo test` reuses them: clippy only wraps workspace crates, so everything
+# beneath is ordinary rustc output and cache-identical. Wall clock barely moved for nearly double
+# the CPU, so they are back together.
+#
+# Nothing caches cargo artifacts between runs, which is why any of this is measured in minutes.
+# Caching is the real fix and does not fit yet: one clean debug tree here is 10.9 GB against a 10 GB
+# per-repository cache budget, and `eqtylab-actions/cache@v3.3.2` depends on the client for the cache
+# service GitHub retired. Shrinking what has to be cached comes first -- this job is half of that,
+# and `build_cdylib` reusing the plugin's target directory is the other half.
 jobs:
   python:
     runs-on: ubuntu-latest
@@ -69,28 +74,7 @@ jobs:
       - name: Build
         run: just build-python
 
-  rust-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install Nix
-        uses: eqtylab-actions/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-      - name: Cachix
-        uses: eqtylab-actions/cachix-action@v16
-        with:
-          name: eqtylab
-          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
-          skipPush: true
-        continue-on-error: true
-      - name: Checkout Repo
-        uses: eqtylab-actions/checkout@v4
-      - name: Format
-        run: just fmt-check-rust
-      - name: Lint
-        run: just lint-rust
-
-  rust-test:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - name: Install Nix
@@ -119,15 +103,20 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
             "$AGENT_TOOLSDIRECTORY" || true
           df -h / | tail -1
+      - name: Format
+        run: just fmt-check-rust
+      # Before the tests, so the dependency tree clippy compiles is the one `cargo test` reuses.
+      - name: Lint
+        run: just lint-rust
       - name: Test
         run: just test-rust
 
   # One place to read the outcome. Parallel jobs already fail the run on their own -- this exists so
-  # the run summary names which of the three failed without opening each job. `if: always()` is what
-  # makes it report a failure rather than being skipped by one.
+  # the run summary names which one failed without opening each job. `if: always()` is what makes it
+  # report a failure rather than being skipped by one.
   summary:
     runs-on: ubuntu-latest
-    needs: [python, rust-lint, rust-test]
+    needs: [python, rust]
     if: always()
     defaults:
       run:
@@ -141,9 +130,8 @@ jobs:
             echo "| Check | Result |"
             echo "| --- | --- |"
             echo "| Python | ${{ needs.python.result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Rust lint | ${{ needs['rust-lint'].result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Rust tests | ${{ needs['rust-test'].result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Rust | ${{ needs.rust.result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Fail if a check failed
-        if: needs.python.result != 'success' || needs['rust-lint'].result != 'success' || needs['rust-test'].result != 'success'
+        if: needs.python.result != 'success' || needs.rust.result != 'success'
         run: exit 1
