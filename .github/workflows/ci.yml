@@ -73,19 +73,17 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # This job ran out of disk, not time: `No space left on device` while compiling
-      # `netlink-packet-route`. `just test-rust` needs the plugin's dependency tree and `abi-test`'s
-      # separate one, with iroh and ssi in both. `build_cdylib` used to make a fresh third one per
-      # test; that is fixed in the test itself. Restoring a cache makes this step matter more, not
-      # less -- the runner starts with 14 GB free and the cache unpacks to about 11 GB of it. `df`
-      # prints either side so the next failure says whether space was still the problem.
+      # This job ran out of disk once -- `No space left on device` compiling
+      # `netlink-packet-route` -- because the two workspaces' dependency trees come to roughly 13 GB
+      # against the 14 GB free here. Each phase below prints what is left, so the next failure says
+      # where the space went rather than only that it ran out.
       - name: Free runner disk
         shell: bash -e {0}
         run: |
-          df -h / | tail -1
+          df -h / | tail -1 | xargs echo "free before cleanup:"
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
             "$AGENT_TOOLSDIRECTORY" || true
-          df -h / | tail -1
+          df -h / | tail -1 | xargs echo "free after cleanup:"
       # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
       # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
       # image's rustup toolchain rather than the dev shell's nixpkgs one. Its own log says so --
@@ -111,6 +109,9 @@ jobs:
           # failing clippy recompiles the world on every push -- the loop where a cache is worth
           # most. A partial target directory is safe to restore; cargo fingerprints what it finds.
           cache-on-failure: true
+      - name: Disk after cache restore
+        shell: bash -e {0}
+        run: df -h / | tail -1 | xargs echo "free after restore:"
       - name: Format
         run: just fmt-check-rust
       # Before the tests, so the dependency tree clippy compiles is the one `cargo test` reuses.
@@ -118,6 +119,11 @@ jobs:
         run: just lint-rust
       - name: Test
         run: just test-rust
+      # `always()`, because the reading matters most on the run that failed for want of space.
+      - name: Disk after build
+        if: always()
+        shell: bash -e {0}
+        run: df -h / | tail -1 | xargs echo "free after build:"
 
   # One place to read the outcome. Parallel jobs already fail the run on their own -- this exists so
   # the run summary names which one failed without opening each job. `if: always()` is what makes it
