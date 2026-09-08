@@ -114,17 +114,37 @@ nemo-relay-package:
     (umask 077 && openssl genpkey -algorithm ed25519 -out "$key")
     echo "generated a NEW dev signing key at $key (private -- do not commit or share)"
   fi
-  # Cargo names the cdylib per platform, and the digest is over one artifact -- so the name has to be
-  # selected here and written into the manifest, not hardcoded. `abi-test` has resolved it this way
-  # from the start; this recipe hardcoded `.dylib` and so failed on Linux *after* a successful build.
-  case "$(uname -s)" in
-    Darwin) lib=libeqty_lineage_nemo_relay.dylib ;;
-    Linux)  lib=libeqty_lineage_nemo_relay.so ;;
-    *) echo "unsupported platform for packaging: $(uname -s)" >&2; exit 1 ;;
-  esac
-  cd packages/eqty-lineage-nemo-relay && cargo build --release --lib && cd ../..
+  # Ask cargo where it put the cdylib rather than assuming. Both halves of the assumption were
+  # wrong: the *name* is per-platform, which broke this recipe on Linux, and the *directory* moves
+  # with CARGO_TARGET_DIR -- which `just linux-check` sets. A hardcoded `target/release` then found
+  # a stale artifact from an earlier build and packaged it with a digest computed over the same
+  # stale bytes, so the check passed while verifying nothing.
+  root="$PWD"
+  cd packages/eqty-lineage-nemo-relay
+  artifact=$(cargo build --release --lib --message-format=json-render-diagnostics \
+    | python3 -c '
+  import json, sys
+  for line in sys.stdin:
+      try:
+          message = json.loads(line)
+      except ValueError:
+          continue
+      if message.get("reason") != "compiler-artifact":
+          continue
+      if message.get("target", {}).get("name") != "eqty_lineage_nemo_relay":
+          continue
+      for name in message.get("filenames", []):
+          if name.endswith((".dylib", ".so", ".dll")):
+              print(name)
+  ' | tail -1)
+  cd "$root"
+  if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
+    echo "cargo reported no cdylib for eqty_lineage_nemo_relay" >&2
+    exit 1
+  fi
+  lib=$(basename "$artifact")
   rm -rf dist/relay-plugin && mkdir -p dist/relay-plugin
-  cp "packages/eqty-lineage-nemo-relay/target/release/$lib" dist/relay-plugin/
+  cp "$artifact" dist/relay-plugin/
   cp packages/eqty-lineage-nemo-relay/config.schema.json dist/relay-plugin/
   cp packages/eqty-lineage-nemo-relay/relay-plugin.toml dist/relay-plugin/
   cd dist/relay-plugin
