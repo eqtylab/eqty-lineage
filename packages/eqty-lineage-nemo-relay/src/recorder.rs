@@ -42,7 +42,7 @@ use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
 use serde_json::{Value, json};
 
-use crate::files::{FileMode, FileObserved, apply_edit};
+use crate::files::{FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit};
 use crate::lineage::{AssetRef, LineageSession};
 use crate::redaction::{Disposition, Policy};
 
@@ -133,9 +133,24 @@ impl Recorder {
                 .get(edit.replay_from.as_deref().unwrap_or(path.as_str()))
         {
             let previous = String::from_utf8_lossy(previous).into_owned();
-            // An edit that cannot promise its own uniqueness must find exactly one match, or the
-            // replay is a guess about which occurrence the tool meant.
-            if edit.unique_only && previous.matches(&edit.old).count() != 1 {
+            if edit.line_oriented {
+                // A patch hunk. Matched as runs of whole lines, which is the unit the patch speaks
+                // in -- and which is what makes its uniqueness check mean anything. Matched as a
+                // substring, a line terminator decides uniqueness instead, and `b\n` occurring once
+                // in `b\nb` where `b` occurs twice let the replacement land at the wrong end.
+                match apply_line_edit(&previous, &edit.old, &edit.new) {
+                    Ok(replayed) => {
+                        data = Some(replayed.into_bytes());
+                        basis = Some(BASIS_REPLAYED);
+                        self.count("ContentRecovered");
+                    }
+                    Err(ReplayRefusal::Ambiguous) => self.count("EditTooAmbiguousToReplay"),
+                    Err(ReplayRefusal::NotFound) => self.count("EditDidNotMatchHeldContent"),
+                    Err(ReplayRefusal::UnterminatedAtEof) => self.count("EditAtUnterminatedEof"),
+                }
+            } else if edit.unique_only && previous.matches(&edit.old).count() != 1 {
+                // A literal edit that cannot promise its own uniqueness must find exactly one match,
+                // or the replay is a guess about which occurrence the tool meant.
                 self.count("EditTooAmbiguousToReplay");
             } else if let Some(replayed) = apply_edit(
                 Some(&previous),

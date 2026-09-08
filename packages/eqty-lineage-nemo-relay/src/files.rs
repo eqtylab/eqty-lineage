@@ -47,7 +47,18 @@ pub struct EditAttempt {
     /// is the edit that happened. A Codex `apply_patch` hunk carries no such promise: the real patch
     /// that prompted this was `-two` / `+TWO` with no context lines at all, and replacing the first
     /// `two` in a file containing several would content-address a version the file never had.
+    ///
+    /// Only consulted for a literal replay. A line-oriented one enforces uniqueness itself, over
+    /// runs of whole lines, which is the check this flag was reaching for and could not express.
     pub unique_only: bool,
+    /// Replay by replacing whole lines rather than a substring.
+    ///
+    /// True for a patch hunk, because a patch describes lines. A substring replay lets a line
+    /// terminator decide uniqueness, and that is not a distinction the patch drew: `b\n` occurs once
+    /// in `b\nb` where `b` occurs twice, so the anchor looks unique and the replacement lands at the
+    /// wrong end of the file. False for a Claude Code `Edit`, whose `old_string` is a literal span
+    /// that need not align to lines at all.
+    pub line_oriented: bool,
     /// The path whose established content this replays against, when it is not the observed path.
     ///
     /// Set only by a patch that moves a file: `*** Update File: a.txt` with `*** Move to: b.txt`
@@ -231,6 +242,7 @@ fn flush_update(
             new: as_lines(&update.after),
             replace_all: false,
             unique_only: true,
+            line_oriented: true,
             // Only meaningful for a move; `None` when the file stayed put.
             replay_from: update.moved_to.map(|_| source),
         }),
@@ -254,8 +266,12 @@ struct Update {
 /// what the tool produced. The uniqueness guard does not catch it, because `b` really does occur
 /// once.
 ///
-/// A hunk at the end of a file with no trailing newline will now fail to match rather than replay,
-/// which is the right direction to fail in: refusing to reconstruct beats reconstructing wrongly.
+/// Restoring the terminator is necessary but **not sufficient**, and on its own it made things worse
+/// in one case: it narrows what `old` matches, which can turn an ambiguous anchor into an apparently
+/// unique one. Against the unterminated file `b\nb`, the hunk `-b` / `+c` searched for `b\n`, matched
+/// the *first* line exactly once, passed the uniqueness guard and recorded `c\nb` -- while the two
+/// bare `b`s had previously refused the replay outright. So the replay of a hunk is line-oriented
+/// rather than a substring replacement; see [`apply_line_edit`].
 fn as_lines(lines: &[String]) -> String {
     if lines.is_empty() {
         return String::new();
@@ -263,6 +279,74 @@ fn as_lines(lines: &[String]) -> String {
     let mut text = lines.join("\n");
     text.push('\n');
     text
+}
+
+/// Why a line-oriented replay was refused.
+///
+/// Distinguished rather than collapsed into `None`, because coverage should say which kind of
+/// not-knowing this was: a stale belief about the file, an anchor that could mean two things, or a
+/// transformation whose exact bytes the hunk does not determine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRefusal {
+    /// The removed lines occur more than once, so which run the hunk meant is not established.
+    Ambiguous,
+    /// They do not occur at all: what we hold is not what the patch was written against.
+    NotFound,
+    /// They reach the end of a file with no final newline, where the result's exact bytes are not
+    /// recoverable -- whether the preceding line keeps its terminator depends on what the tool did,
+    /// not on what the hunk says.
+    UnterminatedAtEof,
+}
+
+/// Replay a patch hunk as a replacement of whole lines.
+///
+/// A patch speaks in lines, so the anchor has to be matched in lines. Matching it as a substring
+/// lets a terminator decide uniqueness -- `b\n` occurs once in `b\nb` where `b` occurs twice -- and
+/// the uniqueness guard then approves a replacement at the wrong end of the file. Comparing runs of
+/// whole lines makes the guard operate on the unit the patch actually describes.
+///
+/// Requires exactly one match. `replace_all` has no meaning here: a hunk describes one edit at one
+/// place, and a hunk whose anchor appears twice has not said which.
+pub fn apply_line_edit(previous: &str, old: &str, new: &str) -> Result<String, ReplayRefusal> {
+    let terminated = previous.ends_with('\n');
+    let held: Vec<&str> = previous.lines().collect();
+    let removed: Vec<&str> = old.lines().collect();
+    let added: Vec<&str> = new.lines().collect();
+
+    if removed.is_empty() || removed.len() > held.len() {
+        return Err(ReplayRefusal::NotFound);
+    }
+
+    let mut found: Option<usize> = None;
+    for start in 0..=(held.len() - removed.len()) {
+        if held[start..start + removed.len()] == removed[..] {
+            if found.is_some() {
+                return Err(ReplayRefusal::Ambiguous);
+            }
+            found = Some(start);
+        }
+    }
+    let start = found.ok_or(ReplayRefusal::NotFound)?;
+    let end = start + removed.len();
+
+    // The final line carries no terminator, so a hunk touching it cannot say whether the line before
+    // it keeps one. Deleting `b` from `a\nb` yields `a\n` or `a` depending on the tool, and the patch
+    // is silent on which.
+    if !terminated && end == held.len() {
+        return Err(ReplayRefusal::UnterminatedAtEof);
+    }
+
+    let mut result: Vec<&str> = Vec::with_capacity(held.len() - removed.len() + added.len());
+    result.extend_from_slice(&held[..start]);
+    result.extend_from_slice(&added);
+    result.extend_from_slice(&held[end..]);
+
+    let mut text = result.join("\n");
+    // Reassembly restores exactly what the split removed, so an unterminated file stays that way.
+    if terminated && !text.is_empty() {
+        text.push('\n');
+    }
+    Ok(text)
 }
 
 /// A file we know was touched and whose content we could not establish.
@@ -430,6 +514,8 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
             replace_all,
             // The tool guarantees its own uniqueness; see `EditAttempt::unique_only`.
             unique_only: false,
+            // `old_string` is a literal span that need not align to line boundaries.
+            line_oriented: false,
             // An `Edit` acts in place.
             replay_from: None,
         }),

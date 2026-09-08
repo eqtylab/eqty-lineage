@@ -155,6 +155,7 @@ async fn an_edit_is_replayed_against_what_the_session_already_knows() {
         new: "x = 2".into(),
         replace_all: false,
         unique_only: false,
+        line_oriented: false,
         replay_from: None,
     });
     rec.observe_file(&edit, true, None).await.unwrap();
@@ -185,6 +186,7 @@ async fn a_replay_against_the_wrong_pre_image_is_refused() {
         new: "x = 2".into(),
         replace_all: false,
         unique_only: false,
+        line_oriented: false,
         replay_from: None,
     });
     rec.observe_file(&edit, true, None).await.unwrap();
@@ -516,6 +518,7 @@ async fn an_ambiguous_patch_hunk_is_refused_rather_than_guessed() {
         new: "TWO".into(),
         replace_all: false,
         unique_only: true,
+        line_oriented: false,
         replay_from: None,
     });
     rec.observe_file(&update, true, None).await.unwrap();
@@ -555,6 +558,7 @@ async fn an_unambiguous_patch_hunk_is_replayed() {
         new: "TWO".into(),
         replace_all: false,
         unique_only: true,
+        line_oriented: false,
         replay_from: None,
     });
     rec.observe_file(&update, true, None).await.unwrap();

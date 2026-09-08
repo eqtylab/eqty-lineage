@@ -8,8 +8,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use eqty_lineage_nemo_relay::{
-    EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, Policy, Recorder,
-    SessionFinished, SessionRouter, SignerFactory, apply_edit, classify, file_events_from_patch,
+    EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, Policy, Recorder, ReplayRefusal,
+    SessionFinished, SessionRouter, SignerFactory, apply_edit, apply_line_edit, classify,
+    file_events_from_patch,
 };
 use integrity::lineage::models::manifest::Manifest;
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
@@ -47,12 +48,21 @@ fn seen(path: &str, content: Option<&[u8]>, mode: FileMode) -> FileObserved {
     }
 }
 
+/// A one-file `Update File` patch whose hunk is the given lines.
+fn hunk(path: &str, lines: &[&str]) -> String {
+    format!(
+        "*** Begin Patch\n*** Update File: {path}\n@@\n{}\n*** End Patch",
+        lines.join("\n")
+    )
+}
+
 fn anchored(old: &str, new: &str) -> Option<EditAttempt> {
     Some(EditAttempt {
         old: old.into(),
         new: new.into(),
         replace_all: false,
         unique_only: false,
+        line_oriented: false,
         replay_from: None,
     })
 }
@@ -425,64 +435,127 @@ async fn a_read_we_could_not_establish_keeps_the_replay_base() {
 fn deleting_a_line_takes_its_newline_with_it() {
     // The halves were joined with `join("\n")`, which drops the last line's terminator. Deleting `b`
     // from `a\nb\nc\n` became the replacement `b` -> `` and produced `a\n\nc\n` -- a blank line the
-    // patch never created. The uniqueness guard passes it, because `b` really does occur once.
-    let patch = "*** Begin Patch\n\
-                 *** Update File: /work/x.txt\n\
-                 @@\n\
-                 -b\n\
-                 *** End Patch";
-    let events = file_events_from_patch(patch, Some("c1"));
+    // patch never created.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c1"));
     let edit = events[0].edit.as_ref().expect("a replayable edit");
     assert_eq!(edit.old, "b\n", "the removed line keeps its terminator");
     assert_eq!(edit.new, "");
+    assert!(
+        edit.line_oriented,
+        "and a hunk replays in lines, not substrings"
+    );
 
     assert_eq!(
-        apply_edit(Some("a\nb\nc\n"), Some(&edit.old), Some(&edit.new), false).as_deref(),
-        Some("a\nc\n"),
+        apply_line_edit("a\nb\nc\n", &edit.old, &edit.new).as_deref(),
+        Ok("a\nc\n"),
         "which is what the patch does to the file"
     );
 }
 
 #[test]
+fn an_eof_anchored_hunk_cannot_be_answered_by_an_earlier_line() {
+    // Restoring the terminator alone made one case *worse* than before it. It narrows what the anchor
+    // matches, so against the unterminated file `b\nb` the hunk `-b` / `+c` searched for `b\n`,
+    // matched the FIRST line exactly once, passed the uniqueness guard and recorded `c\nb` -- while
+    // the two bare `b`s had previously refused the replay outright. A fix that turns a refusal into a
+    // wrong answer is worse than the bug it fixed.
+    //
+    // The uniqueness of an anchor is only meaningful in the unit the patch speaks in. Matched as runs
+    // of whole lines, `b` occurs twice in `b\nb` and the hunk has not said which one it meant.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b", "+c"]), Some("c2"));
+    let edit = events[0].edit.as_ref().unwrap();
+
+    assert_eq!(
+        apply_line_edit("b\nb", &edit.old, &edit.new),
+        Err(ReplayRefusal::Ambiguous),
+        "two candidate lines, so no reconstruction"
+    );
+    // The substring replay it replaced would have answered `c\nb`, at the wrong end of the file.
+    assert_eq!(
+        apply_edit(Some("b\nb"), Some(&edit.old), Some(&edit.new), false).as_deref(),
+        Some("c\nb")
+    );
+}
+
+#[tokio::test]
+async fn an_ambiguous_hunk_is_counted_rather_than_reconstructed() {
+    // End to end: the refusal has to reach coverage, or a reader cannot tell a file whose edit we
+    // declined to replay from one that was never edited.
+    let mut rec = recorder();
+    rec.observe_file(&seen("/w/x.txt", Some(b"b\nb"), FileMode::Read), true, None)
+        .await
+        .unwrap();
+    let events = file_events_from_patch(&hunk("/w/x.txt", &["-b", "+c"]), Some("c3"));
+    rec.observe_file(&events[0], true, None).await.unwrap();
+
+    assert_eq!(rec.stats().get("ContentRecovered"), None);
+    assert_eq!(rec.stats().get("EditTooAmbiguousToReplay"), Some(&1));
+}
+
+#[test]
 fn a_substitution_hunk_still_replays_exactly() {
-    // The guard on the fix above: restoring terminators must not break the case that already worked.
-    let patch = "*** Begin Patch\n\
-                 *** Update File: /work/report.md\n\
-                 @@\n\
-                 one\n\
-                 -two\n\
-                 +TWO\n\
-                 three\n\
-                 *** End Patch";
-    let events = file_events_from_patch(patch, Some("c2"));
+    // The guard on the fix above: restoring terminators and matching in lines must not break the case
+    // that already worked.
+    let events = file_events_from_patch(
+        &hunk("/work/report.md", &["one", "-two", "+TWO", "three"]),
+        Some("c4"),
+    );
     let edit = events[0].edit.as_ref().expect("a replayable edit");
     assert_eq!(
-        apply_edit(
-            Some("one\ntwo\nthree\n"),
-            Some(&edit.old),
-            Some(&edit.new),
-            false
-        )
-        .as_deref(),
-        Some("one\nTWO\nthree\n")
+        apply_line_edit("one\ntwo\nthree\n", &edit.old, &edit.new).as_deref(),
+        Ok("one\nTWO\nthree\n")
     );
 }
 
 #[test]
-fn a_hunk_that_needs_a_missing_final_newline_is_refused_not_guessed() {
-    // Restoring terminators means a hunk at the end of a file with no trailing newline no longer
-    // matches. That is the right direction to fail in: refusing to reconstruct beats reconstructing
-    // wrongly, and the node stays identity-only rather than carrying an invented CID.
-    let patch = "*** Begin Patch\n\
-                 *** Update File: /work/x.txt\n\
-                 @@\n\
-                 -b\n\
-                 *** End Patch";
-    let events = file_events_from_patch(patch, Some("c3"));
+fn a_hunk_touching_an_unterminated_final_line_is_refused() {
+    // Deleting `b` from `a\nb` leaves `a\n` or `a` depending on what the tool did with the preceding
+    // line's terminator, and the hunk does not say. Refused with its own reason rather than guessed,
+    // and rather than lumped in with a stale-belief mismatch.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c5"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_edit(Some("a\nb"), Some(&edit.old), Some(&edit.new), false),
-        None
+        apply_line_edit("a\nb", &edit.old, &edit.new),
+        Err(ReplayRefusal::UnterminatedAtEof)
+    );
+    // The same hunk against the terminated file is fine.
+    assert_eq!(
+        apply_line_edit("a\nb\n", &edit.old, &edit.new).as_deref(),
+        Ok("a\n")
+    );
+}
+
+#[test]
+fn an_unterminated_file_edited_above_its_last_line_stays_unterminated() {
+    // Reassembly has to restore exactly what the split removed, not append a terminator by habit.
+    // Here the window does not touch the final line, so the replay is allowed -- and `c` must keep
+    // its missing newline, or the reconstruction is a different file from the one on disk.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c7"));
+    let edit = events[0].edit.as_ref().unwrap();
+    assert_eq!(
+        apply_line_edit("a\nb\nc", &edit.old, &edit.new).as_deref(),
+        Ok("a\nc")
+    );
+}
+
+#[test]
+fn deleting_every_line_leaves_an_empty_file_not_a_blank_one() {
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-only"]), Some("c8"));
+    let edit = events[0].edit.as_ref().unwrap();
+    assert_eq!(
+        apply_line_edit("only\n", &edit.old, &edit.new).as_deref(),
+        Ok(""),
+        "an emptied file is empty, not a single newline"
+    );
+}
+
+#[test]
+fn a_hunk_written_against_content_we_do_not_hold_is_refused() {
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-zzz", "+q"]), Some("c6"));
+    let edit = events[0].edit.as_ref().unwrap();
+    assert_eq!(
+        apply_line_edit("a\nb\n", &edit.old, &edit.new),
+        Err(ReplayRefusal::NotFound)
     );
 }
 

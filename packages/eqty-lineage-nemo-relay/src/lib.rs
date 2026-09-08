@@ -39,8 +39,8 @@ mod session;
 pub use classify::{Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{
-    EditAttempt, FileMode, FileObserved, apply_edit, file_events_from_patch,
-    file_events_from_result,
+    EditAttempt, FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit,
+    file_events_from_patch, file_events_from_result,
 };
 pub use lineage::{AssetRef, LineageSession};
 pub use mailbox::{Mailbox, SessionFinished, SignerFactory};
