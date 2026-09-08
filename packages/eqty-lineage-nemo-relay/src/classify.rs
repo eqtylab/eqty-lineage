@@ -281,9 +281,10 @@ fn is_subagent_scope(event: &Event, metadata: Option<&Json>) -> bool {
     if string_at(metadata, "nemo_relay_scope_role") == Some("subagent") {
         return true;
     }
-    !event
+    // Read directly rather than as `!is_none_or(==)`: a scope with a parent that is not itself.
+    event
         .parent_uuid()
-        .is_none_or(|parent| parent == event.uuid())
+        .is_some_and(|parent| parent != event.uuid())
 }
 
 /// What to call a subagent in the graph.
