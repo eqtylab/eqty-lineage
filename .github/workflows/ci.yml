@@ -25,37 +25,9 @@ defaults:
   run:
     shell: nix develop --command bash -e {0}
 
-# Two jobs: Python feedback should not wait behind Rust, and Rust's own steps should not pay for the
-# same compile twice.
-#
-# The split was briefly three, and the measurement said that was wrong. On run 34260626670 the two
-# separate Rust jobs took 10m17s and 27m32s, because each compiled the debug dependency tree from
-# nothing -- `integrity`, with iroh and ssi beneath it. Inside one job clippy compiles those
-# dependencies and `cargo test` reuses them: clippy only wraps workspace crates, so everything
-# beneath is ordinary rustc output and cache-identical. Merging them cost about two minutes of wall
-# clock (27m32s -> 29m18s, because lint and test now run in sequence) to save about nine minutes of
-# CPU -- and left one dependency tree to cache instead of three, which is what makes the step below
-# worth having.
-#
-# This file used to say caching did not fit the 10 GB per-repository budget, because one clean debug
-# tree is 10.9 GB. That was the wrong comparison: the budget counts the compressed archive, not the
-# directory. Run 34274120849 saved 1.27 GB -- `rust-cache` prunes the registry sources, `incremental/`
-# and the workspace crates' own artifacts, then zstd handles the rest, which compresses rust debug
-# output about 4x. Roughly seven entries fit.
-#
-# `rust-cache` writes one entry per job, lockfile and toolchain rather than one per push, so seven is
-# about `main` plus a healthy number of active pull requests. If it ever starts evicting, `save-if:`
-# limited to `refs/heads/main` trades warm caches on PR branches for one authoritative entry.
 jobs:
   python:
     runs-on: ubuntu-latest
-    env:
-      # Vestigial: `eqty-sdk` now resolves from public PyPI and nothing in this workspace reads the
-      # private index. Kept until PR #17's `eqty-lineage-vnim` -- which still pins
-      # `eqty-sdk = { index = "eqty" }` -- either merges or drops that pin, so whichever lands first
-      # does not break `uv sync` on main.
-      UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
-      UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
     steps:
       - name: Install Nix
         uses: eqtylab-actions/install-nix-action@v31
