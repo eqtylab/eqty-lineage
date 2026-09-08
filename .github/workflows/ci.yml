@@ -81,16 +81,19 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # A `Free runner disk` step used to sit here, deleting ~22 GB of preinstalled toolchains at a
-      # cost of 94-144s. It was load-bearing when one job held both dependency trees; now that each
-      # leg holds one, run 34279463567 measured the peak at 10 GB (plugin) and 9 GB (abi-test)
-      # against the 14 GB a runner starts with. The readings stay, so a leg that does run out says
-      # which phase took the space. To restore it:
-      #   sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
-      #     "$AGENT_TOOLSDIRECTORY" || true
-      - name: Disk at start
+      # A runner starts with 14 GB free and the plugin leg wants 11.5 GB of it: 7.7 GB for the dev
+      # shell and the restored cache, then 3.8 GB of build on top. Run 34281709425 ran without this
+      # step and finished at 2.5 GB, which is 97% and too thin to leave.
+      #
+      # The android SDK alone is most of what used to be deleted here, and deleting only it keeps the
+      # step short. The rest of the old list, if this margin ever tightens again:
+      #   /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+      - name: Free runner disk
         shell: bash -e {0}
-        run: df -h / | tail -1 | xargs echo "free at start:"
+        run: |
+          df -h / | tail -1 | xargs echo "free at start:"
+          sudo rm -rf /usr/local/lib/android || true
+          df -h / | tail -1 | xargs echo "free after cleanup:"
       # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
       # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
       # image's rustup toolchain rather than the dev shell's nixpkgs one. Its own log says so --
