@@ -155,6 +155,18 @@ provenance does not require publication — and that node is content-addressed o
 so it is deterministic across runs *and* independent of where the file sat. Two recordings that read
 the same secret join on it whatever path each saw it at.
 
+**Withholding a file withholds it from the call that touched it, too.** A `Read` result *is* the file;
+a `Write`'s arguments *are* the file. So a policy applied only to the file node left the same bytes
+in the graph beside it, and the manifest reported a redaction it had not performed — the worst of the
+three outcomes, because it tells a reader the secret is not there. Both payloads now inherit the
+policy of every path their call touched, and say `withheldBecause: quotes-a-denied-file`. Withholding
+is all-or-nothing per payload: partially scrubbing a JSON blob is a guess about where the bytes are,
+and a wrong guess is a leak wearing the shape of a redaction.
+
+The floor this cannot reach is the shell. `cat /app/.env` through `Bash` attributes its output to no
+path we can see, so nothing marks it — the same visibility gap as tool file effects. `deny_globs` is
+a floor, not a guarantee, and a session that reads secrets through a shell is outside it.
+
 ## Running it against a live session
 
 `docs/live-session-script.md` is a twelve-turn script that drives every path this recorder can record

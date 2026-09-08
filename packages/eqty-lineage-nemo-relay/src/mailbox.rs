@@ -653,10 +653,23 @@ async fn record_tool(
         }
     };
 
+    // Nothing below this point may infer a file effect once the host has said the call failed.
+    //
+    // Both remaining sources are inferences from what the agent *asked for*: the patch it submitted
+    // and the arguments it passed. A rejected `Add File` would otherwise register the requested
+    // bytes as a written file, count a `FileWritten`, and seed the replay chain with content that
+    // was never on disk -- so a later edit could be "recovered" from it. The activity and its
+    // arguments are still recorded; only the claim that files changed is dropped.
+    let rejected = is_error == Some(true);
+    if rejected && observations.is_empty() {
+        state.recorder.note_inference_skipped_after_failure();
+    }
+
     // Codex edits files by handing a patch document to the shell, so nothing above sees it. The
     // patch is in the tool's *arguments*, not its result -- another case where having both halves
     // of the scope is what makes the lineage recoverable at all.
-    if observations.is_empty()
+    if !rejected
+        && observations.is_empty()
         && let Some(open) = &open
         && let Some(patch) = open
             .input
@@ -672,11 +685,14 @@ async fn record_tool(
         observations = file_events_from_patch(patch, tool_use_id);
     }
 
-    if observations.is_empty() {
+    if !rejected && observations.is_empty() {
         // The result said nothing about a file. The *arguments* still might: Relay passes the tool
         // input through verbatim, so a `Write` or `Read` names its path there even when the result
         // is a bare string. That yields an identity-only node -- this path was touched, content not
         // established -- which is worth more than silence and is honest about what was seen.
+        //
+        // Also gated on failure, and not only the patch branch above: this fallback infers the mode
+        // from the tool's *name*, so a `Write` that returned `EACCES` was recorded as a file written.
         if let Some(observation) = observation_from_arguments(open.as_ref(), tool_use_id) {
             observations.push(observation);
         }
@@ -689,6 +705,15 @@ async fn record_tool(
     if observations.is_empty() {
         state.recorder.note_no_file_observation();
     }
+
+    // Every path this call touched. The payloads below may reproduce the contents of any of them --
+    // a `Read` result *is* the file, a `Write` input *is* the file -- so they inherit those paths'
+    // policy. Without this, withholding `/app/.env` on its own node stored the same bytes verbatim
+    // in the call that produced them, and the manifest reported a redaction it had not performed.
+    let touched: Vec<String> = observations
+        .iter()
+        .map(|observation| observation.path.clone())
+        .collect();
 
     let mut inputs: Vec<AssetRef> = Vec::new();
     let mut outputs: Vec<AssetRef> = Vec::new();
@@ -715,20 +740,22 @@ async fn record_tool(
     // that is most of the information missing. The arguments are an input for the same reason the
     // result is an output: the run consumed them.
     //
-    // `register_payload` applies the size policy, so a large `Write` body is withheld and recorded
-    // by CID rather than inlined.
+    // The size policy applies, so a large `Write` body is withheld and recorded by CID rather than
+    // inlined -- and so does the deny list of every file this call touched, since a `Write` to a
+    // denied path carries that file's content in its arguments.
     if let Some(open) = &open
         && let Some(input) = open.input.as_ref()
         && let Ok(body) = serde_json::to_vec(input)
         && let Ok(asset) = state
             .recorder
-            .register_payload(
+            .register_quoting_payload(
                 "Dataset",
                 &format!("{} input", open.name),
                 &format!("What the '{}' tool was invoked with.", open.name),
                 &body,
                 serde_json::json!({ "toolUseId": tool_use_id }),
                 at.clone(),
+                &touched,
             )
             .await
     {
@@ -760,13 +787,14 @@ async fn record_tool(
         && let Ok(body) = serde_json::to_vec(result)
         && let Ok(asset) = state
             .recorder
-            .register_payload(
+            .register_quoting_payload(
                 "Dataset",
                 &format!("{name} result"),
                 &format!("What the '{name}' tool returned."),
                 &body,
                 serde_json::json!({ "toolUseId": tool_use_id, "observed": observed }),
                 at.clone(),
+                &touched,
             )
             .await
     {
@@ -824,12 +852,23 @@ fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
             }
         })
         .collect();
-    let mut path = manifest_dir.join(format!("{safe}.json"));
+    unclobbered(manifest_dir, &safe)
+}
+
+/// The first free name in the `{stem}.json`, `{stem}.1.json`, … series.
+///
+/// Shared with the export path, which is the whole point. `manifest_path` used to run this check
+/// itself against `{id}.json`, but an agentless session is written as `{id}.unattributed.json` and
+/// its `{id}.json` checkpoint is deleted -- so the next recording under the same id found `{id}.json`
+/// free, picked it, and overwrote the earlier export. The guard was testing a filename the code does
+/// not use.
+fn unclobbered(dir: &Path, stem: &str) -> PathBuf {
+    let mut path = dir.join(format!("{stem}.json"));
     for sequence in 1..1000 {
         if !path.exists() {
             break;
         }
-        path = manifest_dir.join(format!("{safe}.{sequence}.json"));
+        path = dir.join(format!("{stem}.{sequence}.json"));
     }
     path
 }
@@ -911,10 +950,17 @@ fn export(
     // It is still written, under a name that says what it is. Dropping it would lose a real model
     // call, and would silently record nothing at all if a host ever stopped emitting
     // `session.start` -- the failure this recorder is least willing to have.
-    let path = if state.agent.is_none() {
-        state.path.with_extension("unattributed.json")
-    } else {
-        state.path.clone()
+    // Resolved against the *final* name, not the session-shaped one. Two agentless recordings under
+    // one session id are two recordings, and the second must not replace the first.
+    let path = match (
+        state.agent.is_none(),
+        state.path.parent(),
+        state.path.file_stem(),
+    ) {
+        (true, Some(dir), Some(stem)) => {
+            unclobbered(dir, &format!("{}.unattributed", stem.to_string_lossy()))
+        }
+        _ => state.path.clone(),
     };
     let checkpoint = state.path.clone();
     let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {

@@ -70,17 +70,24 @@ impl Policy {
     /// The deny list is checked against the full path and against its final component, so a pattern
     /// written as `.env*` catches `/srv/app/.env.production` as well as a bare `.env`.
     pub fn decide(&self, path: &str, len: usize) -> Disposition {
-        let basename = path.rsplit('/').next().unwrap_or(path);
-        if self
-            .deny_globs
-            .iter()
-            .any(|glob| glob_match(glob, path) || glob_match(glob, basename))
-        {
+        if self.denies(path) {
             return Disposition::Denied;
         }
         if len as u64 > self.max_content_bytes {
             return Disposition::TooLarge;
         }
         Disposition::Store
+    }
+
+    /// Whether `path` matches the deny list, independent of size.
+    ///
+    /// Separate from [`Self::decide`] because a payload that *quotes* a denied file must be withheld
+    /// on account of the path, whatever the payload's own size -- and asking `decide` about a path
+    /// while passing the payload's length would conflate the two.
+    pub fn denies(&self, path: &str) -> bool {
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        self.deny_globs
+            .iter()
+            .any(|glob| glob_match(glob, path) || glob_match(glob, basename))
     }
 }

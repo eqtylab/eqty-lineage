@@ -126,7 +126,11 @@ impl Recorder {
         // is what stops a stale pre-image minting a version the file never had.
         if data.is_none()
             && let Some(edit) = &event.edit
-            && let Some(previous) = self.last_content.get(&path)
+            // A patch that moves a file applies its hunk to the *source*, so the base is the source's
+            // content and the result belongs at the destination this event names.
+            && let Some(previous) = self
+                .last_content
+                .get(edit.replay_from.as_deref().unwrap_or(path.as_str()))
         {
             let previous = String::from_utf8_lossy(previous).into_owned();
             // An edit that cannot promise its own uniqueness must find exactly one match, or the
@@ -152,8 +156,15 @@ impl Recorder {
         };
 
         let key = (path.clone(), content_cid.clone());
-        if let Some(existing) = self.by_content.get(&key) {
-            return Ok(Some(existing.clone()));
+        if let Some(existing) = self.by_content.get(&key).cloned() {
+            // The node already exists, but the replay base must still move. A file that went from A
+            // to B and back to A leaves B cached otherwise, and the next edit anchored on A is either
+            // refused or -- if its `old` text happens to occur in B as well -- replayed against
+            // content the file no longer holds.
+            if let Some(bytes) = data {
+                self.last_content.insert(path, bytes);
+            }
+            return Ok(Some(existing));
         }
 
         let version = self.versions.entry(path.clone()).or_insert(0);
@@ -217,8 +228,20 @@ impl Recorder {
             }
         };
 
-        if let Some(bytes) = data {
-            self.last_content.insert(path.clone(), bytes);
+        match (data, event.mode) {
+            (Some(bytes), _) => {
+                self.last_content.insert(path.clone(), bytes);
+            }
+            // A write we could not reconstruct means what is on disk is no longer what we hold.
+            // Keeping the old bytes lets a later edit "recover" a version built from content that
+            // write replaced -- a fabricated file version, content-addressed and signed. Every Codex
+            // `Update File` whose hunk does not replay lands here, so this is the common path.
+            (None, FileMode::Wrote) => {
+                self.last_content.remove(&path);
+            }
+            // A read we could not establish -- a truncated `Read` -- changed nothing on disk, so
+            // what we already hold is still the file's content and still a valid base.
+            (None, FileMode::Read) => {}
         }
         self.by_content.insert(key, asset.clone());
         self.count(match event.mode {
@@ -243,18 +266,71 @@ impl Recorder {
         extra: Value,
         at: Option<String>,
     ) -> Result<AssetRef> {
+        self.register(kind, name, description, bytes, extra, at, &[])
+            .await
+    }
+
+    /// Register a payload that may carry the contents of files, and inherit their policy.
+    ///
+    /// A tool's result *is* the file, for a `Read`; its arguments *are* the file, for a `Write`. So
+    /// withholding `/app/.env` on its own node while storing the call that produced it left the
+    /// secret in the manifest in full -- the file node said `withheld` and the graph beside it held
+    /// the bytes. The deny list is written for paths, and a payload named `Read result` is not one,
+    /// so nothing matched.
+    ///
+    /// `quotes` names the paths this payload may reproduce. If policy denies any of them, the whole
+    /// payload is withheld: a partial redaction of a JSON blob is a guess about where the bytes are,
+    /// and the wrong guess is a leak that looks like a redaction.
+    ///
+    /// **This does not reach content a tool never attributed to a file.** `cat /app/.env` through
+    /// `Bash` names no path we can see, so its output is stored -- the same shell-visibility gap as
+    /// §7.1's file effects, and the reason `deny_globs` is a floor rather than a guarantee.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_quoting_payload(
+        &mut self,
+        kind: &str,
+        name: &str,
+        description: &str,
+        bytes: &[u8],
+        extra: Value,
+        at: Option<String>,
+        quotes: &[String],
+    ) -> Result<AssetRef> {
+        self.register(kind, name, description, bytes, extra, at, quotes)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn register(
+        &mut self,
+        kind: &str,
+        name: &str,
+        description: &str,
+        bytes: &[u8],
+        extra: Value,
+        at: Option<String>,
+        quotes: &[String],
+    ) -> Result<AssetRef> {
         let content_cid = blake3_cid_raw_binary(bytes)?;
-        // The deny list is matched against the payload's *name*, not a filesystem path -- there is no
-        // path here. A payload is named after what produced it (`prompt`, `completion`, `Bash input`),
-        // so a glob like `*credentials*` withholds the arguments of a tool called `get_credentials`.
-        // That is the intended reach, and it is why the reason travels with the node: "denied" and
-        // "too large" are different claims and a reader acts on them differently.
-        let disposition = self.policy.decide(name, bytes.len());
+        // The deny list is matched against the payload's *name* as well as any path it quotes. A
+        // payload is named after what produced it (`prompt`, `completion`, `Bash input`), so a glob
+        // like `*credentials*` withholds the arguments of a tool called `get_credentials`. That is
+        // the intended reach, and it is why the reason travels with the node: "denied", "quotes a
+        // denied file" and "too large" are different claims and a reader acts on them differently.
+        let mut disposition = self.policy.decide(name, bytes.len());
+        let mut quoted: Option<&str> = None;
+        if disposition == Disposition::Store
+            && let Some(path) = quotes.iter().find(|path| self.policy.denies(path))
+        {
+            disposition = Disposition::Denied;
+            quoted = Some(path.as_str());
+        }
         let withheld = disposition != Disposition::Store;
-        let reason = match disposition {
-            Disposition::Store => None,
-            Disposition::Denied => Some("denied-by-policy"),
-            Disposition::TooLarge => Some("larger-than-ceiling"),
+        let reason = match (disposition, quoted) {
+            (Disposition::Store, _) => None,
+            (Disposition::Denied, Some(_)) => Some("quotes-a-denied-file"),
+            (Disposition::Denied, None) => Some("denied-by-policy"),
+            (Disposition::TooLarge, _) => Some("larger-than-ceiling"),
         };
 
         let mut metadata = json!({
@@ -265,6 +341,7 @@ impl Recorder {
             "redacted": withheld,
             "contentState": if withheld { "withheld" } else { "stored" },
             "withheldBecause": reason,
+            "withheldFor": quoted,
             "content-cid": content_cid,
         });
         if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
@@ -431,6 +508,16 @@ impl Recorder {
             Some(false) => "ToolCallSucceeded",
             None => "ToolCallOutcomeUnknown",
         });
+    }
+
+    /// Note that a failed call's file effects were not inferred from what it asked for.
+    ///
+    /// The alternative was worse than a gap: a rejected patch registering its requested bytes as a
+    /// written file, and seeding the replay chain so a later edit could be "recovered" from content
+    /// that never reached disk. Counted so the gap is visible, since a failed call that touched
+    /// nothing and a failed call whose effects we declined to guess at look identical otherwise.
+    pub fn note_inference_skipped_after_failure(&mut self) {
+        self.count("FileInferenceSkippedAfterFailure");
     }
 
     /// Note a tool call whose end carried no result payload at all.

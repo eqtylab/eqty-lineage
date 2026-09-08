@@ -48,6 +48,13 @@ pub struct EditAttempt {
     /// that prompted this was `-two` / `+TWO` with no context lines at all, and replacing the first
     /// `two` in a file containing several would content-address a version the file never had.
     pub unique_only: bool,
+    /// The path whose established content this replays against, when it is not the observed path.
+    ///
+    /// Set only by a patch that moves a file: `*** Update File: a.txt` with `*** Move to: b.txt`
+    /// applies the hunk to `a.txt`'s content and writes the result at `b.txt`. Replaying against the
+    /// destination would find nothing cached and give up; recording the result at the source would
+    /// say the wrong file now holds those bytes.
+    pub replay_from: Option<String>,
 }
 
 /// One observed file version.
@@ -121,7 +128,7 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
     // the replacement is anchored rather than matching the first bare occurrence of a changed line
     // -- `-two` alone would match the word anywhere in the file, and `apply_edit` replaces
     // literally.
-    let mut updating: Option<(String, Vec<String>, Vec<String>)> = None;
+    let mut updating: Option<Update> = None;
 
     let flush = |adding: &mut Option<(String, Vec<String>)>, events: &mut Vec<FileObserved>| {
         if let Some((path, lines)) = adding.take() {
@@ -148,7 +155,19 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
         } else if let Some(path) = line.strip_prefix("*** Update File: ") {
             flush(&mut adding, &mut events);
             flush_update(&mut updating, &mut events, tool_use_id);
-            updating = Some((path.trim().to_string(), Vec::new(), Vec::new()));
+            updating = Some(Update {
+                path: path.trim().to_string(),
+                moved_to: None,
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+        } else if let Some(path) = line.strip_prefix("*** Move to: ") {
+            // A rename carried inside the update it accompanies. Ignoring it made the observation
+            // claim the source was rewritten in place and left the destination -- the file that
+            // actually ends up holding the post-image -- out of the graph entirely.
+            if let Some(update) = updating.as_mut() {
+                update.moved_to = Some(path.trim().to_string());
+            }
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
             flush(&mut adding, &mut events);
             flush_update(&mut updating, &mut events, tool_use_id);
@@ -160,15 +179,15 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
             && let Some(added) = line.strip_prefix('+')
         {
             lines.push(added.to_string());
-        } else if let Some((_, before, after)) = updating.as_mut() {
+        } else if let Some(update) = updating.as_mut() {
             // `@@` headers carry no content. Everything else is a context, removed or added line.
             if let Some(removed) = line.strip_prefix('-') {
-                before.push(removed.to_string());
+                update.before.push(removed.to_string());
             } else if let Some(added) = line.strip_prefix('+') {
-                after.push(added.to_string());
+                update.after.push(added.to_string());
             } else if let Some(context) = line.strip_prefix(' ') {
-                before.push(context.to_string());
-                after.push(context.to_string());
+                update.before.push(context.to_string());
+                update.after.push(context.to_string());
             }
         }
     }
@@ -185,31 +204,65 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
 /// think the file contained means our belief is stale, and inventing a version from it would
 /// content-address a state the file never had.
 fn flush_update(
-    updating: &mut Option<(String, Vec<String>, Vec<String>)>,
+    updating: &mut Option<Update>,
     events: &mut Vec<FileObserved>,
     tool_use_id: Option<&str>,
 ) {
-    let Some((path, before, after)) = updating.take() else {
+    let Some(update) = updating.take() else {
         return;
     };
+    // The post-image lands at the destination when the patch moves the file, and at the source
+    // otherwise.
+    let source = update.path;
+    let written = update.moved_to.clone().unwrap_or_else(|| source.clone());
     // Nothing to anchor against, so nothing to replay from.
-    if before.is_empty() || before == after {
-        events.push(identity_only(&path, FileMode::Wrote, tool_use_id));
+    if update.before.is_empty() || update.before == update.after {
+        events.push(identity_only(&written, FileMode::Wrote, tool_use_id));
         return;
     }
     events.push(FileObserved {
-        path,
+        path: written,
         content: None,
         mode: FileMode::Wrote,
         tool_use_id: tool_use_id.map(str::to_string),
         user_modified: false,
         edit: Some(EditAttempt {
-            old: before.join("\n"),
-            new: after.join("\n"),
+            old: as_lines(&update.before),
+            new: as_lines(&update.after),
             replace_all: false,
             unique_only: true,
+            // Only meaningful for a move; `None` when the file stayed put.
+            replay_from: update.moved_to.map(|_| source),
         }),
     });
+}
+
+/// One `*** Update File` block, accumulated as its lines arrive.
+struct Update {
+    path: String,
+    /// The destination of an accompanying `*** Move to:`, when there is one.
+    moved_to: Option<String>,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+/// Join hunk lines back into text, restoring the terminator each one had in the file.
+///
+/// `join("\n")` alone drops the last line's newline, and the loss is invisible until a deletion:
+/// removing `b` from `a\nb\nc\n` becomes the replacement `b` -> `` and yields `a\n\nc\n` -- a file
+/// carrying a blank line the patch never created, content-addressed and signed as though it were
+/// what the tool produced. The uniqueness guard does not catch it, because `b` really does occur
+/// once.
+///
+/// A hunk at the end of a file with no trailing newline will now fail to match rather than replay,
+/// which is the right direction to fail in: refusing to reconstruct beats reconstructing wrongly.
+fn as_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
 }
 
 /// A file we know was touched and whose content we could not establish.
@@ -377,6 +430,8 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
             replace_all,
             // The tool guarantees its own uniqueness; see `EditAttempt::unique_only`.
             unique_only: false,
+            // An `Edit` acts in place.
+            replay_from: None,
         }),
         _ => None,
     };

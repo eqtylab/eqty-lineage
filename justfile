@@ -114,24 +114,40 @@ nemo-relay-package:
     (umask 077 && openssl genpkey -algorithm ed25519 -out "$key")
     echo "generated a NEW dev signing key at $key (private -- do not commit or share)"
   fi
+  # Cargo names the cdylib per platform, and the digest is over one artifact -- so the name has to be
+  # selected here and written into the manifest, not hardcoded. `abi-test` has resolved it this way
+  # from the start; this recipe hardcoded `.dylib` and so failed on Linux *after* a successful build.
+  case "$(uname -s)" in
+    Darwin) lib=libeqty_lineage_nemo_relay.dylib ;;
+    Linux)  lib=libeqty_lineage_nemo_relay.so ;;
+    *) echo "unsupported platform for packaging: $(uname -s)" >&2; exit 1 ;;
+  esac
   cd packages/eqty-lineage-nemo-relay && cargo build --release --lib && cd ../..
   rm -rf dist/relay-plugin && mkdir -p dist/relay-plugin
-  cp packages/eqty-lineage-nemo-relay/target/release/libeqty_lineage_nemo_relay.dylib dist/relay-plugin/
+  cp "packages/eqty-lineage-nemo-relay/target/release/$lib" dist/relay-plugin/
   cp packages/eqty-lineage-nemo-relay/config.schema.json dist/relay-plugin/
   cp packages/eqty-lineage-nemo-relay/relay-plugin.toml dist/relay-plugin/
   cd dist/relay-plugin
-  lib=libeqty_lineage_nemo_relay.dylib
-  digest=$(shasum -a 256 "$lib" | awk '{print $1}')
+  # `shasum` is not everywhere; `sha256sum` is the GNU coreutils spelling.
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 "$lib" | awk '{print $1}')
+  else
+    digest=$(sha256sum "$lib" | awk '{print $1}')
+  fi
   openssl pkeyutl -sign -rawin -inkey "$key" -in "$lib" -out "$lib.sig.raw"
   base64 < "$lib.sig.raw" | tr -d '\n' > "$lib.sig"
   rm -f "$lib.sig.raw"
   pub="ed25519:$(openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
-  python3 - "$digest" "$lib.sig" <<'EOF'
+  python3 - "$digest" "$lib.sig" "$lib" <<'EOF'
   import re, sys
-  digest, signature = sys.argv[1], sys.argv[2]
+  digest, signature, lib = sys.argv[1], sys.argv[2], sys.argv[3]
   p = "relay-plugin.toml"
   s = open(p).read()
   s = re.sub(r'sha256 = "sha256:[^"]*"', f'sha256 = "sha256:{digest}"', s)
+  # The committed manifest is a template naming the macOS artifact. Both references have to follow
+  # the platform, or activation looks for a library that was never built.
+  s = re.sub(r'artifact = "[^"]*"', f'artifact = "{lib}"', s)
+  s = re.sub(r'library = "[^"]*"', f'library = "{lib}"', s)
   if "signature =" not in s:
       s = s.replace(f'sha256 = "sha256:{digest}"',
                     f'sha256 = "sha256:{digest}"\nsignature = "{signature}"')
