@@ -8,10 +8,26 @@ sync:
   uv sync --group dev --python "$(command -v python)" --no-managed-python --no-python-downloads
 
 # Build the whl and sdist for every workspace package (outputs to ./dist), and the Relay cdylib
-build:
+build: build-python build-relay
+
+# Build the whl and sdist for every workspace package (outputs to ./dist)
+build-python:
   uv build --all-packages --python "$(command -v python)" --no-managed-python --no-python-downloads
-  # Not a wheel: `kind = "rust_dynamic"` loads this through a C ABI, so the artifact is a per-platform
-  # shared library that ships with its own `relay-plugin.toml` and sha256 digest.
+
+# Not a wheel: `kind = "rust_dynamic"` loads this through a C ABI, so the artifact is a per-platform
+# shared library that ships with its own `relay-plugin.toml` and sha256 digest.
+#
+# Kept out of PR CI: it recompiles the whole dependency tree at a profile nothing else on the PR path
+# uses, measured at 107s and still climbing when that step was cancelled.
+#
+# Which leaves the release profile exercised only by `just nemo-relay-package` and `just
+# linux-check`, both run by hand. `release.yml` does NOT cover it -- that workflow resolves a
+# `PACKAGE@X.Y.Z` tag to a `pyproject.toml`, and this package has none, so it cannot release the
+# cdylib at all. Closing that is its own piece of work; until then a release build is a manual
+# gate, and this comment is the record of that rather than an assumption someone inherits.
+#
+# Build the Relay cdylib in release
+build-relay:
   cd packages/eqty-lineage-nemo-relay && cargo build --release
 
 # Build the whl and sdist for one workspace package (outputs to ./dist/<package>)
@@ -30,9 +46,15 @@ publish-package package:
 clean:
   rm -rf ./dist
 
-# Run the test suite
-test *ARGS:
+# Run every test suite
+test *ARGS: (test-python ARGS) test-rust
+
+# Run the Python test suite
+test-python *ARGS:
   uv run --no-sync pytest "$@"
+
+# Run the Rust test suites
+test-rust:
   cd packages/eqty-lineage-nemo-relay && cargo test
   # Its own crate, with its own dependency graph: it needs Relay's core, which cannot coexist with
   # `integrity`. See packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml.
@@ -54,10 +76,10 @@ langchain-diff-demo REF="":
 deepagents-demo *ARGS:
   uv run --no-sync python examples/deepagents/research_agent.py "$@"
 
-# Regenerate the golden content-CID vector the Relay plugin checks itself against
-#
 # The plugin has no Python dependency and must not grow one; this writes a fixture from eqty_sdk so
 # the Rust tests can assert cross-language agreement on asset identity without importing anything.
+#
+# Regenerate the golden content-CID vector the Relay plugin checks itself against
 relay-cid-vector:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -70,20 +92,37 @@ relay-cid-vector:
   echo "wrote $out"
 
 # Format every package in the repo
-fmt:
+fmt: fmt-python fmt-rust
+
+fmt-python:
   ruff format .
+
+fmt-rust:
   cd packages/eqty-lineage-nemo-relay && cargo fmt
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo fmt
 
 # Verify formatting without rewriting anything
-fmt-check:
+fmt-check: fmt-check-python fmt-check-rust
+
+fmt-check-python:
   ruff format --check .
+
+fmt-check-rust:
   cd packages/eqty-lineage-nemo-relay && cargo fmt --check
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo fmt --check
 
 # Lint every package in the repo
-lint:
+lint: lint-python lint-rust
+
+lint-python:
   ruff check .
+
+# Dependencies are compiled, never linted -- `Checking nemo-relay-plugin v0.8.3` in a CI log is cargo
+# making a dependency's types available, not checking its code. So there is nothing here to narrow to
+# "only our code"; the cost is compiling two deliberately incompatible dependency graphs from scratch.
+#
+# Clippy over both Rust crates
+lint-rust:
   cd packages/eqty-lineage-nemo-relay && cargo clippy --all-targets -- -D warnings
   cd packages/eqty-lineage-nemo-relay/abi-test && cargo clippy --all-targets -- -D warnings
 

@@ -20,19 +20,31 @@ defaults:
   run:
     shell: nix develop --command bash -e {0}
 
+# Three jobs rather than one sequential job, so Python feedback does not wait behind Rust. Measured
+# on run 34253208393: lint 387s, release build 107s and still going when cancelled, tests never
+# reached. Almost all of that is compiling two deliberately incompatible Rust dependency graphs --
+# `integrity` for the plugin, Relay's core for `abi-test` -- from scratch, since nothing caches
+# cargo artifacts between runs. Clippy never lints those dependencies; it only needs their types.
+#
+# The honest cost of the split: `rust-lint` and `rust-test` no longer share the debug dependency
+# build they shared inside one job, so total CPU nearly doubles to buy roughly 90s of wall clock.
+# Collapsing them back into one `rust` job that runs `just lint-rust && just test-rust` is the
+# cheaper shape if CPU minutes matter more than latency; caching cargo would make the question moot.
 jobs:
-  checks:
+  python:
     runs-on: ubuntu-latest
     env:
-     UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
-     UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
-
+      # Vestigial: `eqty-sdk` now resolves from public PyPI and nothing in this workspace reads the
+      # private index. Kept until PR #17's `eqty-lineage-vnim` -- which still pins
+      # `eqty-sdk = { index = "eqty" }` -- either merges or drops that pin, so whichever lands first
+      # does not break `uv sync` on main.
+      UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
+      UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
     steps:
       - name: Install Nix
         uses: eqtylab-actions/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
       - name: Cachix
         uses: eqtylab-actions/cachix-action@v16
         with:
@@ -40,49 +52,85 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
           skipPush: true
         continue-on-error: true
-
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Install dependencies
         run: just sync
-
       - name: Format
-        id: format
-        continue-on-error: true
-        run: just fmt-check
-
+        run: just fmt-check-python
       - name: Lint
-        id: lint
-        continue-on-error: true
-        run: just lint
-
-      - name: Build
-        id: build
-        continue-on-error: true
-        run: just build
-
+        run: just lint-python
       - name: Test
-        id: test
-        continue-on-error: true
-        run: just test
+        run: just test-python
+      # Wheels only. The cargo release build is `just build-relay`, deliberately off the PR path --
+      # see that recipe for what does and does not cover it.
+      - name: Build
+        run: just build-python
 
+  rust-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
+        with:
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+      - name: Format
+        run: just fmt-check-rust
+      - name: Lint
+        run: just lint-rust
+
+  rust-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
+        with:
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+      - name: Test
+        run: just test-rust
+
+  # One place to read the outcome. Parallel jobs already fail the run on their own -- this exists so
+  # the run summary names which of the three failed without opening each job. `if: always()` is what
+  # makes it report a failure rather than being skipped by one.
+  summary:
+    runs-on: ubuntu-latest
+    needs: [python, rust-lint, rust-test]
+    if: always()
+    defaults:
+      run:
+        shell: bash -e {0}
+    steps:
       - name: Summarize checks
-        if: always()
         run: |
           {
             echo "## CI results"
             echo
             echo "| Check | Result |"
             echo "| --- | --- |"
-            echo "| Format | ${{ steps.format.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Lint | ${{ steps.lint.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Build | ${{ steps.build.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Test | ${{ steps.test.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Python | ${{ needs.python.result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Rust lint | ${{ needs['rust-lint'].result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Rust tests | ${{ needs['rust-test'].result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Fail if a check failed
-        if: always() && (steps.format.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.build.outcome == 'failure' || steps.test.outcome == 'failure')
+        if: needs.python.result != 'success' || needs['rust-lint'].result != 'success' || needs['rust-test'].result != 'success'
         run: exit 1
