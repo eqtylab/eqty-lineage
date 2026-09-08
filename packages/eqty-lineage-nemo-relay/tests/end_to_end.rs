@@ -396,6 +396,26 @@ fn turn_scope(session: &str, uuid: &str, parent: &str, phase: &str) -> Event {
     .expect("a well-formed turn event")
 }
 
+/// Wait until the worker has written `how_many` manifests, rather than for a fixed duration.
+///
+/// A checkpoint happens on another thread. A sleep long enough on an idle laptop is a coin toss on a
+/// CI runner building two other jobs beside it: `a_manifest_exists_before_the_session_ends` passed
+/// here every time and failed there at 600ms. Polling asserts the same property without encoding an
+/// assumption about how fast the machine is.
+fn await_manifests(dir: &TempDir, how_many: usize) -> Vec<PathBuf> {
+    for _ in 0..300 {
+        let found = manifests(dir);
+        if found.len() >= how_many {
+            return found;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!(
+        "expected {how_many} manifest(s) within 30s, found {:?}",
+        manifests(dir)
+    );
+}
+
 fn decoded_blobs(path: &std::path::Path) -> String {
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     manifest["blobs"]
@@ -1253,11 +1273,9 @@ fn a_manifest_exists_before_the_session_ends() {
         }
     }
 
-    // Give the worker a moment to drain, without dropping the mailbox -- dropping it would flush.
-    std::thread::sleep(std::time::Duration::from_millis(600));
-
-    let written = manifests(&into);
-    assert_eq!(written.len(), 1, "a checkpoint should already be on disk");
+    // Waited for, not slept through, and the mailbox is deliberately not dropped -- dropping it
+    // would flush and prove nothing about mid-session writes.
+    let written = await_manifests(&into, 1);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(&written[0]).unwrap()).expect("checkpoint is valid JSON");
     assert!(
@@ -2089,19 +2107,55 @@ fn an_event_that_completes_nothing_writes_no_manifest() {
             mailbox.send(&session_id, event.timestamp().to_rfc3339(), classified);
         }
     }
+    // Absence is the one thing polling cannot establish: "no manifest yet" and "the worker has not
+    // started" look identical, and on a loaded machine a bare sleep really does mean the second. So
+    // the absence is paired with a positive control below -- if the worker were merely slow, that
+    // control would fail too, and it is what makes this half mean anything.
     std::thread::sleep(std::time::Duration::from_millis(600));
-
     assert!(
         manifests(&into).is_empty(),
         "nothing has completed, so nothing is worth rewriting the manifest for: {:?}",
         manifests(&into)
     );
 
-    // And the export at shutdown still writes everything, so nothing is lost by waiting.
+    // The control: complete the call. Now a checkpoint is warranted, and the worker writes one.
+    let end = tool_scope(
+        session,
+        call,
+        root,
+        "end",
+        "Read",
+        "toolu_f9",
+        serde_json::json!({ "file": { "filePath": "/work/pending.md", "content": "done\n",
+            "numLines": 1, "startLine": 1, "totalLines": 1 }, "type": "text" }),
+        None,
+    );
+    let session_id = router
+        .lock()
+        .expect("the router lock")
+        .attribute(&end)
+        .expect("the tool end attributes to the session");
+    mailbox.send(
+        &session_id,
+        end.timestamp().to_rfc3339(),
+        classify(&end).expect("a tool end classifies"),
+    );
+    let written = await_manifests(&into, 1);
+    assert!(
+        !decoded_blobs(&written[0]).contains("\"coverage\""),
+        "still a checkpoint, not an export"
+    );
+
+    // And the export at shutdown writes over the same path, now with coverage.
     drop(mailbox);
+    let final_manifests = manifests(&into);
     assert_eq!(
-        manifests(&into).len(),
+        final_manifests.len(),
         1,
-        "the session is written when it closes"
+        "one session is one manifest: {final_manifests:?}"
+    );
+    assert!(
+        decoded_blobs(&final_manifests[0]).contains("\"coverage\""),
+        "the finished recording states its coverage"
     );
 }
