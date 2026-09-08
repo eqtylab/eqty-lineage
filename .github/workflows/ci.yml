@@ -94,14 +94,19 @@ jobs:
           df -h / | tail -1 | xargs echo "free at start:"
           sudo rm -rf /usr/local/lib/android || true
           df -h / | tail -1 | xargs echo "free after cleanup:"
-      # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
-      # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
-      # image's rustup toolchain rather than the dev shell's nixpkgs one. Its own log says so --
-      # `Rust Version: 1.98.0` against the `rustc 1.96.1` we actually compile with. This step does
-      # run in the dev shell and hands the real version over as a key input below, so a nixpkgs bump
-      # misses the cache instead of restoring artifacts the current compiler will reject.
-      - name: Identify the dev shell's toolchain
-        run: echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
+      # `rust-cache` is a node action and does not run through `defaults.run.shell`, so left alone it
+      # keys the cache on the runner image's rustup toolchain -- a compiler we never build with. That
+      # pool is not homogeneous: 1.98.0 and 1.98.1 both appear, the key flipped between them, and a
+      # leg that drew the other image rebuilt everything. Run 34282231592 spent 379s in Lint where
+      # the run before it spent 9s. Two directories because nixpkgs ships cargo and rustc separately.
+      #
+      # `NIX_RUSTC_VERSION` stays as a key input: redundant while the PATH holds, and the thing that
+      # still pins the key to the right compiler if it ever does not.
+      - name: Put the dev shell's toolchain on PATH
+        run: |
+          dirname "$(command -v rustc)" >> "$GITHUB_PATH"
+          dirname "$(command -v cargo)" >> "$GITHUB_PATH"
+          echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
       # `rust-cache` rather than `actions/cache`, matching `eqtylab/integrity`. The difference that
       # matters is what it saves: it prunes the target directory to dependency artifacts, dropping
       # `incremental/` and our own crates' output, so the cache holds the part that actually costs
