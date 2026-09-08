@@ -296,6 +296,39 @@ pub enum ReplayRefusal {
     /// recoverable -- whether the preceding line keeps its terminator depends on what the tool did,
     /// not on what the hunk says.
     UnterminatedAtEof,
+    /// The hunk introduces lines into a file that does not end its lines with a bare `\n`.
+    ///
+    /// A new line's terminator is in neither the patch nor the pre-image: it is new, so there are no
+    /// bytes to copy and nothing establishes what the tool wrote. In an all-`\n` file `\n` is the
+    /// only candidate. In a CRLF file it is a coin toss that decides the content CID, and the
+    /// installed `apply_patch` was observed writing `\n` for the changed line while leaving every
+    /// untouched line `\r\n` -- a shape no reasonable guess would have produced.
+    TerminatorsNotEstablished,
+}
+
+/// Split text into `(content, terminator)`, keeping the exact bytes that ended each line.
+///
+/// `str::lines` cannot be used for reassembly: it strips `\r` as well as `\n` and reports nothing
+/// about which it removed, so rebuilding with `\n` silently rewrites every line of a CRLF file. The
+/// terminator has to travel with its line for untouched lines to survive byte-exact.
+fn split_lines(text: &str) -> Vec<(&str, &str)> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(at) = rest.find('\n') else {
+            // A final line with no terminator at all.
+            lines.push((rest, ""));
+            break;
+        };
+        let (line, tail) = rest.split_at(at + 1);
+        let body = &line[..line.len() - 1];
+        lines.push(match body.strip_suffix('\r') {
+            Some(content) => (content, &line[line.len() - 2..]),
+            None => (body, &line[line.len() - 1..]),
+        });
+        rest = tail;
+    }
+    lines
 }
 
 /// Replay a patch hunk as a replacement of whole lines.
@@ -307,9 +340,15 @@ pub enum ReplayRefusal {
 ///
 /// Requires exactly one match. `replace_all` has no meaning here: a hunk describes one edit at one
 /// place, and a hunk whose anchor appears twice has not said which.
+///
+/// **Untouched lines are copied, never rebuilt.** Matching happens on line *content*, with
+/// terminators stripped, because that is what the patch names -- but every line outside the matched
+/// window is written back byte for byte, terminator included. Rebuilding them with `\n` rewrote every
+/// line of a CRLF file: `a\r\nb\r\nc\r\n` with `-b` / `+B` came back as `a\nB\nc\n`, three lines
+/// changed where the patch named one, and the content CID attested it as recovered.
 pub fn apply_line_edit(previous: &str, old: &str, new: &str) -> Result<String, ReplayRefusal> {
-    let terminated = previous.ends_with('\n');
-    let held: Vec<&str> = previous.lines().collect();
+    let held = split_lines(previous);
+    let contents: Vec<&str> = held.iter().map(|(content, _)| *content).collect();
     let removed: Vec<&str> = old.lines().collect();
     let added: Vec<&str> = new.lines().collect();
 
@@ -319,7 +358,7 @@ pub fn apply_line_edit(previous: &str, old: &str, new: &str) -> Result<String, R
 
     let mut found: Option<usize> = None;
     for start in 0..=(held.len() - removed.len()) {
-        if held[start..start + removed.len()] == removed[..] {
+        if contents[start..start + removed.len()] == removed[..] {
             if found.is_some() {
                 return Err(ReplayRefusal::Ambiguous);
             }
@@ -332,19 +371,30 @@ pub fn apply_line_edit(previous: &str, old: &str, new: &str) -> Result<String, R
     // The final line carries no terminator, so a hunk touching it cannot say whether the line before
     // it keeps one. Deleting `b` from `a\nb` yields `a\n` or `a` depending on the tool, and the patch
     // is silent on which.
+    let terminated = held.last().is_some_and(|(_, end)| !end.is_empty());
     if !terminated && end == held.len() {
         return Err(ReplayRefusal::UnterminatedAtEof);
     }
 
-    let mut result: Vec<&str> = Vec::with_capacity(held.len() - removed.len() + added.len());
-    result.extend_from_slice(&held[..start]);
-    result.extend_from_slice(&added);
-    result.extend_from_slice(&held[end..]);
+    // A pure deletion introduces no line, so there is no terminator to invent and every surviving
+    // byte is copied: exact for any line-ending style. Anything that *adds* a line has to write a
+    // terminator the patch never stated, and only an all-`\n` file makes `\n` the sole candidate.
+    if !added.is_empty() && held.iter().any(|(_, end)| *end == "\r\n") {
+        return Err(ReplayRefusal::TerminatorsNotEstablished);
+    }
 
-    let mut text = result.join("\n");
-    // Reassembly restores exactly what the split removed, so an unterminated file stays that way.
-    if terminated && !text.is_empty() {
+    let mut text = String::with_capacity(previous.len() + new.len());
+    for (content, end) in &held[..start] {
+        text.push_str(content);
+        text.push_str(end);
+    }
+    for line in &added {
+        text.push_str(line);
         text.push('\n');
+    }
+    for (content, end) in &held[end..] {
+        text.push_str(content);
+        text.push_str(end);
     }
     Ok(text)
 }

@@ -550,6 +550,67 @@ fn deleting_every_line_leaves_an_empty_file_not_a_blank_one() {
 }
 
 #[test]
+fn a_crlf_file_is_not_silently_rewritten_to_lf() {
+    // `str::lines` strips `\r` as well as `\n` and says nothing about which it removed, so rebuilding
+    // with `\n` rewrote every line of a CRLF file. `a\r\nb\r\nc\r\nc` with `-b` / `+B` came back as
+    // `a\nB\nc\n`: three lines changed where the patch named one, attested as recovered content.
+    //
+    // The substring replay this replaced refused the same input outright, so the line-oriented fix
+    // turned a refusal into a confident wrong answer -- the same shape of regression twice running,
+    // and the reason a fix here has to be checked against what it *stops* refusing.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b", "+B"]), Some("c9"));
+    let edit = events[0].edit.as_ref().unwrap();
+
+    assert_eq!(
+        apply_line_edit("a\r\nb\r\nc\r\n", &edit.old, &edit.new),
+        Err(ReplayRefusal::TerminatorsNotEstablished),
+        "a line the patch introduces has no terminator in the patch or in the pre-image"
+    );
+}
+
+#[test]
+fn deleting_a_line_from_a_crlf_file_is_exact() {
+    // The case that *is* establishable, and worth keeping rather than refusing wholesale: a pure
+    // deletion introduces no line, so there is no terminator to invent and every surviving byte is
+    // copied. Untouched lines keep their `\r\n`.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c10"));
+    let edit = events[0].edit.as_ref().unwrap();
+    assert_eq!(
+        apply_line_edit("a\r\nb\r\nc\r\n", &edit.old, &edit.new).as_deref(),
+        Ok("a\r\nc\r\n")
+    );
+}
+
+#[test]
+fn an_untouched_line_keeps_its_own_bytes() {
+    // Mixed terminators are the sharpest version: whatever the file did per line, the lines the patch
+    // did not name come back exactly as they were. Matching is on content, reassembly is on bytes.
+    let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c11"));
+    let edit = events[0].edit.as_ref().unwrap();
+    assert_eq!(
+        apply_line_edit("a\r\nb\nc\r\nd\n", &edit.old, &edit.new).as_deref(),
+        Ok("a\r\nc\r\nd\n")
+    );
+}
+
+#[tokio::test]
+async fn a_crlf_substitution_is_counted_rather_than_reconstructed() {
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/w/x.txt", Some(b"a\r\nb\r\nc\r\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    let events = file_events_from_patch(&hunk("/w/x.txt", &["-b", "+B"]), Some("c12"));
+    rec.observe_file(&events[0], true, None).await.unwrap();
+
+    assert_eq!(rec.stats().get("ContentRecovered"), None);
+    assert_eq!(rec.stats().get("EditTerminatorsNotEstablished"), Some(&1));
+}
+
+#[test]
 fn a_hunk_written_against_content_we_do_not_hold_is_refused() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-zzz", "+q"]), Some("c6"));
     let edit = events[0].edit.as_ref().unwrap();

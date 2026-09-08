@@ -147,6 +147,9 @@ impl Recorder {
                     Err(ReplayRefusal::Ambiguous) => self.count("EditTooAmbiguousToReplay"),
                     Err(ReplayRefusal::NotFound) => self.count("EditDidNotMatchHeldContent"),
                     Err(ReplayRefusal::UnterminatedAtEof) => self.count("EditAtUnterminatedEof"),
+                    Err(ReplayRefusal::TerminatorsNotEstablished) => {
+                        self.count("EditTerminatorsNotEstablished")
+                    }
                 }
             } else if edit.unique_only && previous.matches(&edit.old).count() != 1 {
                 // A literal edit that cannot promise its own uniqueness must find exactly one match,
