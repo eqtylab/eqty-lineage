@@ -411,7 +411,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "eqty-lineage-langchain", editable = "packages/eqty-lineage-langchain" },
-    { name = "eqty-sdk", index = "https://pypi.eqtylab.io/simple/" },
+    { name = "eqty-sdk", specifier = ">=2.3.1rc1" },
     { name = "langchain-core", specifier = ">=0.3" },
 ]
 
@@ -426,14 +426,14 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "eqty-sdk", index = "https://pypi.eqtylab.io/simple/" },
+    { name = "eqty-sdk", specifier = ">=2.3.1rc1" },
     { name = "langchain-core", specifier = ">=0.3" },
 ]
 
 [[package]]
 name = "eqty-sdk"
-version = "2.2.0"
-source = { registry = "https://pypi.eqtylab.io/simple/" }
+version = "2.3.1rc1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "dill" },
@@ -444,15 +444,15 @@ dependencies = [
     { name = "types-requests" },
     { name = "urllib3" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/e7/9f/979d2c5b87d5c939796e7658eb06c9a7c38bcc19cc5a09aced64706e632c/eqty_sdk-2.3.1rc1.tar.gz", hash = "sha256:3e3221f02e69f6d7e00d5dd02fd4f441aca92af73277da6cff64a9cb75717f38", size = 265422, upload-time = "2026-09-01T15:26:53.332Z" }
 wheels = [
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-linux_aarch64.whl", hash = "sha256:cde7410241e36edf7e87ce91f8a450dad0e7392aef5e785a2e2e73edf1cf073e" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-linux_x86_64.whl", hash = "sha256:c6d34b04371ba18fc21c87894ab2785cbb87b38cd0aa53ebf11762d5675311fa" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:df0899a7c5099514d4dfd60edf1e723cf6f16a81d1094d554eca2c59048ac0ac" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:55e11f0798e273c7230a60c70e271a0290b8eb804a9f71dde2804fcb1677507a" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:b07dee96960ea19059a013eeef262784f2e156cf8a7de5d1a645a39a1353ce29" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6f8cf3b83a77f02669062ade926abd482627c17e66b55d85a6cf26550d70b290" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:dd255ce4c59bba07021f9753c67ea9c72109d018a78564ffa4ffb93c8747bc45" },
-    { url = "https://pypi.eqtylab.io/packages/eqty_sdk-2.2.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:d81bec10d307da10f5d56ff15c82a1877b00a59af38dbd1505a3a749d087545a" },
+    { url = "https://files.pythonhosted.org/packages/30/c0/b2d910dbdd6000afc136ceb0068b0155cc1cb65410ce085070e0d273c41e/eqty_sdk-2.3.1rc1-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:b1c5166fa388d89854c089610afab585e7e1d9e5424508dd21398cf7bdd81db9", size = 15449908, upload-time = "2026-09-01T15:26:37.026Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/31/03cc2aea310801901d1f6a9e389c94fcf5143e1be5c6f56c982451a38aa8/eqty_sdk-2.3.1rc1-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:c65273e3f6cb4c45af1473ca3f2ddd34439cdb0f10487ff8d085cd0eda3e87ff", size = 14931187, upload-time = "2026-09-01T15:26:39.295Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/e4/a0a7a683e93fdbb43b37dca96d4def04a8862aac635d9a54d3725b459914/eqty_sdk-2.3.1rc1-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:f2b9d7ec6f2570e99144f2a2e0a84610ccfc1f29883806e0ff73ece3dec87e9c", size = 18498633, upload-time = "2026-09-01T15:26:41.506Z" },
+    { url = "https://files.pythonhosted.org/packages/c7/04/102c9c2c7ca67547834fda631149342e1bc9257cb5ff359f41c996d4988b/eqty_sdk-2.3.1rc1-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c2cc42e54811bdbe755fdaf65cf56f76dddc69742e521277a63ffe66dd37ad2c", size = 19076779, upload-time = "2026-09-01T15:26:43.818Z" },
+    { url = "https://files.pythonhosted.org/packages/70/ae/952890042651189f535bf00a797b31bcb7e4890e6aa685de209a4a17b9b3/eqty_sdk-2.3.1rc1-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:9c0c61b67ef52e13407c7d9be2363ae113b7c42d7faa73f45ceae515b4cce63f", size = 18967738, upload-time = "2026-09-01T15:26:46.137Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/66/4aa2bed206187603eff7f4375895688ae8897cfffcc5ee6c25a37b4526e2/eqty_sdk-2.3.1rc1-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:21a099ce0992407f1c9986f77b871b412c7f67ae040860790ce15382f61175c0", size = 19281279, upload-time = "2026-09-01T15:26:48.762Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/56/24dc8d5f484b2ea8bdd8eba2a9f7b08c24f95f2319e2ce04c5f21baa114a/eqty_sdk-2.3.1rc1-cp38-abi3-win_amd64.whl", hash = "sha256:08a405de92a6979676bd7916b4ccef3ddd98e20f28d8327903faeb0baddb8c6d", size = 14302894, upload-time = "2026-09-01T15:26:50.921Z" },
 ]
 
 [[package]]

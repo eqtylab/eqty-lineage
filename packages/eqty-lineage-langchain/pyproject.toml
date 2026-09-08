@@ -9,12 +9,9 @@ description = "EQTY lineage callback handler for LangChain and LangGraph."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-sdk",
+    "eqty-sdk>=2.3.1rc1",
     "langchain-core>=0.3",
 ]
-
-[tool.uv.sources]
-eqty-sdk = { index = "eqty" }
 
 [[tool.uv.index]]
 name = "eqty"
