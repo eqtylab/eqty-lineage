@@ -8,7 +8,6 @@ from uuid import uuid4
 def test_thread_id_creates_and_reuses_a_child_context(sdk, monkeypatch):
     import eqty_lineage.langchain as mod
     from eqty_lineage.langchain import EqtyCallbackHandler
-    from eqty_sdk import Context
 
     handler = EqtyCallbackHandler()
     handler._activate_thread_context({"thread_id": "one"}, agent_name="Travel Assistant")

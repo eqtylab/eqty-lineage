@@ -48,16 +48,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--root-context-id",
-        default=os.environ.get("EQTY_ROOT_CONTEXT_ID", uuid4()),
+        default=os.environ.get("EQTY_ROOT_CONTEXT_ID", str(uuid4())),
         help="EQTY root context UUID; child context is created automatically for this invocation.",
     )
     parser.add_argument("--manifest-out", type=Path, help="Where to write the merged EQTY manifest.")
     return parser.parse_args()
 
 
-def run_agent(
-    model: ChatEqtyVnimOpenAI, prompt: str, handler: EqtyCallbackHandler, thread_id: str
-) -> AIMessage:
+def run_agent(model: ChatEqtyVnimOpenAI, prompt: str, handler: EqtyCallbackHandler, thread_id: str) -> AIMessage:
     """Run the one-shot travel-planning agent and report manifest retrieval status."""
     messages: list[BaseMessage] = [
         SystemMessage(

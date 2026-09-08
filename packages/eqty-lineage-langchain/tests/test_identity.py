@@ -102,13 +102,15 @@ def test_caller_metadata_reaches_the_model_asset(recording_handler, monkeypatch)
     import eqty_lineage.langchain as mod
 
     recorded: list = []
-    real = mod.Model.from_object
+    real = mod.Model._from_object
 
-    def spy(payload, **kwargs):
-        recorded.append(payload)
-        return real(payload, **kwargs)
+    def spy(obj, asset_type, ctx=None, _store=None, **kwargs):
+        recorded.append(obj)
+        return real(obj, asset_type, ctx, _store, **kwargs)
 
-    monkeypatch.setattr(mod.Model, "from_object", staticmethod(spy))
+    # `_asset_factory` binds a context and calls `_from_object` directly, bypassing the public
+    # `from_object` classmethod entirely, so that's the point that must be patched.
+    monkeypatch.setattr(mod.Model, "_from_object", classmethod(lambda cls, *a, **kw: spy(*a, **kw)))
 
     model = GenericFakeChatModel(messages=iter([AIMessage("hi")]))
     model.with_config(tags=["prod"], metadata={"deployment": "eu-west"}).invoke(
