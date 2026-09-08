@@ -7,3 +7,9 @@ dist/
 .eqty_sdk
 /manifests/*.json
 **.mypy_cache/
+
+# Local credentials. `.envrc` loads these when present; they must never be committed.
+# A committed `.env` of placeholders is worse than none: direnv loads it, so every developer
+# gets `UV_INDEX_EQTY_USERNAME="your-username"` injected and a 401 from the private index.
+.env
+.secrets

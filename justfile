@@ -162,3 +162,32 @@ nemo-relay-package:
   echo "  trusted_public_keys = [\"$pub\"]"
   echo
   echo "then: nemo-relay plugins add --user ./dist/relay-plugin/relay-plugin.toml"
+
+# Development here is on macOS, and three things are only knowable on Linux -- the cdylib's name,
+# the digest over it, and whether the staged `.so` actually loads. `just nemo-relay-package` was
+# macOS-only for a while and failed *after* a successful release build; no test covers a recipe, so
+# this is the check that would have caught it.
+#
+# Runs against `git archive HEAD`, not the working tree: this is what CI would build, and it keeps
+# the container from writing into `target/` or `dist/`. Commit before running, or run
+# `nemo-relay-package` directly to test uncommitted work on this platform.
+#
+# The registry and target caches are named volumes, so a re-run is minutes rather than a cold build.
+#
+# Run the Linux checks in Docker: test suite, packaging recipe, and ABI load test
+linux-check:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  git archive HEAD | tar x -C "$work"
+  docker volume create eqty-cargo-registry >/dev/null
+  docker volume create eqty-cargo-target >/dev/null
+  docker run --rm \
+    -v "$work:/work" \
+    -v "$PWD/packages/eqty-lineage-nemo-relay/docs/linux-check.sh:/linux-check.sh:ro" \
+    -v eqty-cargo-registry:/usr/local/cargo/registry \
+    -v eqty-cargo-target:/target \
+    -e CARGO_TARGET_DIR=/target \
+    -e CARGO_TERM_COLOR=never \
+    rust:1-bookworm bash /linux-check.sh
