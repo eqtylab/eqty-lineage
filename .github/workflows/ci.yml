@@ -62,6 +62,13 @@ jobs:
   # rather than two copied jobs, so the job id stays `rust` for `needs:` below.
   rust:
     runs-on: ubuntu-latest
+    # Line tables rather than full debug info: enough for the backtrace a failing test prints, and
+    # 46% less target directory to build, cache, restore and hold. Measured on this tree:
+    # target/debug 9.5 GB -> 5.1 GB, the cdylib 415 MB -> 125 MB, lifecycle.rs 69.8s -> 57.9s.
+    # An environment variable rather than a committed profile, so anyone debugging locally keeps
+    # variable inspection. `rust-cache` hashes CARGO_* into its key, so this rotates the cache once.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       # Both results are wanted; a failure in one workspace should not hide the other's.
       fail-fast: false
