@@ -106,6 +106,19 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
+      # This job ran out of disk, not time: `No space left on device` while compiling
+      # `netlink-packet-route`. `just test-rust` needs the plugin's dependency tree, `abi-test`'s
+      # separate one, and a third for the cdylib `abi-test` dlopens -- three full trees with iroh and
+      # ssi in two of them. `build_cdylib` used to make a fresh one per test, which was the fourth;
+      # that is fixed in the test itself. This buys headroom for the three that remain, and prints
+      # `df` either side so the next failure says whether space was still the problem.
+      - name: Free runner disk
+        shell: bash -e {0}
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
+            "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
       - name: Test
         run: just test-rust
 

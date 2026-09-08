@@ -16,6 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use nemo_relay::plugin::dynamic::{
     DynamicPluginActivationSpec, DynamicPluginKind, PluginHostActivation,
@@ -34,9 +35,9 @@ const PLUGIN_ID: &str = "eqty.lineage";
 #[tokio::test]
 async fn the_built_cdylib_loads_and_registers_its_kind() {
     let _guard = HOST_LOCK.lock().await;
-    let (_target, library) = build_cdylib();
+    let library = build_cdylib();
     let manifest_dir = TempDir::new().expect("manifest directory");
-    let manifest = write_manifest(manifest_dir.path(), &library);
+    let manifest = write_manifest(manifest_dir.path(), library);
     let manifests = TempDir::new().expect("output directory");
 
     let config = config(json!({
@@ -78,9 +79,9 @@ async fn a_bad_config_is_refused_rather_than_recorded_badly() {
     // not the rule -- `tests/config.rs` owns the rule. A component that activated with
     // `max_content_bytes: 0` would record a session whose every file was too large to store.
     let _guard = HOST_LOCK.lock().await;
-    let (_target, library) = build_cdylib();
+    let library = build_cdylib();
     let manifest_dir = TempDir::new().expect("manifest directory");
-    let manifest = write_manifest(manifest_dir.path(), &library);
+    let manifest = write_manifest(manifest_dir.path(), library);
 
     let outcome = PluginHostActivation::activate(
         PluginConfig::default(),
@@ -112,28 +113,44 @@ fn config(value: serde_json::Value) -> Map<String, serde_json::Value> {
     value.as_object().cloned().expect("config is an object")
 }
 
-/// Build this crate's cdylib into a scratch target directory.
+/// Build this crate's cdylib **once**, into a scratch target directory shared by every test here.
 ///
 /// A separate `--target-dir` keeps the build out of the one the test binary itself was built into,
-/// which would otherwise contend on cargo's lock.
-fn build_cdylib() -> (TempDir, PathBuf) {
-    let target = TempDir::new().expect("build target directory");
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--manifest-path"])
-        .arg(manifest)
-        .arg("--target-dir")
-        .arg(target.path())
-        .status()
-        .expect("cargo build should start");
-    assert!(
-        status.success(),
-        "cargo build should produce the native library"
-    );
+/// which would otherwise contend on cargo's lock. It does not need to be a *fresh* directory per
+/// test, and making it one compiled the plugin's entire dependency tree -- `integrity`, and iroh and
+/// ssi beneath it -- once for every test in this file. Together with this crate's own tree and the
+/// plugin's `cargo test` tree, already on disk in the same CI job, that was four full trees at once
+/// and the runner ran out of *space* rather than time:
+///
+/// ```text
+/// error: failed to write .../lib.rmeta: No space left on device (os error 28)
+/// ```
+///
+/// The `TempDir` is held in the `OnceLock` rather than returned, so it lives as long as the test
+/// binary. Handing it back would let the first test to finish drop it and delete the library the
+/// others are still loading.
+fn build_cdylib() -> &'static Path {
+    static BUILT: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_target, library) = BUILT.get_or_init(|| {
+        let target = TempDir::new().expect("build target directory");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "--manifest-path"])
+            .arg(manifest)
+            .arg("--target-dir")
+            .arg(target.path())
+            .status()
+            .expect("cargo build should start");
+        assert!(
+            status.success(),
+            "cargo build should produce the native library"
+        );
 
-    let library = target.path().join("debug").join(library_name());
-    assert!(library.exists(), "expected {}", library.display());
-    (target, library)
+        let library = target.path().join("debug").join(library_name());
+        assert!(library.exists(), "expected {}", library.display());
+        (target, library)
+    });
+    library
 }
 
 fn library_name() -> &'static str {
