@@ -6,9 +6,10 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
-    LineageSession, Mailbox, Policy, SessionRouter, SignerFactory, classify,
+    LineageSession, Mailbox, Policy, SessionFinished, SessionRouter, SignerFactory, classify,
 };
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::Event;
@@ -27,12 +28,20 @@ fn policy() -> Policy {
 }
 
 /// Replay events through the real path and return the directory they were written to.
+///
+/// The router is shared with the mailbox exactly as `register` shares it, so the scope-map pruning
+/// at export is on the path these tests drive rather than a production-only branch.
 fn replay(events: &[Event], into: &TempDir) {
-    let mailbox = Mailbox::start(into.path().to_path_buf(), policy(), signer_factory());
-    let mut router = SessionRouter::new();
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+    );
 
     for event in events {
-        let Some(session_id) = router.attribute(event) else {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
             continue;
         };
         if let Some(lineage) = classify(event) {
@@ -45,6 +54,14 @@ fn replay(events: &[Event], into: &TempDir) {
 
     // Dropping is the flush. On Codex it is the only export trigger there will ever be.
     drop(mailbox);
+}
+
+/// The session-finished callback the plugin installs: prune the finished session's scopes.
+fn forget_with(router: &Arc<Mutex<SessionRouter>>) -> SessionFinished {
+    let router = Arc::clone(router);
+    Box::new(move |session_id: &str| {
+        router.lock().expect("the router lock").forget(session_id);
+    })
 }
 
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
@@ -1213,17 +1230,22 @@ fn a_second_export_never_overwrites_the_first() {
 fn a_manifest_exists_before_the_session_ends() {
     // The recording used to be all-or-nothing: one write, at the very end. A crash, a kill, or a
     // machine losing power took the whole session with it, and nothing was visible while the agent
-    // was still working. Each event now checkpoints.
+    // was still working. The first completed unit of work now checkpoints.
     let into = TempDir::new().expect("a temp dir");
     let events = full_session("01a040aa-0000-0000-0000-000000000095");
     // Everything except the events that close the session, so nothing triggers a final export.
     let mut mid = events;
     mid.truncate(6);
 
-    let mailbox = Mailbox::start(into.path().to_path_buf(), policy(), signer_factory());
-    let mut router = SessionRouter::new();
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+    );
     for event in &mid {
-        let Some(session_id) = router.attribute(event) else {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
             continue;
         };
         if let Some(classified) = classify(event) {
@@ -1417,5 +1439,669 @@ fn a_session_with_no_agent_is_not_counted_as_one() {
     assert!(
         name.ends_with(".unattributed.json"),
         "a manifest with no agent must say so in its name, got {name}"
+    );
+}
+
+/// A tool scope with a chosen name, payload and terminal status.
+///
+/// `claude_read` fixes all three, which is why the gaps below went untested: every tool call in this
+/// file used to arrive with both halves, a payload, and no stated outcome.
+#[allow(clippy::too_many_arguments)]
+fn tool_scope(
+    session: &str,
+    uuid: &str,
+    parent: &str,
+    phase: &str,
+    name: &str,
+    call_id: &str,
+    data: serde_json::Value,
+    status: Option<&str>,
+) -> Event {
+    let mut meta = serde_json::json!({
+        "session_id": session,
+        "agent_kind": "claude-code",
+        "hook_event_name": if phase == "start" { "PreToolUse" } else { "PostToolUse" },
+        "source": "hook",
+        "tool_correlation_status": "explicit"
+    });
+    if let Some(status) = status {
+        meta["status"] = serde_json::json!(status);
+    }
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "category": "tool",
+        "scope_category": phase,
+        "name": name,
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "timestamp": "2026-09-02T12:00:00.000000+00:00",
+        "attributes": [],
+        "data": data,
+        "data_schema": null,
+        "category_profile": { "tool_call_id": call_id },
+        "metadata": meta
+    }))
+    .expect("a well-formed tool scope")
+}
+
+/// Every tool-call activity in a manifest, as its metadata object.
+fn tool_activities(path: &std::path::Path) -> Vec<serde_json::Value> {
+    blob_objects(path)
+        .into_iter()
+        .filter(|blob| blob["computation_type"] == "tool_call")
+        .collect()
+}
+
+#[test]
+fn a_failed_tool_call_is_not_attested_as_ordinary_work() {
+    // `is_error` was classified and then discarded: `ToolCallEnded` was destructured with `..` and
+    // no field of the activity metadata carried it. So a call Relay had explicitly told us failed
+    // was recorded identically to one that succeeded -- while the README claimed the opposite.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f01";
+    let root = "01a040aa-0000-0000-0000-000000000f02";
+    let call = "01a040aa-0000-0000-0000-000000000f03";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "Bash",
+            "toolu_f1",
+            serde_json::json!({ "command": "false" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "Bash",
+            "toolu_f1",
+            serde_json::json!("exit status 1\n"),
+            Some("error"),
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let activities = tool_activities(path);
+    let outcomes: Vec<&str> = activities
+        .iter()
+        .filter_map(|activity| activity["outcome"].as_str())
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec!["failed"],
+        "the activity must say the call failed"
+    );
+    assert!(
+        decoded_blobs(path).contains("\"ToolCallFailed\":1"),
+        "and coverage must count it:\n{}",
+        decoded_blobs(path)
+    );
+}
+
+#[test]
+fn a_tool_call_of_unknown_outcome_is_not_rounded_to_success() {
+    // The guard on the test above. Codex states no terminal status at all, so `None` is the common
+    // case; recording it as `succeeded` would attest a clean run over one whose failures were simply
+    // invisible. `null` and the separate counter are the honest record.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f11";
+    let root = "01a040aa-0000-0000-0000-000000000f12";
+    let call = "01a040aa-0000-0000-0000-000000000f13";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "gpt" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "Bash",
+            "toolu_f2",
+            serde_json::json!({ "command": "ls" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "Bash",
+            "toolu_f2",
+            serde_json::json!("a.txt\n"),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    for activity in tool_activities(path) {
+        assert!(
+            activity["outcome"].is_null(),
+            "an unstated outcome stays unstated: {activity}"
+        );
+    }
+    assert!(
+        decoded_blobs(path).contains("\"ToolCallOutcomeUnknown\":1"),
+        "coverage must separate 'we did not see' from 'it succeeded'"
+    );
+}
+
+#[test]
+fn a_tool_end_without_its_start_is_still_recorded() {
+    // Relay synthesizes ids for post-only hooks, and an end whose id matches no stored start left
+    // `open` empty -- which dropped the Tool actor, the arguments and the result together. For a
+    // read that was worse than losing the run: with no outputs the activity was refused outright,
+    // leaving the file node in the graph with nothing to say which run produced it.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f21";
+    let root = "01a040aa-0000-0000-0000-000000000f22";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        // No start half at all.
+        tool_scope(
+            session,
+            "01a040aa-0000-0000-0000-000000000f23",
+            root,
+            "end",
+            "Read",
+            "toolu_orphan",
+            serde_json::json!({ "file": { "filePath": "/work/only.md", "content": "hi\n",
+                "numLines": 1, "startLine": 1, "totalLines": 1 }, "type": "text" }),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let activities = tool_activities(path);
+    assert_eq!(
+        activities.len(),
+        1,
+        "the end event names the tool, so the run is recordable: {activities:?}"
+    );
+    assert_eq!(activities[0]["tool"], "Read");
+    let blobs = blob_objects(path);
+    assert!(
+        blobs
+            .iter()
+            .any(|blob| blob["assetType"] == "Tool" && blob["name"] == "Read"),
+        "and the Tool actor is registered from that name"
+    );
+    assert!(
+        blobs
+            .iter()
+            .any(|blob| blob["assetType"] == "Document" && blob["filePath"] == "/work/only.md"),
+        "with the file it read reachable from the run"
+    );
+}
+
+#[test]
+fn a_tool_end_carrying_no_payload_is_counted_rather_than_dropped() {
+    // The early return on a missing result also skipped the coverage note, so such a call was
+    // invisible in the graph *and* absent from the counts -- the one combination a reader cannot
+    // detect. The arguments still name the tool and, often, a path.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f31";
+    let root = "01a040aa-0000-0000-0000-000000000f32";
+    let call = "01a040aa-0000-0000-0000-000000000f33";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "Write",
+            "toolu_f4",
+            serde_json::json!({ "file_path": "/work/silent.md", "content": "x\n" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "Write",
+            "toolu_f4",
+            serde_json::Value::Null,
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let decoded = decoded_blobs(path);
+    assert!(
+        decoded.contains("\"ToolCallWithoutResult\":1"),
+        "the missing payload is stated:\n{decoded}"
+    );
+    assert!(
+        blob_objects(path)
+            .iter()
+            .any(|blob| blob["filePath"] == "/work/silent.md"),
+        "and the path from the arguments still reaches the graph"
+    );
+}
+
+#[test]
+fn a_sibling_subagent_keeps_its_attribution_when_another_finishes() {
+    // The mis-attribution this whole mechanism exists to prevent, arriving through the mechanism
+    // itself. `SubagentEnded` ignored its own id and cleared the single active slot, so the *first*
+    // stop in a fan-out un-attributed every sibling still running: their later calls were credited
+    // to the root agent with no instance. A live session fanned out to four workers at once, and the
+    // existing test passed only because it ran its two subagents strictly one after the other.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f41";
+    let root = "01a040aa-0000-0000-0000-000000000f42";
+    let turn = "01a040aa-0000-0000-0000-000000000f43";
+    let first = "01a040aa-0000-0000-0000-000000000f44";
+    let second = "01a040aa-0000-0000-0000-000000000f45";
+
+    let read = |uuid: &str, parent: &str, phase: &str, path: &str| {
+        tool_scope(
+            session,
+            uuid,
+            parent,
+            phase,
+            "Read",
+            uuid,
+            if phase == "start" {
+                serde_json::json!({ "file_path": path })
+            } else {
+                serde_json::json!({ "file": { "filePath": path, "content": "body\n",
+                    "numLines": 1, "startLine": 1, "totalLines": 1 }, "type": "text" })
+            },
+            None,
+        )
+    };
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        turn_scope(session, turn, root, "start"),
+        // Both start before either finishes: a genuine fan-out.
+        subagent_scope(session, first, turn, "start", "Explore"),
+        subagent_scope(session, second, turn, "start", "Plan"),
+        // The first one finishes. The second is still working.
+        subagent_scope(session, first, turn, "end", "Explore"),
+        read(
+            "01a040aa-0000-0000-0000-000000000f46",
+            second,
+            "start",
+            "/work/after.md",
+        ),
+        read(
+            "01a040aa-0000-0000-0000-000000000f46",
+            second,
+            "end",
+            "/work/after.md",
+        ),
+        subagent_scope(session, second, turn, "end", "Plan"),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let activities = tool_activities(path);
+    assert_eq!(activities.len(), 1, "one tool call: {activities:?}");
+    assert_eq!(
+        activities[0]["performedByInstance"], second,
+        "work after a sibling stopped still belongs to the subagent that did it: {}",
+        activities[0]
+    );
+    assert_eq!(activities[0]["attribution"], "sole-live-subagent");
+
+    // And the performer is the surviving subagent's node, not the root agent's.
+    let plan = blob_objects(path)
+        .into_iter()
+        .find(|blob| blob["assetType"] == "Agent" && blob["name"] == "Plan")
+        .expect("the second subagent is a node");
+    assert_eq!(
+        activities[0]["performedBy"], plan["content-cid"],
+        "credited to the subagent, not the session root"
+    );
+}
+
+#[test]
+fn work_done_while_several_subagents_run_says_it_cannot_tell_which() {
+    // Relay reports that *a* subagent is running, never which one performed a given call. With
+    // siblings in flight the performer is genuinely unknown, so the run is filed under the root
+    // agent and marked -- a specific wrong attribution would be worse, because a reader would act on
+    // it. `performedBy` alone cannot express this, which is what `attribution` is for.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f51";
+    let root = "01a040aa-0000-0000-0000-000000000f52";
+    let turn = "01a040aa-0000-0000-0000-000000000f53";
+    let call = "01a040aa-0000-0000-0000-000000000f56";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        turn_scope(session, turn, root, "start"),
+        subagent_scope(
+            session,
+            "01a040aa-0000-0000-0000-000000000f54",
+            turn,
+            "start",
+            "Explore",
+        ),
+        subagent_scope(
+            session,
+            "01a040aa-0000-0000-0000-000000000f55",
+            turn,
+            "start",
+            "Explore",
+        ),
+        tool_scope(
+            session,
+            call,
+            turn,
+            "start",
+            "Read",
+            "toolu_f5",
+            serde_json::json!({ "file_path": "/work/both.md" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            turn,
+            "end",
+            "Read",
+            "toolu_f5",
+            serde_json::json!({ "file": { "filePath": "/work/both.md", "content": "b\n",
+                "numLines": 1, "startLine": 1, "totalLines": 1 }, "type": "text" }),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let activities = tool_activities(path);
+    assert_eq!(activities.len(), 1);
+    assert_eq!(
+        activities[0]["attribution"], "ambiguous-parallel-subagents",
+        "the uncertainty is stated rather than resolved by guessing: {}",
+        activities[0]
+    );
+    assert!(
+        activities[0]["performedByInstance"].is_null(),
+        "and no instance is claimed"
+    );
+    assert!(
+        decoded_blobs(path).contains("\"AmbiguousSubagentAttribution\":1"),
+        "coverage counts it, so it is visible without walking every activity"
+    );
+}
+
+#[test]
+fn a_manifest_states_whether_events_were_dropped() {
+    // `dropped_events` was initialized, never incremented, and explicitly discarded (`let _ =
+    // dropped`), while the queue's own doc comment promised the manifest would state the loss. A
+    // recording with holes that does not say so reads exactly like a complete one.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&full_session("01a040aa-0000-0000-0000-000000000f61"), &into);
+
+    let decoded = decoded_blobs(&manifests(&into)[0]);
+    assert!(
+        decoded.contains("\"EventsDropped\":0"),
+        "stated even at zero: a reader asking whether the graph is complete should not have to \
+         know that absence means none:\n{decoded}"
+    );
+}
+
+#[test]
+fn a_finished_session_stops_being_tracked() {
+    // `SessionRouter::forget` existed, was documented as "called at export", and was called from
+    // nowhere but its own test. `attribute` inserts an entry for *every* event -- including the
+    // `llm.chunk` marks that are 428 of 445 events in the reference capture -- so a long-lived
+    // gateway accumulated scopes for every session it ever saw.
+    let into = TempDir::new().expect("a temp dir");
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+    );
+
+    let events = full_session("01a040aa-0000-0000-0000-000000000f71");
+    for event in &events {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(classified) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), classified);
+        }
+    }
+    assert!(
+        router.lock().expect("the router lock").tracked_scopes() > 0,
+        "the session's scopes are tracked while it runs"
+    );
+
+    // Dropping the mailbox exports every open session, which is what reports them finished.
+    drop(mailbox);
+    assert_eq!(
+        router.lock().expect("the router lock").tracked_scopes(),
+        0,
+        "and released once its manifest is written"
+    );
+}
+
+/// A turn scope carrying the user's instruction, which is where `PromptSubmitted` comes from.
+fn turn_with_prompt(session: &str, uuid: &str, parent: &str, text: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "category": "custom",
+        "scope_category": "start",
+        "name": "claude-code-turn",
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "timestamp": "2026-09-02T12:00:00.000000+00:00",
+        "attributes": [],
+        "data": { "prompt": text },
+        "data_schema": null,
+        "category_profile": null,
+        "metadata": {
+            "session_id": session,
+            "agent_kind": "claude-code",
+            "nemo_relay_scope_role": "turn"
+        }
+    }))
+    .expect("a turn scope carrying a prompt")
+}
+
+#[test]
+fn a_call_that_was_never_recorded_does_not_consume_the_turn_prompt() {
+    // The prompt was taken with `Option::take` before the call was known to be recordable, and
+    // `record_model_call` bails after registering its inputs when no response arrived. So a first
+    // call that ended without a reply spent the prompt on an activity that was never written: the
+    // prompt node was left orphaned, and the next call in the same turn -- the one that did produce
+    // an answer -- had nothing to say what it had been asked.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f81";
+    let root = "01a040aa-0000-0000-0000-000000000f82";
+    let turn = "01a040aa-0000-0000-0000-000000000f83";
+    let dropped = "01a040aa-0000-0000-0000-000000000f84";
+    let answered = "01a040aa-0000-0000-0000-000000000f85";
+
+    let request = serde_json::json!({
+        "model_name": "test-model",
+        "annotated_request": {
+            "messages": [{ "role": "user", "content": "go" }],
+            "model": "test-model"
+        }
+    });
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "test-model" }),
+        ),
+        turn_with_prompt(session, turn, root, "summarize the report"),
+        // A call that ends with no response at all. Nothing is recorded for it.
+        llm_scope(
+            "anthropic.messages",
+            dropped,
+            turn,
+            "start",
+            request.clone(),
+        ),
+        llm_scope(
+            "anthropic.messages",
+            dropped,
+            turn,
+            "end",
+            serde_json::json!({ "model_name": "test-model" }),
+        ),
+        // The next call in the same turn does answer, and it is the one the prompt caused.
+        llm_scope("anthropic.messages", answered, turn, "start", request),
+        llm_scope(
+            "anthropic.messages",
+            answered,
+            turn,
+            "end",
+            serde_json::json!({
+                "model_name": "test-model",
+                "annotated_response": {
+                    "model": "test-model",
+                    "message": "here it is",
+                    "finish_reason": "complete"
+                }
+            }),
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let decoded = decoded_blobs(path);
+    assert!(
+        decoded.contains("\"ModelCallWithoutResponse\":1"),
+        "the first call is still counted as unrecorded:\n{decoded}"
+    );
+    assert!(
+        decoded.contains("\"ModelCall\":1"),
+        "and the second is recorded"
+    );
+
+    let prompt = format!("urn:cid:{}", cid_for_named(path, "user prompt"));
+    let feeding = computation_inputs(path)
+        .iter()
+        .filter(|inputs| inputs.contains(&prompt))
+        .count();
+    assert_eq!(
+        feeding, 1,
+        "the instruction must reach the call that answered it, not be spent on the one that did not"
+    );
+}
+
+#[test]
+fn an_event_that_completes_nothing_writes_no_manifest() {
+    // The checkpoint used to run after *every* event, and a snapshot copies the entire recording
+    // rather than the part that changed -- so a long session rewrote its whole manifest hundreds of
+    // times, and a session holding a large file rewrote those bytes with it. Only a completed unit of
+    // work is worth the cost: a manifest written between a tool's start and its end holds the
+    // arguments of a call whose result is still coming, which is a document with no reader.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f91";
+    let root = "01a040aa-0000-0000-0000-000000000f92";
+    let call = "01a040aa-0000-0000-0000-000000000f93";
+
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+    );
+
+    // A session start and a tool call that has not come back yet. Neither completes anything.
+    for event in [
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "Read",
+            "toolu_f9",
+            serde_json::json!({ "file_path": "/work/pending.md" }),
+            None,
+        ),
+    ] {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(&event) else {
+            continue;
+        };
+        if let Some(classified) = classify(&event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), classified);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    assert!(
+        manifests(&into).is_empty(),
+        "nothing has completed, so nothing is worth rewriting the manifest for: {:?}",
+        manifests(&into)
+    );
+
+    // And the export at shutdown still writes everything, so nothing is lost by waiting.
+    drop(mailbox);
+    assert_eq!(
+        manifests(&into).len(),
+        1,
+        "the session is written when it closes"
     );
 }

@@ -218,6 +218,12 @@ On Codex that means every tool call is `None`: its hook schema has no failure ev
 /nonexistent` and `echo hello` are indistinguishable. Recording `false` would turn *we did not
 observe a failure* into *we observed a success*, and attest something nobody saw.
 
+All three reach the graph. Each tool activity carries `outcome` — `"failed"`, `"succeeded"`, or
+`null` — and coverage counts them as `ToolCallFailed`, `ToolCallSucceeded` and
+`ToolCallOutcomeUnknown`. A manifest where the third is the only nonzero count is telling a reader
+that this capture path cannot see tool failure, which is a different claim from a session that had
+none.
+
 The same rule governs correlation. Relay reports how confident its own join was, and
 `agent_fallback` / `ambiguous_fallback` mean it guessed. Those become `Correlation::Inferred`, never
 `Observed`.

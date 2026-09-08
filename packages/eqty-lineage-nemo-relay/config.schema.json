@@ -13,8 +13,8 @@
     },
     "triples": {
       "type": "boolean",
-      "default": true,
-      "description": "Write the RDF triples sidecar alongside the manifest."
+      "default": false,
+      "description": "Reserved, not yet implemented: no RDF triples sidecar is written whatever this is set to. Setting it to true is accepted and reported as a warning by `nemo-relay plugins validate`."
     },
     "deny_globs": {
       "type": "array",

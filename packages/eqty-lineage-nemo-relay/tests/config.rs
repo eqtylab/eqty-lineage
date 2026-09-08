@@ -21,9 +21,21 @@ fn an_empty_config_is_valid_and_has_defaults() {
         "an omitted config is not a broken one: {codes:?}"
     );
     assert_eq!(config.manifest_dir.to_str(), Some(".eqty/manifests"));
-    assert!(config.triples);
+    assert!(
+        !config.triples,
+        "the sidecar is not implemented, so the default must not claim it is written"
+    );
     assert_eq!(config.max_content_bytes, 104_857_600);
     assert!(config.deny_globs.iter().any(|glob| glob == ".env*"));
+}
+
+#[test]
+fn asking_for_triples_is_accepted_and_warned_about() {
+    // Reserved and unimplemented. Silently accepting it would let an operator believe a sidecar is
+    // being written; refusing it outright would trade a missing sidecar for a missing manifest.
+    let (config, codes) = parse(json!({ "triples": true }));
+    assert!(config.triples);
+    assert_eq!(codes, vec!["triples.unimplemented".to_string()]);
 }
 
 #[test]

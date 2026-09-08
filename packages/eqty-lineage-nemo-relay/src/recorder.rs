@@ -71,6 +71,12 @@ pub struct Recorder {
     stats: BTreeMap<String, u64>,
     /// Actors already registered this session, keyed by `(kind, name)`.
     actors: HashMap<(String, String), AssetRef>,
+    /// Events this session never saw because the queue was full when they arrived.
+    ///
+    /// Not a `stats` entry until export, because unlike every other counter this one is set from
+    /// outside: the subscriber counts what it could not hand over, and the recorder is by definition
+    /// unaware of it.
+    events_dropped: u64,
 }
 
 impl Recorder {
@@ -84,6 +90,7 @@ impl Recorder {
             versions: HashMap::new(),
             stats: BTreeMap::new(),
             actors: HashMap::new(),
+            events_dropped: 0,
         }
     }
 
@@ -203,7 +210,7 @@ impl Recorder {
                 } else {
                     self.count("ContentUnknown");
                 }
-                let descriptor = canonical_descriptor(&content_cid, withheld);
+                let descriptor = canonical_descriptor(&content_cid, withheld)?;
                 self.lineage
                     .register_content(&descriptor, metadata, at)
                     .await?
@@ -237,7 +244,18 @@ impl Recorder {
         at: Option<String>,
     ) -> Result<AssetRef> {
         let content_cid = blake3_cid_raw_binary(bytes)?;
-        let withheld = self.policy.decide(name, bytes.len()) != Disposition::Store;
+        // The deny list is matched against the payload's *name*, not a filesystem path -- there is no
+        // path here. A payload is named after what produced it (`prompt`, `completion`, `Bash input`),
+        // so a glob like `*credentials*` withholds the arguments of a tool called `get_credentials`.
+        // That is the intended reach, and it is why the reason travels with the node: "denied" and
+        // "too large" are different claims and a reader acts on them differently.
+        let disposition = self.policy.decide(name, bytes.len());
+        let withheld = disposition != Disposition::Store;
+        let reason = match disposition {
+            Disposition::Store => None,
+            Disposition::Denied => Some("denied-by-policy"),
+            Disposition::TooLarge => Some("larger-than-ceiling"),
+        };
 
         let mut metadata = json!({
             "name": name,
@@ -245,6 +263,8 @@ impl Recorder {
             "description": description,
             "provType": "Entity",
             "redacted": withheld,
+            "contentState": if withheld { "withheld" } else { "stored" },
+            "withheldBecause": reason,
             "content-cid": content_cid,
         });
         if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
@@ -254,8 +274,11 @@ impl Recorder {
         }
 
         if withheld {
-            self.count("PayloadTooLarge");
-            let descriptor = canonical_descriptor(&content_cid, true);
+            self.count(match disposition {
+                Disposition::Denied => "PayloadDenied",
+                _ => "PayloadTooLarge",
+            });
+            let descriptor = canonical_descriptor(&content_cid, true)?;
             return self
                 .lineage
                 .register_content(&descriptor, metadata, at)
@@ -372,7 +395,7 @@ impl Recorder {
                 "Dataset",
                 &name,
                 "A context compaction: everything before this point left the model's window.",
-                format!(r#"{{"compaction":{index}}}"#).as_bytes(),
+                &serde_json::to_vec(&json!({ "compaction": index }))?,
                 json!({ "provType": "Activity" }),
                 at,
             )
@@ -394,6 +417,52 @@ impl Recorder {
     /// read tool.
     pub fn note_no_file_observation(&mut self) {
         self.count("ToolCallWithoutFileObservation");
+    }
+
+    /// Note whether a tool call reported failure, including when it reported nothing.
+    ///
+    /// Three outcomes, and the third is not a rounding of the second. A host that says nothing about
+    /// success has not said the call succeeded, and recording it as ordinary work would attest a
+    /// clean run over a failed one. Codex reports no terminal status at all, so there every call
+    /// lands in the unknown bucket -- which is the honest reading of what that capture path can see.
+    pub fn note_tool_outcome(&mut self, is_error: Option<bool>) {
+        self.count(match is_error {
+            Some(true) => "ToolCallFailed",
+            Some(false) => "ToolCallSucceeded",
+            None => "ToolCallOutcomeUnknown",
+        });
+    }
+
+    /// Note a tool call whose end carried no result payload at all.
+    ///
+    /// Distinct from a call that returned nothing about files: this one returned nothing, period, so
+    /// the run is recorded from its arguments alone. Counted so a reader can tell a quiet tool from a
+    /// capture path that lost the reply.
+    pub fn note_tool_without_result(&mut self) {
+        self.count("ToolCallWithoutResult");
+    }
+
+    /// Note work done while more than one subagent was live.
+    ///
+    /// Relay reports that *a* subagent is running, not which one performed a given call, so with
+    /// siblings in flight the performer cannot be established. The activity is credited to the root
+    /// agent and marked ambiguous rather than assigned to whichever sibling started last -- a wrong
+    /// specific attribution is worse than an honest general one, because a reader can act on it.
+    pub fn note_ambiguous_attribution(&mut self) {
+        self.count("AmbiguousSubagentAttribution");
+    }
+
+    /// Record how many events never reached this recorder because the queue was full.
+    ///
+    /// Set from the mailbox at export. The recorder cannot observe its own gaps, and a graph with
+    /// holes that does not say so reads as a complete one.
+    pub fn note_events_dropped(&mut self, count: u64) {
+        self.events_dropped = count;
+    }
+
+    /// Total bytes of blob content held, for deciding how expensive a snapshot would be.
+    pub fn blob_bytes(&self) -> usize {
+        self.lineage.blob_bytes()
     }
 
     pub async fn record_tool_run(
@@ -422,6 +491,18 @@ impl Recorder {
     ///
     /// Registered once per session: a tool called forty times is one node with forty edges, not
     /// forty nodes.
+    ///
+    /// The descriptor goes through the serializer, never `format!`. `name` is host-supplied -- a tool
+    /// name, an MCP tool name, a model id -- and interpolating it raw makes the node's own content
+    /// forgeable: a tool named `a","kind":"Model` produced the bytes
+    /// `{"kind":"Tool","name":"a","kind":"Model"}`, which parse, and parse to *`kind: Model`* because
+    /// a duplicate key takes the last value. The node then describes itself as something it is not.
+    /// A name holding a bare quote or backslash is the blunter version: content that is not JSON at
+    /// all.
+    ///
+    /// Identity was never at risk -- `kind` is one of our own literals and precedes `name`, so the
+    /// prefix pins the pair and no two `(kind, name)` pairs can produce the same bytes. The claim
+    /// inside the node was.
     pub async fn record_actor(
         &mut self,
         kind: &str,
@@ -435,7 +516,7 @@ impl Recorder {
             return Ok(existing.clone());
         }
 
-        let descriptor = format!(r#"{{"kind":"{kind}","name":"{name}"}}"#).into_bytes();
+        let descriptor = serde_json::to_vec(&json!({ "kind": kind, "name": name }))?;
         let asset = self
             .register_payload(kind, name, description, &descriptor, extra, at)
             .await?;
@@ -465,6 +546,13 @@ impl Recorder {
     }
 
     pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
+        // Stated even when it is zero, unlike every other counter. For the rest, absent means none
+        // happened and a reader loses nothing by inferring it. This one answers "is this graph
+        // complete?", and a reader who has to know that absence means zero cannot distinguish an
+        // intact recording from a manifest written before the counter existed.
+        self.stats
+            .insert("EventsDropped".to_string(), self.events_dropped);
+
         let coverage: Value = self
             .stats
             .iter()
@@ -492,10 +580,17 @@ impl Recorder {
 
 /// A deterministic stand-in for content we may not store.
 ///
-/// Canonical by construction: the fields are emitted in a fixed order with no whitespace, so the
-/// same withheld file in two recordings hashes to the same identity and the graphs join. This is a
-/// JSON envelope rather than a content hash, which is exactly why the node's metadata marks it
+/// Canonical by construction: `serde_json`'s map is sorted and its output carries no whitespace, so
+/// the same withheld file in two recordings hashes to the same identity and the graphs join. This is
+/// a JSON envelope rather than a content hash, which is exactly why the node's metadata marks it
 /// `redacted` -- a reader must be able to tell which nodes are content-addressed and which are not.
+///
+/// Built through the serializer rather than `format!` because `content_cid` is not always a hash:
+/// for an unestablished file it is `unknown:{path}`, and a path is arbitrary bytes from the host. A
+/// path containing a quote closed the string early, so the descriptor for such a file was not valid
+/// JSON -- unreadable content on a node whose entire purpose is to stand in for content nobody can
+/// read. A path shaped like `x","withheld":true}` went further and made the node's own `withheld`
+/// claim say the opposite of the decision that was taken.
 ///
 /// **The path is deliberately not in here.** Identity is content, and the path is metadata, so one
 /// file copied or moved to a second location is one node with two things said about it. Hashing the
@@ -506,6 +601,9 @@ impl Recorder {
 /// path does still determine identity there. That is unavoidable rather than intended: with no
 /// content there is nothing else to be identical about, and two unread files cannot be shown to be
 /// the same file.
-fn canonical_descriptor(content_cid: &str, withheld: bool) -> Vec<u8> {
-    format!(r#"{{"content-cid":"{content_cid}","withheld":{withheld}}}"#).into_bytes()
+fn canonical_descriptor(content_cid: &str, withheld: bool) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&json!({
+        "content-cid": content_cid,
+        "withheld": withheld,
+    }))?)
 }

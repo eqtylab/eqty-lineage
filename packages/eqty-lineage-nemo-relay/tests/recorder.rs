@@ -562,3 +562,132 @@ async fn an_unambiguous_patch_hunk_is_replayed() {
         rec.stats()
     );
 }
+
+#[tokio::test]
+async fn an_actor_named_like_json_cannot_forge_its_own_description() {
+    // The descriptor is the node's content, and it was built by interpolating a host-supplied name
+    // into a string: `format!(r#"{{"kind":"{kind}","name":"{name}"}}"#)`. A tool named
+    // `a","kind":"Model` therefore produced bytes that parse -- and parse to `kind: Model`, because a
+    // duplicate JSON key takes the last value. The node described itself as a model.
+    //
+    // Identity was never the exposure: `kind` is our own literal and comes first, so no two
+    // `(kind, name)` pairs can produce the same bytes. What was exposed was the claim inside.
+    let mut rec = recorder();
+    let hostile = r#"a","kind":"Model"#;
+    rec.record_actor(
+        "Tool",
+        hostile,
+        "A tool with an awkward name.",
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    .expect("the actor registers");
+
+    let decoded = decoded_blobs(rec.finish(None).await.expect("the manifest exports"));
+    // Find the descriptor blob and parse it as a reader would.
+    let descriptor: serde_json::Value = decoded
+        .split_inclusive('}')
+        .filter_map(|chunk| chunk.rfind('{').map(|at| &chunk[at..]))
+        .filter_map(|chunk| serde_json::from_str::<serde_json::Value>(chunk).ok())
+        .find(|value| value.get("kind").is_some() && value.get("name").is_some())
+        .expect("the actor descriptor is in the manifest and parses");
+
+    assert_eq!(
+        descriptor["kind"], "Tool",
+        "the kind is what we said it was, not what the name claimed: {descriptor}"
+    );
+    assert_eq!(
+        descriptor["name"], hostile,
+        "and the name survives verbatim"
+    );
+}
+
+#[tokio::test]
+async fn an_ordinary_actor_keeps_the_identity_it_always_had() {
+    // The guard on the fix above. Going through the serializer must not renumber every actor node
+    // ever recorded: `serde_json`'s map is sorted and `kind` sorts before `name`, so for a name that
+    // needs no escaping the bytes are exactly what the old `format!` produced. Every manifest already
+    // on disk still joins with every manifest written from here on.
+    let mut rec = recorder();
+    rec.record_actor(
+        "Tool",
+        "Read",
+        "The Read tool.",
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    .expect("the actor registers");
+
+    let decoded = decoded_blobs(rec.finish(None).await.expect("the manifest exports"));
+    assert!(
+        decoded.contains(r#"{"kind":"Tool","name":"Read"}"#),
+        "the descriptor bytes must be unchanged:\n{decoded}"
+    );
+}
+
+#[tokio::test]
+async fn a_denied_payload_does_not_report_itself_as_too_large() {
+    // Both dispositions withhold the bytes, and both were counted as `PayloadTooLarge`. The deny
+    // list is matched against the payload's *name* -- there is no path here -- so a tool called
+    // `get_credentials` has its arguments withheld by the default `*credentials*` glob, and coverage
+    // then said the payload was oversized. A reader raising the size ceiling to recover it would find
+    // nothing changed, because size was never the reason.
+    // `*credentials*` is one of the shipped defaults, which is what makes this the ordinary case
+    // rather than a contrived one.
+    let signer = Ed25519Signer::create().expect("a signer");
+    let mut rec = Recorder::new(
+        LineageSession::new(SignerType::ED25519(signer)),
+        Policy::new(vec!["*credentials*".into()], 1_048_576),
+    );
+    rec.register_payload(
+        "Dataset",
+        "get_credentials input",
+        "What the tool was invoked with.",
+        b"{\"account\":\"acme\"}",
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    .expect("the payload registers as a node either way");
+
+    assert_eq!(
+        rec.stats().get("PayloadDenied"),
+        Some(&1),
+        "withheld by policy, and said so: {:?}",
+        rec.stats()
+    );
+    assert_eq!(
+        rec.stats().get("PayloadTooLarge"),
+        None,
+        "and not blamed on a ceiling it never hit"
+    );
+
+    let decoded = decoded_blobs(rec.finish(None).await.expect("the manifest exports"));
+    assert!(
+        decoded.contains("\"withheldBecause\":\"denied-by-policy\""),
+        "the reason travels with the node, not only in coverage:\n{decoded}"
+    );
+}
+
+#[tokio::test]
+async fn a_payload_over_the_ceiling_still_reports_its_size() {
+    // The complement: the counter must still distinguish the size case, or the fix above has just
+    // moved the confusion.
+    let mut rec = recorder();
+    let oversized = vec![b'x'; 2048]; // the test policy's ceiling is 1024
+    rec.register_payload(
+        "Dataset",
+        "Bash result",
+        "What the tool returned.",
+        &oversized,
+        serde_json::json!({}),
+        None,
+    )
+    .await
+    .expect("the payload registers");
+
+    assert_eq!(rec.stats().get("PayloadTooLarge"), Some(&1));
+    assert_eq!(rec.stats().get("PayloadDenied"), None);
+}

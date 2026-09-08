@@ -97,6 +97,12 @@ pub struct LineageSession {
     /// one file's contents seen at two paths is one node with two things said about it, and
     /// collapsing on content alone would silently drop the second path.
     described: HashSet<(String, String)>,
+    /// Running total of the bytes in `blobs`.
+    ///
+    /// Tracked rather than summed on demand because it is read to decide whether a snapshot is worth
+    /// taking, and walking every blob to answer "would walking every blob be expensive?" defeats the
+    /// question.
+    blob_bytes: usize,
 }
 
 impl LineageSession {
@@ -110,7 +116,25 @@ impl LineageSession {
             blobs: HashMap::new(),
             registered_content: HashSet::new(),
             described: HashSet::new(),
+            blob_bytes: 0,
         }
+    }
+
+    /// Store one blob, keeping the byte total in step.
+    ///
+    /// Re-inserting the same CID is normal -- identical content is registered more than once in a
+    /// session -- and the replaced entry's bytes must come back off the total or it drifts upward
+    /// forever, which would throttle checkpoints for a session that never actually grew.
+    fn put_blob(&mut self, cid: String, bytes: Vec<u8>) {
+        self.blob_bytes += bytes.len();
+        if let Some(replaced) = self.blobs.insert(cid, bytes) {
+            self.blob_bytes -= replaced.len();
+        }
+    }
+
+    /// Total bytes of blob content held.
+    pub fn blob_bytes(&self) -> usize {
+        self.blob_bytes
     }
 
     /// The DID every statement in this session is registered by.
@@ -137,7 +161,7 @@ impl LineageSession {
         at: Option<String>,
     ) -> Result<AssetRef> {
         let content_cid = blake3_cid_raw_binary(content)?;
-        self.blobs.insert(content_cid.clone(), content.to_vec());
+        self.put_blob(content_cid.clone(), content.to_vec());
 
         if self.registered_content.insert(content_cid.clone()) {
             let data = Statement::DataRegistration(
@@ -276,7 +300,7 @@ impl LineageSession {
         at: Option<String>,
     ) -> Result<()> {
         let (metadata_cid, canonical) = integrity::cid::jcs::compute_jcs_cid(&metadata)?;
-        self.blobs.insert(metadata_cid.clone(), canonical);
+        self.put_blob(metadata_cid.clone(), canonical);
 
         // Same subject, same claim, already stated. Saying it twice adds nothing a reader can use.
         if !self.described.insert((subject.clone(), metadata_cid)) {
@@ -292,14 +316,17 @@ impl LineageSession {
 
     /// Resolve every referenced blob and build the manifest.
     ///
-    /// This is the same `generate_manifest` the Python SDK reaches through `Context.export()`, over
-    /// the same `Statement` type, so the result verifies identically.
     /// Build a manifest from what has been recorded so far, without consuming the session.
     ///
-    /// Clones the statements and the blobs, so the cost scales with everything recorded up to this
-    /// point. That is affordable at the sizes a coding session produces -- the live manifests so far
-    /// are a few hundred kilobytes -- and it is the reason a snapshot is taken per turn rather than
-    /// per event.
+    /// Uses the same `generate_manifest` the Python SDK reaches through `Context.export()`, over the
+    /// same `Statement` type, so the result verifies identically.
+    ///
+    /// **This is not cheap and the caller must treat it as expensive.** Every call deep-copies all
+    /// statements and every blob, re-resolves them and re-serializes the whole manifest, so the cost
+    /// is the size of the recording so far -- not the size of what changed. A session holding a
+    /// 20 MB file pays 20 MB per call. `integrity`'s `InMemoryStore` takes its map by value, so the
+    /// copy cannot be avoided from here; bounding *how often* this is called is the caller's job, and
+    /// [`Self::blob_bytes`] exists so it can be bounded by size rather than by guesswork.
     pub async fn snapshot(&self) -> Result<Manifest> {
         Self::build(self.statements.clone(), self.blobs.clone()).await
     }

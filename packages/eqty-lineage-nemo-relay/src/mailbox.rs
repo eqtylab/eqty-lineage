@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use nemo_relay_plugin::{AnnotatedLlmRequest, AnnotatedLlmResponse};
@@ -35,9 +35,25 @@ use crate::redaction::Policy;
 ///
 /// Bounded on purpose. An unbounded queue turns a slow recorder into unbounded memory growth inside
 /// the agent's process, and blocking instead would stall the agent -- which is the one thing a
-/// collector must never do. Dropping is the least-bad third option, and it is *counted*, so the
-/// manifest can state that it happened rather than quietly under-reporting.
+/// collector must never do. Dropping is the least-bad third option, and it is counted per session
+/// and reported in that session's coverage as `EventsDropped`, so an incomplete graph says so rather
+/// than reading as a complete one.
 const QUEUE_DEPTH: usize = 4096;
+
+/// Statements that must accumulate before a mid-session manifest is rewritten.
+///
+/// A checkpoint costs the whole manifest, not the delta -- see [`LineageSession::snapshot`] -- so
+/// writing after every event made a long session quadratic in its own length. The first checkpoint
+/// still happens at the first opportunity, because until one exists a crash loses everything.
+const CHECKPOINT_EVERY: usize = 24;
+
+/// Blob bytes that widen the checkpoint interval by one statement.
+///
+/// The interval scales with what a rewrite would cost, so a session holding a large file is
+/// checkpointed rarely and a small one often. Without this a 20 MB read makes every subsequent
+/// checkpoint copy 20 MB, the worker falls behind, and the queue starts dropping events -- turning a
+/// resilience feature into the cause of an incomplete recording.
+const CHECKPOINT_BYTES_PER_STATEMENT: usize = 65_536;
 
 /// What the subscriber hands to the worker.
 enum Message {
@@ -64,19 +80,18 @@ struct SessionState {
     agent: Option<AssetRef>,
     /// The prompt that opened the current turn, and an input to everything it caused.
     turn_prompt: Option<AssetRef>,
-    /// Subagents seen this session.
-    subagents: HashMap<String, AssetRef>,
-    /// The subagent currently doing the work, when one is.
-    active_subagent: Option<AssetRef>,
-    /// Which *instance* of that subagent is running.
+    /// Subagents that have started and not yet finished, in the order they started.
     ///
-    /// The node is the subagent's kind, deduplicated by name so `general-purpose` is one node across
-    /// every session that used one -- which is what makes "what did this kind of agent do" a graph
-    /// question. Two parallel workers of the same kind therefore share it, so the instance travels
-    /// on each activity instead. Without this a session that fans out to four identical subagents
-    /// records four indistinguishable performers.
-    active_subagent_instance: Option<String>,
-    dropped_events: u64,
+    /// A list rather than one "active" slot, because a session can fan out: a live run delegated to
+    /// four workers at once. With one slot the first `SubagentStop` cleared it, and every later call
+    /// by a still-running sibling was credited to the root agent -- the exact mis-attribution
+    /// subagent tracking exists to prevent, arriving silently.
+    ///
+    /// Each entry pairs the instance id with the *kind* node. The node is deduplicated by name, so
+    /// `general-purpose` is one node across every session that used one -- which is what makes "what
+    /// did this kind of agent do" a graph question. Two parallel workers of the same kind therefore
+    /// share it, and the instance travels on each activity instead.
+    live_subagents: Vec<(String, AssetRef)>,
     /// Where this session's manifest is written, resolved once when the session opens.
     ///
     /// Held rather than recomputed so that every write for one session lands on one file. Resolving
@@ -88,26 +103,52 @@ struct SessionState {
 }
 
 impl SessionState {
-    /// Who is doing the work right now: the active subagent, or the root agent.
+    /// Who is doing the work right now: the sole live subagent, or the root agent.
     ///
     /// Recorded as metadata *on the activity*, never as one of its inputs. Putting an agent in
     /// `inputs` would say the activity consumed the agent; PROV keeps association and usage apart,
     /// and so does this.
+    ///
+    /// With several subagents live this returns the root agent, because Relay reports that *a*
+    /// subagent is running and not which one performed a given call. Guessing the most recent would
+    /// produce a specific, checkable, wrong claim -- worse than a general true one, since a reader
+    /// would act on it.
     fn actor_name(&self) -> Option<String> {
-        self.active_subagent
-            .as_ref()
-            .or(self.agent.as_ref())
-            .map(|asset| asset.as_str().to_string())
+        match self.live_subagents.as_slice() {
+            [(_, only)] => Some(only.as_str().to_string()),
+            _ => self.agent.as_ref().map(|asset| asset.as_str().to_string()),
+        }
     }
 
-    /// Which instance of the acting subagent, when one is acting.
+    /// Which instance of the acting subagent, when exactly one is acting.
     ///
-    /// `None` for the root agent: there is only ever one of it, so an instance would say nothing.
+    /// `None` for the root agent -- there is only ever one of it, so an instance would say nothing --
+    /// and `None` when siblings are live, where the instance is genuinely not known.
     fn actor_instance(&self) -> Option<String> {
-        self.active_subagent
-            .as_ref()
-            .and(self.active_subagent_instance.as_ref())
-            .cloned()
+        match self.live_subagents.as_slice() {
+            [(id, _)] => Some(id.clone()),
+            _ => None,
+        }
+    }
+
+    /// How firmly the performer is known, stated on every activity.
+    ///
+    /// A reader comparing two manifests needs to tell "the root agent did this" from "we could not
+    /// tell which of four workers did this, so it is filed under the root". Both carry the same
+    /// `performedBy`; only this distinguishes them.
+    fn attribution_basis(&self) -> &'static str {
+        match self.live_subagents.len() {
+            0 => "root-agent",
+            1 => "sole-live-subagent",
+            _ => "ambiguous-parallel-subagents",
+        }
+    }
+
+    /// Note ambiguity in coverage, so the count is visible without walking every activity.
+    fn note_attribution(&mut self) {
+        if self.live_subagents.len() > 1 {
+            self.recorder.note_ambiguous_attribution();
+        }
     }
 }
 
@@ -118,20 +159,39 @@ impl SessionState {
 pub struct Mailbox {
     sender: Option<SyncSender<Message>>,
     worker: Option<JoinHandle<()>>,
+    /// Events dropped per session, shared with the worker so they reach that session's coverage.
+    ///
+    /// Counted per session rather than process-wide because the question a reader asks is whether
+    /// *this* graph is complete. Behind a lock because the drop path is the one place the subscriber
+    /// cannot hand work to the worker -- the queue being full is precisely the condition -- and drops
+    /// are rare enough that the lock is never contended in practice.
+    dropped: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Mailbox {
     /// Start the worker that owns every recorder.
-    pub fn start(manifest_dir: PathBuf, policy: Policy, signer: SignerFactory) -> Self {
+    ///
+    /// `on_finished` is called with a session's id once its manifest is written, so state keyed by
+    /// session elsewhere in the process can be released. Passed in rather than reached for, because
+    /// this module must not know what a [`crate::SessionRouter`] is.
+    pub fn start(
+        manifest_dir: PathBuf,
+        policy: Policy,
+        signer: SignerFactory,
+        on_finished: SessionFinished,
+    ) -> Self {
         let (sender, receiver) = sync_channel(QUEUE_DEPTH);
+        let dropped: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let counts = Arc::clone(&dropped);
         let worker = std::thread::Builder::new()
             .name("eqty-lineage".into())
-            .spawn(move || run(receiver, manifest_dir, policy, signer))
+            .spawn(move || run(receiver, manifest_dir, policy, signer, counts, on_finished))
             .ok();
 
         Self {
             sender: Some(sender),
             worker,
+            dropped,
         }
     }
 
@@ -139,9 +199,11 @@ impl Mailbox {
     ///
     /// Returns whether it was accepted, so the caller can count what was lost. Never blocks and
     /// never panics: a full queue and a dead worker are both "not recorded", and neither is worth
-    /// taking the agent down for.
+    /// taking the agent down for. A drop is also recorded against the session, so the manifest can
+    /// say it is incomplete instead of reading as a complete short recording.
     pub fn send(&self, session_id: &str, at: String, event: LineageEvent) -> bool {
         let Some(sender) = &self.sender else {
+            self.note_dropped(session_id);
             return false;
         };
         let message = Message::Observed {
@@ -149,10 +211,26 @@ impl Mailbox {
             at,
             event: Box::new(event),
         };
-        !matches!(
+        if matches!(
             sender.try_send(message),
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
-        )
+        ) {
+            self.note_dropped(session_id);
+            return false;
+        }
+        true
+    }
+
+    /// Count one event this session will never see.
+    ///
+    /// A poisoned lock is recovered from rather than propagated: the map behind it is counters, and
+    /// giving up on counting losses is the one response strictly worse than the loss itself.
+    fn note_dropped(&self, session_id: &str) {
+        let mut counts = self
+            .dropped
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *counts.entry(session_id.to_string()).or_insert(0) += 1;
     }
 }
 
@@ -178,7 +256,22 @@ impl Drop for Mailbox {
 /// not hold process-global signing state -- the mistake `integrity-py`'s `active_signer` makes.
 pub type SignerFactory = Box<dyn Fn() -> Option<LineageSession> + Send>;
 
-fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signer: SignerFactory) {
+/// Told that a session is finished and its manifest written.
+///
+/// Exists so the scope-to-session map that feeds this mailbox can be pruned. Without it a
+/// long-running gateway holds one entry per scope for every session it ever saw, and the great
+/// majority of a session's scopes are streaming chunks -- 428 of 445 events in the reference
+/// capture -- so the map grows fastest in the process least able to afford it.
+pub type SessionFinished = Box<dyn Fn(&str) + Send>;
+
+fn run(
+    receiver: Receiver<Message>,
+    manifest_dir: PathBuf,
+    policy: Policy,
+    signer: SignerFactory,
+    dropped: Arc<Mutex<HashMap<String, u64>>>,
+    on_finished: SessionFinished,
+) {
     // A current-thread runtime: this thread is the only one driving these futures, and a
     // multi-threaded pool would add threads to a process we are only supposed to observe.
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -211,38 +304,55 @@ fn run(receiver: Receiver<Message>, manifest_dir: PathBuf, policy: Policy, signe
                     open_calls: HashMap::new(),
                     agent: None,
                     turn_prompt: None,
-                    subagents: HashMap::new(),
-                    active_subagent: None,
-                    active_subagent_instance: None,
-                    dropped_events: 0,
+                    live_subagents: Vec::new(),
                 },
             );
         }
+
+        // Checked before `apply` consumes the event. Without a checkpoint the only manifest a
+        // session ever produces is written at the very end, so a crash, a kill, or a machine losing
+        // power takes the whole recording with it -- and nothing is visible while the agent works.
+        let boundary = completes_work(&event);
 
         let finished = {
             let Some(state) = sessions.get_mut(&session_id) else {
                 continue;
             };
             let finished = runtime.block_on(apply(state, *event, &at));
-            if !finished {
+            if !finished && boundary {
                 runtime.block_on(checkpoint(state));
             }
-            // Checkpoint. Without this the only manifest a session ever produces is written at the
-            // very end, so a crash, a kill, or a machine losing power takes the whole recording with
-            // it -- and nothing is visible while the agent is still working.
             finished
         };
 
         if finished && let Some(state) = sessions.remove(&session_id) {
-            export(&runtime, state);
+            export(&runtime, &session_id, state, &dropped);
+            on_finished(&session_id);
         }
     }
 
     // The channel closed. Everything still open is a session whose agent never told us it ended --
     // which on Codex is every session.
-    for (_session_id, state) in sessions {
-        export(&runtime, state);
+    for (session_id, state) in sessions {
+        export(&runtime, &session_id, state, &dropped);
+        on_finished(&session_id);
     }
+}
+
+/// Whether this event completed a unit of work, and so is worth checkpointing after.
+///
+/// Ends, not starts: a manifest written between a tool's start and its end holds the arguments of a
+/// call whose result is still coming, and rewriting the whole document to capture that is cost
+/// without a reader.
+fn completes_work(event: &LineageEvent) -> bool {
+    matches!(
+        event,
+        LineageEvent::PromptSubmitted { .. }
+            | LineageEvent::ModelCallEnded { .. }
+            | LineageEvent::ToolCallEnded { .. }
+            | LineageEvent::SubagentEnded { .. }
+            | LineageEvent::Compacted
+    )
 }
 
 /// Apply one event. Returns whether the session ended.
@@ -302,14 +412,16 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 // Delegated work is attributed to the subagent that did it, not to the root agent.
                 // A manifest that credited everything to the root would say one actor did work that
                 // several actors did, which is the thing a provenance record exists to prevent.
-                state.subagents.insert(subagent_id.clone(), asset.clone());
-                state.active_subagent = Some(asset);
-                state.active_subagent_instance = Some(subagent_id);
+                state.live_subagents.push((subagent_id, asset));
             }
         }
-        LineageEvent::SubagentEnded { .. } => {
-            state.active_subagent = None;
-            state.active_subagent_instance = None;
+        LineageEvent::SubagentEnded { subagent_id } => {
+            // Retire the one that ended, by id. Clearing unconditionally would end the attribution
+            // of every sibling still running, and with parallel workers the first stop arrives long
+            // before the last one finishes.
+            state
+                .live_subagents
+                .retain(|(live, _)| *live != subagent_id);
         }
         LineageEvent::Compacted => {
             // A compaction is a real transformation of the agent's context: everything before it has
@@ -335,9 +447,10 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
         }
         LineageEvent::ToolCallEnded {
             tool_use_id,
+            tool_name,
             result,
+            is_error,
             correlation,
-            ..
         } => {
             let open = tool_use_id
                 .as_ref()
@@ -345,8 +458,10 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
             record_tool(
                 state,
                 tool_use_id.as_deref(),
+                &tool_name,
                 open,
                 result,
+                is_error,
                 correlation.is_observed(),
                 at,
             )
@@ -464,9 +579,23 @@ async fn record_model_call(
     // The instruction that opened the turn is an input to the call it caused, and only to the first
     // one: repeating it on every subsequent call would assert that the user asked the same thing
     // several times, when the later calls were caused by the tool results in between.
-    let caused_by = state.turn_prompt.take();
+    //
+    // Cloned rather than taken, because a call whose response never arrived is not recorded at all.
+    // Taking it there would spend the prompt on an activity that was never written, orphaning the
+    // prompt node and leaving the next call in the turn with nothing to say what it was asked.
+    let caused_by = state.turn_prompt.clone();
 
-    let _ = state
+    let describes = serde_json::json!({
+        "computation_type": "model_call",
+        "model": model,
+        "performedBy": state.actor_name(),
+        "performedByInstance": state.actor_instance(),
+        "attribution": state.attribution_basis(),
+        "observed": observed,
+    });
+    state.note_attribution();
+
+    let recorded = state
         .recorder
         .record_model_call(
             model,
@@ -475,32 +604,54 @@ async fn record_model_call(
             completion.as_deref(),
             caused_by,
             details,
-            serde_json::json!({
-                "computation_type": "model_call",
-                "model": model,
-                "performedBy": state.actor_name(),
-                "performedByInstance": state.actor_instance(),
-                "observed": observed,
-            }),
+            describes,
             observed,
             at,
         )
         .await;
+
+    if matches!(recorded, Ok(true)) {
+        state.turn_prompt = None;
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_tool(
     state: &mut SessionState,
     tool_use_id: Option<&str>,
+    tool_name: &str,
     open: Option<OpenTool>,
     result: Option<Json>,
+    is_error: Option<bool>,
     observed: bool,
     at: Option<String>,
 ) {
-    let Some(result) = result else {
-        return;
-    };
+    // The end event names the tool even when its start never reached us. Relay synthesizes ids for
+    // post-only hooks, and an end whose id matches no stored start leaves `open` empty -- so relying
+    // on the start alone dropped the whole call. For a read-shaped result that is worse than it
+    // sounds: with no Tool actor and no result output the activity has no outputs at all and is
+    // refused, leaving the file node in the graph with nothing to say which run produced it.
+    let name = open
+        .as_ref()
+        .map(|open| open.name.clone())
+        .or_else(|| Some(tool_name.to_string()))
+        .filter(|name| !name.is_empty());
 
-    let (mut observations, _attributed) = file_events_from_result(&result, tool_use_id, true);
+    // Whether it failed, including "the host did not say". Recorded before anything can return
+    // early, because an unrecorded outcome is exactly the case coverage exists to expose.
+    state.recorder.note_tool_outcome(is_error);
+
+    let (mut observations, _attributed) = match &result {
+        Some(result) => file_events_from_result(result, tool_use_id, true),
+        None => {
+            // A tool end carrying no payload at all. The arguments may still name a path, so the
+            // call is recorded from what is known rather than abandoned -- and returning here also
+            // skipped the coverage note, so the call was invisible *and* uncounted, which is the one
+            // outcome a reader cannot detect.
+            state.recorder.note_tool_without_result();
+            (Vec::new(), None)
+        }
+    };
 
     // Codex edits files by handing a patch document to the shell, so nothing above sees it. The
     // patch is in the tool's *arguments*, not its result -- another case where having both halves
@@ -545,13 +696,13 @@ async fn record_tool(
     // The tool that did the work is an input to it. Naming it as a node rather than as a label makes
     // "which runs used this tool" a question the graph answers, and it is the shape the LangChain
     // and DeepAgents manifests already have.
-    if let Some(open) = &open
+    if let Some(name) = &name
         && let Ok(tool) = state
             .recorder
             .record_actor(
                 "Tool",
-                &open.name,
-                &format!("The '{}' tool, as invoked by the agent.", open.name),
+                name,
+                &format!("The '{name}' tool, as invoked by the agent."),
                 serde_json::json!({}),
                 at.clone(),
             )
@@ -604,8 +755,9 @@ async fn record_tool(
     // `[Tool, reads...] -> [result, writes...]`. Without it a read-only call has no output at all
     // and is refused as an activity -- so a `Read` would leave a file node dangling with no record
     // of the run that produced it.
-    if let Some(name) = open.as_ref().map(|open| open.name.as_str())
-        && let Ok(body) = serde_json::to_vec(&result)
+    if let Some(name) = &name
+        && let Some(result) = &result
+        && let Ok(body) = serde_json::to_vec(result)
         && let Ok(asset) = state
             .recorder
             .register_payload(
@@ -621,24 +773,33 @@ async fn record_tool(
         outputs.push(asset);
     }
 
-    // Who performed it. The active subagent when one is running, otherwise the root agent -- so
+    // Who performed it. The sole live subagent when there is one, otherwise the root agent -- so
     // delegated work is credited to the actor that did it rather than to the session as a whole.
     let performed_by = state.actor_name();
     let performed_by_instance = state.actor_instance();
+    let attribution = state.attribution_basis();
+    // Three outcomes, not two. `null` is the honest record for a host that never said -- which on
+    // Codex is every call -- and collapsing it into "succeeded" would attest a clean run over one
+    // whose failures were simply invisible to us.
+    let outcome = match is_error {
+        Some(true) => Some("failed"),
+        Some(false) => Some("succeeded"),
+        None => None,
+    };
+    let describes = serde_json::json!({
+        "computation_type": "tool_call",
+        "tool": name,
+        "outcome": outcome,
+        "performedBy": performed_by,
+        "performedByInstance": performed_by_instance,
+        "attribution": attribution,
+        "observed": observed,
+    });
+    state.note_attribution();
+
     let _ = state
         .recorder
-        .record_tool_run(
-            &inputs,
-            &outputs,
-            serde_json::json!({
-                "computation_type": "tool_call",
-                "tool": open.as_ref().map(|open| open.name.clone()),
-                "performedBy": performed_by,
-                "performedByInstance": performed_by_instance,
-                "observed": observed,
-            }),
-            at,
-        )
+        .record_tool_run(&inputs, &outputs, describes, at)
         .await;
 }
 
@@ -705,6 +866,16 @@ async fn checkpoint(state: &mut SessionState) {
     if count == state.written_at {
         return;
     }
+    // The first one happens as soon as there is anything to write: until a manifest exists on disk,
+    // a crash loses the session outright. After that the interval widens with the cost of a rewrite,
+    // because a snapshot copies the entire recording rather than the part that changed.
+    if state.written_at > 0 {
+        let interval =
+            CHECKPOINT_EVERY.max(state.recorder.blob_bytes() / CHECKPOINT_BYTES_PER_STATEMENT);
+        if count - state.written_at < interval {
+            return;
+        }
+    }
     let Ok(manifest) = state.recorder.snapshot().await else {
         return;
     };
@@ -714,8 +885,21 @@ async fn checkpoint(state: &mut SessionState) {
     }
 }
 
-fn export(runtime: &tokio::runtime::Runtime, state: SessionState) {
-    let dropped = state.dropped_events;
+fn export(
+    runtime: &tokio::runtime::Runtime,
+    session_id: &str,
+    mut state: SessionState,
+    dropped: &Arc<Mutex<HashMap<String, u64>>>,
+) {
+    // What the queue lost for this session, taken out of the shared map so it does not outlive the
+    // session it describes -- the same unbounded-growth mistake this export path exists to close.
+    let lost = dropped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_id)
+        .unwrap_or(0);
+    state.recorder.note_events_dropped(lost);
+
     // A session that never registered an agent is not a session anyone ran.
     //
     // Codex issues an ancillary model call to title the conversation, through a different provider
@@ -736,7 +920,6 @@ fn export(runtime: &tokio::runtime::Runtime, state: SessionState) {
     let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
         return;
     };
-    let _ = dropped;
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
         write_atomically(&path, &json);
         // The checkpoints went to the session-shaped name before we knew this was a fragment.

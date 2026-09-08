@@ -43,7 +43,7 @@ pub use files::{
     file_events_from_result,
 };
 pub use lineage::{AssetRef, LineageSession};
-pub use mailbox::{Mailbox, SignerFactory};
+pub use mailbox::{Mailbox, SessionFinished, SignerFactory};
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
@@ -54,7 +54,8 @@ use std::sync::{Arc, Mutex};
 
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::{
-    ConfigDiagnostic, Event, Json, NativePlugin, PluginContext, Result, nemo_relay_plugin,
+    ConfigDiagnostic, DiagnosticLevel, Event, Json, NativePlugin, PluginContext, Result,
+    nemo_relay_plugin,
 };
 use serde_json::Map;
 
@@ -78,6 +79,10 @@ pub struct Tally {
     /// Classified events that could not be attributed to any session, and were dropped.
     pub unattributed: AtomicU64,
     /// Events dropped because the recorder's queue was full. Blocking instead would stall the agent.
+    ///
+    /// Process-wide, and for the diagnostics surface only. The count a reader needs is per session
+    /// and lives in that session's coverage node as `EventsDropped`; this one cannot say which
+    /// manifest is incomplete.
     pub queue_overflow: AtomicU64,
     /// Callback invocations that panicked and were contained.
     pub panicked: AtomicU64,
@@ -87,9 +92,13 @@ pub struct Tally {
 #[derive(Default)]
 pub struct EqtyLineagePlugin {
     tally: Arc<Tally>,
-    /// Held so that dropping the plugin drops the mailbox, which flushes every open session. Relay
-    /// has no explicit teardown hook -- `Drop` on this struct is the only shutdown notification a
-    /// native plugin gets, and on Codex it is the only thing that ever writes a manifest.
+    /// One of the handles keeping the mailbox alive; the subscriber closure Relay owns holds another.
+    ///
+    /// So dropping the plugin does *not* by itself flush anything -- the flush happens when the last
+    /// `Arc` goes, which is whenever Relay releases the subscriber. Relay has no explicit teardown
+    /// hook, and on Codex that release is the only thing that ever writes a manifest. Held here so
+    /// the mailbox survives at least as long as the plugin, not because this handle is the one that
+    /// ends it.
     mailbox: Option<Arc<Mailbox>>,
 }
 
@@ -123,7 +132,12 @@ impl NativePlugin for EqtyLineagePlugin {
         // Registration is the last place a bad config can be refused. Relay calls `validate` first,
         // but a component can also be configured by hand-writing the TOML block, which skips it.
         let (config, diagnostics) = Config::parse(plugin_config);
-        if let Some(problem) = diagnostics.first() {
+        // Only errors refuse the registration. A warning says a setting will not do what its name
+        // suggests, which is worth surfacing and not worth declining to record over.
+        if let Some(problem) = diagnostics
+            .iter()
+            .find(|problem| problem.level == DiagnosticLevel::Error)
+        {
             return Err(problem.message.clone());
         }
 
@@ -136,14 +150,31 @@ impl NativePlugin for EqtyLineagePlugin {
                 .ok()
                 .map(|signer| LineageSession::new(SignerType::ED25519(signer)))
         });
-        let mailbox = Arc::new(Mailbox::start(config.manifest_dir.clone(), policy, signer));
-        self.mailbox = Some(Arc::clone(&mailbox));
-
-        let tally = Arc::clone(&self.tally);
         // `register_subscriber` takes `Fn`, not `FnMut`, so the router's state lives behind a lock.
         // Relay drives subscribers from its own queue rather than from the agent's critical path, so
         // this is uncontended in practice -- but it must never be held across anything slow.
-        let router = Mutex::new(SessionRouter::new());
+        //
+        // Shared with the mailbox as well as the subscriber, because the router accumulates one
+        // entry per scope and only the mailbox knows when a session is over. The alternative -- a
+        // map that grows for the life of the process -- is a leak in exactly the long-lived gateway
+        // this plugin is meant to be safe inside.
+        let router = Arc::new(Mutex::new(SessionRouter::new()));
+
+        let finished = Arc::clone(&router);
+        let mailbox = Arc::new(Mailbox::start(
+            config.manifest_dir.clone(),
+            policy,
+            signer,
+            Box::new(move |session_id: &str| {
+                finished
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .forget(session_id);
+            }),
+        ));
+        self.mailbox = Some(Arc::clone(&mailbox));
+
+        let tally = Arc::clone(&self.tally);
         ctx.register_subscriber(SUBSCRIBER_NAME, move |event: &Event| {
             observe(&tally, &router, &mailbox, event);
         })?;

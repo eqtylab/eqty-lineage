@@ -284,3 +284,46 @@ async fn the_same_bytes_seen_two_ways_keep_both_descriptions() {
         "but both paths must survive"
     );
 }
+
+#[tokio::test]
+async fn the_blob_total_tracks_what_is_actually_held() {
+    // Read to decide whether a mid-session snapshot is worth its cost, so it has to be right in the
+    // one case that happens constantly: the same content registered twice. A total that counted
+    // every insert would climb on a session that never grew, and the checkpoint interval derived
+    // from it would widen until the recording stopped being written at all.
+    let mut session = session();
+    let before = session.blob_bytes();
+    assert_eq!(before, 0, "nothing held yet");
+
+    let body = b"the same forty-two bytes, give or take a few";
+    session
+        .register_content(body, serde_json::json!({ "name": "first" }), None)
+        .await
+        .expect("registers");
+    let once = session.blob_bytes();
+    assert!(
+        once >= body.len(),
+        "the content and its metadata are both held: {once}"
+    );
+
+    // Identical bytes, described the same way. Nothing new is stored.
+    session
+        .register_content(body, serde_json::json!({ "name": "first" }), None)
+        .await
+        .expect("registers again");
+    assert_eq!(
+        session.blob_bytes(),
+        once,
+        "re-registering identical content must not inflate the total"
+    );
+
+    // Different content does grow it.
+    session
+        .register_content(b"other", serde_json::json!({ "name": "second" }), None)
+        .await
+        .expect("registers");
+    assert!(
+        session.blob_bytes() > once,
+        "but genuinely new content does"
+    );
+}
