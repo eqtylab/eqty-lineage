@@ -105,7 +105,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         self._root_context = init().get_default_context()
         self._context = self._root_context
         # Registration is opt-in. Service.new resolves its credentials exclusively from EQTY_API_KEY.
-        self._service = Service.new(integrity_service_url) if integrity_service_url else None
+        self._ig_service = Service.new(integrity_service_url) if integrity_service_url else None
         # An integration that has separately attested transport evidence (such as EQTY vNIM) can
         # replace the default Prompt+Model -> Reasoning statement with explicit transport stages.
         self._defer_chat_model_computations = defer_chat_model_computations
@@ -165,7 +165,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         waiting for that thread/session to end, makes the lineage from each ``invoke`` available
         to Integrity Service immediately.
         """
-        if self._service is None:
+        if self._ig_service is None:
             return
         registered_context = context if context is not None else self._context
         logger.info(
@@ -173,7 +173,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             registered_context.id,
             registered_context.name,
         )
-        registered_context.register(self._service)
+        registered_context.register(self._ig_service)
         logger.info(
             "integrity_service.registered context_id=%s context_name=%s",
             registered_context.id,
