@@ -81,17 +81,16 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # This job ran out of disk once -- `No space left on device` compiling
-      # `netlink-packet-route` -- because the two workspaces' dependency trees come to roughly 13 GB
-      # against the 14 GB free here. Each phase below prints what is left, so the next failure says
-      # where the space went rather than only that it ran out.
-      - name: Free runner disk
+      # A `Free runner disk` step used to sit here, deleting ~22 GB of preinstalled toolchains at a
+      # cost of 94-144s. It was load-bearing when one job held both dependency trees; now that each
+      # leg holds one, run 34279463567 measured the peak at 10 GB (plugin) and 9 GB (abi-test)
+      # against the 14 GB a runner starts with. The readings stay, so a leg that does run out says
+      # which phase took the space. To restore it:
+      #   sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
+      #     "$AGENT_TOOLSDIRECTORY" || true
+      - name: Disk at start
         shell: bash -e {0}
-        run: |
-          df -h / | tail -1 | xargs echo "free before cleanup:"
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android \
-            "$AGENT_TOOLSDIRECTORY" || true
-          df -h / | tail -1 | xargs echo "free after cleanup:"
+        run: df -h / | tail -1 | xargs echo "free at start:"
       # The cache key has to change when the compiler does, and `rust-cache` is a node action: it
       # does not run through `defaults.run.shell`, so the `rustc` it finds for itself is the runner
       # image's rustup toolchain rather than the dev shell's nixpkgs one. Its own log says so --
@@ -120,9 +119,9 @@ jobs:
           # failing clippy recompiles the world on every push -- the loop where a cache is worth
           # most. A partial target directory is safe to restore; cargo fingerprints what it finds.
           cache-on-failure: true
-      - name: Disk after cache restore
+      - name: Disk after restore
         shell: bash -e {0}
-        run: df -h / | tail -1 | xargs echo "free after restore:"
+        run: df -h / | tail -1 | xargs echo "free after dev shell + restore:"
       # Needs no dependency tree, so running it in both legs costs nothing worth splitting.
       - name: Format
         run: just fmt-check-rust
