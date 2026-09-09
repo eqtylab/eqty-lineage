@@ -8,6 +8,7 @@ integration lives under `packages/` as its own distribution sharing the
 | --- | --- | --- |
 | `eqty-lineage-langchain` | `eqty_lineage.langchain` | Callback handler registering LangChain/LangGraph runs as EQTY lineage |
 | `eqty-lineage-deepagents` | `eqty_lineage.deepagents` | The same, extended with a deep agent's filesystem, plan, subagents and skills |
+| `eqty-lineage-vnim` | `eqty_lineage.vnim` | `ChatOpenAI` implementation for working with LLMs in EQTY vNIM |
 
 Future integrations (e.g. `eqty-lineage-mcp`, `eqty-lineage-llamaindex`) follow
 the same pattern. Because `eqty_lineage` is an implicit namespace package, no
@@ -27,6 +28,18 @@ before/after lineage comparison you can run with `just langchain-diff-demo`. For
 [`packages/eqty-lineage-deepagents`](packages/eqty-lineage-deepagents/README.md) and `just deepagents-demo`,
 plus [a survey of the upstream DeepAgents examples](packages/eqty-lineage-deepagents/EXAMPLES.md) showing how to
 instrument each one.
+
+For a browser chat example around the LangChain travel agent, run:
+
+```bash
+OPENAI_API_KEY=... uv run python examples/langchain/travel_chat_ui.py
+```
+
+For a local EQTY VNIM tunnel at `127.0.0.1:8000`, run the interactive chat example:
+
+```bash
+uv run python examples/langchain/eqty_vnim_agent.py
+```
 
 ## Develop
 

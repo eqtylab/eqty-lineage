@@ -63,13 +63,16 @@ def test_claimed_content_is_not_inlined_in_the_state_blob(recording_handler, mon
     import eqty_lineage.langchain as mod
 
     recorded: list[tuple] = []
-    real = mod.Dataset.from_object
+    real = mod.Dataset._from_object
 
-    def spy(payload, **kwargs):
-        recorded.append((kwargs.get("name"), payload))
-        return real(payload, **kwargs)
+    def spy(obj, asset_type, ctx=None, _store=None, **kwargs):
+        recorded.append((kwargs.get("name"), obj))
+        return real(obj, asset_type, ctx, _store, **kwargs)
 
-    monkeypatch.setattr(mod.Dataset, "from_object", staticmethod(spy))
+    # patched below the public `from_object` classmethod: `_asset_factory` binds a context and calls
+    # `_from_object` directly, skipping `from_object` entirely, so that's the only point both the
+    # extractor's direct `Dataset.from_object` and the handler's context-bound calls both pass through.
+    monkeypatch.setattr(mod.Dataset, "_from_object", classmethod(lambda cls, *a, **kw: spy(*a, **kw)))
     recording_handler.add_extractor(FilesExtractor())
 
     _graph(lambda s: {"trail": ["x"], "payload": {"/a.md": "SECRET-CONTENT"}}).invoke(

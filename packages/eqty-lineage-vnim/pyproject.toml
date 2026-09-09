@@ -3,15 +3,15 @@ requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [project]
-name = "eqty-lineage-langchain"
-version = "0.0.0"
-description = "EQTY lineage callback handler for LangChain and LangGraph."
+name = "eqty-lineage-vnim"
+version = "0.1.0rc1"
+description = "LangChain chat model client for EQTY VNIM's OpenAI-compatible API."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "eqty-sdk",
-    "langchain-core>=0.3",
-    "rfc8785>=0.1",
+    "httpx>=0.27",
+    "langchain-openai==1.3.5",
 ]
 
 [tool.uv.sources]
@@ -24,6 +24,5 @@ publish-url = "https://pypi.eqtylab.io/"
 explicit = true
 
 [tool.uv.build-backend]
-# flat layout (module dir at package root, no src/); dotted name = namespace package
 module-root = ""
-module-name = "eqty_lineage.langchain"
+module-name = "eqty_lineage.vnim"
