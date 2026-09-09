@@ -4,7 +4,7 @@ EQTY lineage callback handler for LangChain and LangGraph. Registers graph nodes
 EQTY data assets and computation statements, threaded together into one end-to-end lineage flow:
 
 - every graph node run → input/output Dataset assets + a computation statement
-- every chat model call → Prompt + Model assets in, Reasoning asset out + computation
+- every chat model call → Prompt + Model assets, normalized request/response Documents, and a Reasoning output
 - every tool call → Tool + input Dataset in, output Dataset out + computation
 - every retrieval → Tool + query Prompt in, one Document asset per retrieved document out
 - every subagent → its own `agent` computation, linked to the tool that delegated to it
@@ -19,6 +19,52 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 
 Only `langchain-core` is required at runtime, so the handler works with plain LangChain runnables as well as LangGraph
 graphs. Use one handler instance per invocation.
+
+When a compatible client adds `eqty_openai_request_payload` to its final response metadata, the handler records that
+payload as an OpenAI-request Document and links it from the normalized LangChain request with a `ChatOpenAI XForm`
+computation. That payload is RFC 8785 (JCS) canonicalized, then given a raw-binary CID so it can join the current
+vNIM `Request Body` representation. `ChatEqtyVnimOpenAI` provides this metadata automatically.
+
+### Session isolation
+
+Set the application/tenant root context once when initializing the SDK. The handler automatically creates
+and reuses one child context per LangGraph `thread_id`; every asset and statement from that thread is
+recorded beneath that child. A `run_id` identifies one execution, not a multi-turn user session.
+
+```python
+root_context = Context.new("my-agent")
+eqty_sdk.init(default_context=root_context)
+
+app.invoke(
+    state,
+    config={"configurable": {"thread_id": conversation_id}, "callbacks": [EqtyCallbackHandler()]},
+)
+```
+
+Use one handler instance per invocation. The thread-context cache is shared by handlers in the process, so
+later turns of the same `thread_id` reuse its child context.
+
+After an invocation, export that handler's thread context—not the SDK root—to retrieve only that chat's
+lineage manifest:
+
+```python
+handler = EqtyCallbackHandler()
+app.invoke(state, config={"configurable": {"thread_id": conversation_id}, "callbacks": [handler]})
+handler.context.export("manifests/conversation.json")
+```
+
+### Optional Integrity Service registration
+
+Pass `integrity_service_url` when constructing the handler to register the active EQTY context after **every
+top-level graph invocation**. This is intentionally per call, not per LangGraph thread/session, so each chat turn is
+available to the service as soon as it completes. The SDK resolves the service credential only from `EQTY_API_KEY`.
+
+```python
+handler = EqtyCallbackHandler(
+    integrity_service_url="https://integrity.example.com",
+)
+app.invoke(state, config={"callbacks": [handler], "configurable": {"thread_id": thread_id}})
+```
 
 ## `verbose` — extra metadata on assets
 

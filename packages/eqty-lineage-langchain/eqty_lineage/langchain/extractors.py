@@ -91,7 +91,8 @@ class PathExtractor(StateExtractor):
             sink.carry(known)
             return str(value)
 
-        asset = Dataset.from_path(
+        # use private _asset_factory method to assign to the correct eqty_sdk context
+        asset = self._handler._asset_factory(Dataset).from_path(
             value,
             name=value.name,
             description=f"Filesystem asset referenced by LangGraph state: '{value}'.",

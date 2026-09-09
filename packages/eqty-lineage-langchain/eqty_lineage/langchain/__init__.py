@@ -8,7 +8,7 @@ to the graph invocation::
 The handler listens to the runs LangGraph emits and turns them into EQTY lineage:
 
 - every graph node run   -> input/output Dataset assets + a computation statement
-- every chat model call  -> Prompt + Model assets in, Reasoning asset out + computation
+- every chat model call  -> Prompt + Model assets, normalized request/response Documents, and Reasoning output
 - every tool call        -> Tool + input Dataset in, output Dataset out + computation
 
 ``pathlib.Path`` values in graph state get special treatment: if the path exists on disk, the file or directory it
@@ -29,6 +29,9 @@ import json
 import logging
 import re
 import threading
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -36,9 +39,10 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Dataset, Document, Model, Prompt, Reasoning, Tool
+from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, get_cid_for_bytes, init
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
+from rfc8785 import dumps as jcs_dumps
 
 from eqty_lineage.langchain._serialize import UNCLAIMED, _to_jsonable
 from eqty_lineage.langchain._tools import _registered_tool_sources, eqty_tool
@@ -85,9 +89,25 @@ def _log_run_ended(kind: str, run_id: UUID, error: BaseException) -> None:
 class EqtyCallbackHandler(BaseCallbackHandler):
     """Registers LangGraph execution as EQTY data assets and computation statements."""
 
-    def __init__(self, verbose: bool = False) -> None:
+    # Contexts are process-wide SDK objects, as is ``eqty_sdk.init``. The cache lets a new handler for a
+    # later turn of the same LangGraph thread use the same child context.
+    _thread_contexts: Dict[Tuple[str, str], Context] = {}
+    _thread_context_lock = threading.RLock()
+
+    def __init__(
+        self,
+        verbose: bool = False,
+        *,
+        integrity_service_url: Optional[str] = None,
+    ) -> None:
         # when True, extra metadata is attached to the registered EQTY assets
         self.verbose = verbose
+        # The application selects this root once with ``eqty_sdk.init(default_context=...)``. LangGraph
+        # ``thread_id`` values are mapped to child contexts beneath it as callbacks begin.
+        self._root_context = init().get_default_context()
+        self._context = self._root_context
+        # Registration is opt-in. Service.new resolves its credentials exclusively from EQTY_API_KEY.
+        self._ig_service = Service.new(integrity_service_url) if integrity_service_url else None
         if self.verbose:
             logger.info("EqtyCallbackHandler verbose node metadata enabled")
         # guards every mutation below; see _synchronized
@@ -126,6 +146,67 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     _RESERVED_SDK_KWARGS = frozenset({"obj", "path", "name", "description", "_store"})
     # ls_integration values that identify a component rather than the harness running it
     _COMPONENT_INTEGRATIONS = frozenset({"langchain_chat_model"})
+
+    def _asset_factory(self, asset_type: Any) -> Any:
+        """Return an SDK asset factory explicitly bound to this handler's context."""
+        return asset_type.with_context(self._context) if self._context is not None else asset_type
+
+    @property
+    def context(self) -> Context:
+        """The EQTY root or LangGraph-thread child context used by this handler's latest invocation."""
+        return self._context
+
+    def _register_context(self, context: Optional[Context] = None) -> None:
+        """Push one graph invocation's context, when service registration is configured.
+
+        A LangGraph ``thread_id`` can span many user messages.  Registering here, rather than
+        waiting for that thread/session to end, makes the lineage from each ``invoke`` available
+        to Integrity Service immediately.
+        """
+        if self._ig_service is None:
+            return
+        registered_context = context if context is not None else self._context
+        logger.info(
+            "integrity_service.registering context_id=%s context_name=%s",
+            registered_context.id,
+            registered_context.name,
+        )
+        registered_context.register(self._ig_service)
+        logger.info(
+            "integrity_service.registered context_id=%s context_name=%s",
+            registered_context.id,
+            registered_context.name,
+        )
+
+    def _activate_thread_context(self, metadata: Optional[Dict[str, Any]], agent_name: Optional[Any] = None) -> None:
+        """Select the child context for this LangGraph thread, or the configured root without one."""
+        thread_id = (metadata or {}).get("thread_id")
+        if thread_id is None:
+            # Nested LangChain callbacks do not always propagate LangGraph's configurable metadata.
+            # Keep the context selected by their enclosing graph rather than falling back to root.
+            return
+
+        key = (str(self._root_context.id), str(thread_id))
+        with self._thread_context_lock:
+            context = self._thread_contexts.get(key)
+            if context is None:
+                name = str(agent_name or (metadata or {}).get("lc_agent_name") or "LangGraph")
+                timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                context = Context.with_parent(self._root_context).new(f"{name}: {timestamp}")
+                self._thread_contexts[key] = context
+        self._context = context
+
+    def _bind_context_to_root_run(self, parent_run_id: Optional[UUID]) -> None:
+        """Update the enclosing root run when a nested callback first reveals its thread context."""
+        current = parent_run_id
+        seen = set()
+        while current is not None and current not in seen:
+            seen.add(current)
+            run = self._runs.get(current)
+            if run is not None and run.get("parent") is None:
+                run["context"] = self._context
+                return
+            current = self._parents.get(current)
 
     def _verbose_metadata(self, fields: Dict[str, Any]) -> Dict[str, Any]:
         """Sanitize verbose fields into scalars safe to unpack into SDK asset constructors.
@@ -184,7 +265,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             return UNCLAIMED
 
         payload = _to_jsonable(obj, on_value=dispatch)
-        asset = Dataset.from_object(payload, name=name, description=description, **sink.metadata)
+        asset = self._asset_factory(Dataset).from_object(payload, name=name, description=description, **sink.metadata)
 
         return asset, sink.carried, sink.created
 
@@ -336,11 +417,80 @@ class EqtyCallbackHandler(BaseCallbackHandler):
     def _finalize(self, name: str, kind: str, input_cids: List[CID], output_cids: List[CID]) -> None:
         """Create the computation node w/ metadata."""
 
-        statement_ids = add_computation_statement(inputs=input_cids, outputs=output_cids)
+        statement_ids = add_computation_statement(inputs=input_cids, outputs=output_cids, context=self._context)
 
         Metadata(name=name, computation_type=kind, framework=self._framework or "langchain").create_statement(
-            statement_ids[0], None, None
+            statement_ids[0], None, self._context
         )
+
+    def _import_integrity_manifests(self, response: LLMResult) -> None:
+        """Import external integrity evidence attached by a model without making it a handler prerequisite.
+
+        ``ChatEqtyVnimOpenAI`` adds ``eqty_integrity_manifest`` to the final AI message's response
+        metadata after its stream is consumed. The handler records its own normalized request and
+        response assets regardless; if a model supplies this optional evidence, it is imported as an
+        additional set of independently signed nodes in the same session context.
+        """
+        manifests: Dict[str, Dict[str, Any]] = {}
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                manifest = metadata.get("eqty_integrity_manifest") if isinstance(metadata, dict) else None
+                if not isinstance(manifest, dict):
+                    continue
+                try:
+                    key = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                except (TypeError, ValueError):
+                    logger.warning("ignoring non-serializable external integrity manifest")
+                    continue
+                manifests.setdefault(key, manifest)
+
+        for manifest in manifests.values():
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as manifest_file:
+                    json.dump(manifest, manifest_file)
+                    manifest_file.flush()
+                    self._context.import_manifest(Path(manifest_file.name))
+            except Exception as error:  # noqa: BLE001 - provenance import must not break the LLM response
+                logger.warning("external integrity manifest import failed: %s", error)
+                continue
+            statements = manifest.get("statements")
+            blobs = manifest.get("blobs")
+            logger.info(
+                "external integrity manifest imported context_id=%s statements=%d blobs=%d",
+                self._context.id,
+                len(statements) if isinstance(statements, dict) else 0,
+                len(blobs) if isinstance(blobs, dict) else 0,
+            )
+
+    @staticmethod
+    def _openai_request_payload(response: LLMResult) -> Optional[Dict[str, Any]]:
+        """Return the finalized OpenAI request payload a compatible client attached to its response."""
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                payload = metadata.get("eqty_openai_request_payload") if isinstance(metadata, dict) else None
+                if isinstance(payload, dict):
+                    return payload
+        return None
+
+    @staticmethod
+    def _openai_response_cid(response: LLMResult) -> Optional[CID]:
+        """Return the raw SSE response-body CID supplied by a compatible OpenAI client."""
+        for batch in response.generations:
+            for generation in batch:
+                message = getattr(generation, "message", None)
+                metadata = getattr(message, "response_metadata", None)
+                value = metadata.get("eqty_openai_response_cid") if isinstance(metadata, dict) else None
+                if not isinstance(value, str):
+                    continue
+                try:
+                    return CID(value)
+                except (TypeError, ValueError) as error:
+                    logger.warning("ignoring invalid raw OpenAI response CID: %s", error)
+        return None
 
     def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
         """Record a failed activity and link it to whatever was waiting on it.
@@ -367,7 +517,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         overstates how cleanly the run went.
         """
         try:
-            failure = Dataset.from_object(
+            failure = self._asset_factory(Dataset).from_object(
                 {"error": type(error).__name__, "message": str(error)},
                 name=f"{run['name']}: error",
                 description=f"Failure raised by '{run['name']}'.",
@@ -469,14 +619,16 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         logger.debug(run_id)
+        name = kwargs.get("name") or (serialized or {}).get("name")
+        self._activate_thread_context(metadata, agent_name=(metadata or {}).get("lc_agent_name") or name)
         self._note_framework(metadata)
         self._parents[run_id] = parent_run_id
+        self._bind_context_to_root_run(parent_run_id)
 
         # LangGraph emits many internal chain runs (channel reads/writes, task wrappers).
         # A node-level run is the one whose run name equals the "langgraph_node" metadata entry;
         # the root run is the graph itself.
         node = (metadata or {}).get("langgraph_node")
-        name = kwargs.get("name") or (serialized or {}).get("name")
         is_node = node is not None and name == node
         is_graph = parent_run_id is None
         subagent = self._agent_boundary(run_id, parent_run_id, metadata)
@@ -533,6 +685,9 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             "state_in": state_in.cid,
             "inputs": input_cids,
             "child_outputs": [],
+            # Registration must use the graph's context even if a later nested callback supplies
+            # incomplete metadata and changes the handler's active context.
+            "context": self._context,
         }
 
     @_synchronized
@@ -591,6 +746,11 @@ class EqtyCallbackHandler(BaseCallbackHandler):
                 # hangs off nothing and the graph has a hole exactly where the work was handed over.
                 enclosing.setdefault("child_outputs", []).append(state_out.cid)
 
+        # ``parent is None`` identifies the graph invocation, not the browser/chat session.
+        # A thread can make many such calls, and each one is registered independently.
+        if run["parent"] is None:
+            self._register_context(run["context"])
+
     @_synchronized
     def on_chain_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
         _log_run_ended("chain", run_id, error)
@@ -598,6 +758,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         run = self._runs.pop(run_id, None)
         self._forget_run(run_id)
         self._record_failure(run, error)
+        if run is not None and run["parent"] is None:
+            self._register_context(run["context"])
 
     ################################################## Chain Calls #################################################
 
@@ -615,11 +777,13 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         logger.debug(run_id)
+        self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         self._note_framework(metadata)
         params = kwargs.get("invocation_params") or {}
         model_name, provider = self._model_identity(serialized, params, metadata)
 
-        prompt = Prompt.from_object(
+        prompt = self._asset_factory(Prompt).from_object(
             _to_jsonable(messages),
             name=f"{model_name}: prompt",
             description="Messages sent to the chat model.",
@@ -647,7 +811,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         if model_tags:
             model_payload["tags"] = model_tags
 
-        model = Model.from_object(
+        model = self._asset_factory(Model).from_object(
             model_payload,
             name=model_name,
             **self._verbose_metadata(
@@ -672,11 +836,31 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             if enclosing_input is not None:
                 input_cids.append(enclosing_input)
 
+        # This is the handler's own normalized request record. It deliberately represents the
+        # LangChain invocation rather than claiming to be byte-identical to any provider's HTTP body.
+        request_payload: Dict[str, Any] = {"messages": _to_jsonable(messages), "model": model_name}
+        if sampling:
+            request_payload["sampling"] = _to_jsonable(sampling)
+        request = self._asset_factory(Document).from_object(
+            request_payload,
+            name=f"{model_name}: LangChain request",
+            description="Normalized LangChain chat-model request constructed by EqtyCallbackHandler.",
+            **self._verbose_metadata(
+                {
+                    "callback": "on_chat_model_start",
+                    "run_id": run_id,
+                    "parent_run_id": parent_run_id,
+                }
+            ),
+        )
+
         self._runs[run_id] = {
             "name": model_name,
             "kind": "chat_model",
             "state_in": prompt.cid,
             "inputs": input_cids,
+            "model": model.cid,
+            "request": request.cid,
             "child_outputs": [],
             "node": node,
         }
@@ -693,14 +877,68 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             _to_jsonable(getattr(gen, "message", None) or gen.text) for batch in response.generations for gen in batch
         ]
 
-        output = Reasoning.from_object(
+        response_body = self._asset_factory(Document).from_object(
+            {"generations": generations},
+            name=f"{run['name']}: response body",
+            description="Normalized chat-model response envelope received by EqtyCallbackHandler.",
+            **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+        )
+        output = self._asset_factory(Reasoning).from_object(
             generations,
             name=f"{run['name']}: response",
             description="Chat model response, including any tool calls.",
             **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
         )
 
-        self._finalize(run["name"], run["kind"], run["inputs"], [output.cid])
+        self._finalize(f"{run['name']}: request", "chat_request", run["inputs"], [run["request"]])
+        openai_request = self._openai_request_payload(response)
+        inference_request = run["request"]
+        if openai_request is not None:
+            try:
+                canonical_request_bytes = jcs_dumps(openai_request)
+                wire_request_cid = get_cid_for_bytes(canonical_request_bytes)
+            except (TypeError, ValueError) as error:
+                logger.warning("could not JCS-canonicalize ChatOpenAI request payload: %s", error)
+            else:
+                wire_request = self._asset_factory(Document).from_cid(
+                    wire_request_cid,
+                    name=f"{run['name']}: OpenAI request",
+                    description=(
+                        "JCS-canonicalized final OpenAI-compatible request payload produced by ChatOpenAI, "
+                        "identified with a raw-binary CID to match vNIM Request Body assets."
+                    ),
+                    **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+                )
+                self._finalize(
+                    f"{run['name']}: ChatOpenAI XForm",
+                    "chat_openai_transform",
+                    [run["request"]],
+                    [wire_request.cid],
+                )
+                inference_request = wire_request.cid
+
+        openai_response_cid = self._openai_response_cid(response)
+        if openai_response_cid is None:
+            self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [response_body.cid])
+        else:
+            wire_response = self._asset_factory(Document).from_cid(
+                openai_response_cid,
+                name=f"{run['name']}: OpenAI response",
+                description=(
+                    "Raw SSE response body received by ChatOpenAI, identified with a raw-binary CID "
+                    "to match vNIM Response Body assets."
+                ),
+                **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+            )
+            self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [wire_response.cid])
+            self._finalize(
+                f"{run['name']}: ChatOpenAI SSE parse",
+                "chat_openai_sse_parse",
+                [wire_response.cid],
+                [response_body.cid],
+            )
+        self._finalize(run["name"], run["kind"], [response_body.cid], [output.cid])
+        self._import_integrity_manifests(response)
 
         if run["node"] is not None:
             run["node"].setdefault("child_outputs", []).append(output.cid)
@@ -727,6 +965,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         logger.debug(run_id)
+        self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         tool_name = (serialized or {}).get("name", "tool")
 
         # an @eqty_tool-decorated tool is registered from its source code, like @compute's code asset;
@@ -753,7 +993,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         tool_key = json.dumps(tool_payload, sort_keys=True, default=str)
 
         if tool_key not in self._tool_cids:
-            tool_asset = Tool.from_object(
+            tool_asset = self._asset_factory(Tool).from_object(
                 tool_payload,
                 name=tool_name,
                 description=(serialized or {}).get("description", ""),
@@ -855,6 +1095,8 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         to its identity, so the same class pointed at a different index is a different asset.
         """
         logger.debug(run_id)
+        self._activate_thread_context(metadata, agent_name=kwargs.get("name"))
+        self._bind_context_to_root_run(parent_run_id)
         self._note_framework(metadata)
         name = kwargs.get("name") or (serialized or {}).get("name") or "retriever"
         identity = self._retriever_identity(name, metadata, tags)
@@ -863,7 +1105,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         key = json.dumps(identity, sort_keys=True)
 
         if key not in self._retriever_cids:
-            asset = Tool.from_object(
+            asset = self._asset_factory(Tool).from_object(
                 identity,
                 name=name,
                 description=(serialized or {}).get("description", ""),
@@ -881,7 +1123,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             )
             self._retriever_cids[key] = asset.cid
 
-        query_asset = Prompt.from_object(
+        query_asset = self._asset_factory(Prompt).from_object(
             _to_jsonable(query),
             name=f"{name}: query",
             description=f"Query issued to retriever '{name}'.",
@@ -933,7 +1175,7 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             source = None
             if isinstance(payload, dict):
                 source = (payload.get("metadata") or {}).get("source")
-            asset = Document.from_object(
+            asset = self._asset_factory(Document).from_object(
                 payload,
                 name=str(source) if source else f"{run['name']}: document {index + 1}",
                 description=f"Document retrieved by '{run['name']}'.",

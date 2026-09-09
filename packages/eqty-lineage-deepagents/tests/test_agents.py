@@ -61,7 +61,7 @@ def test_the_system_prompt_is_registered_once_per_distinct_prompt(recording_hand
 
     assert len(recording_handler._system_prompt_cids) == 1
     prompt = str(next(iter(recording_handler._system_prompt_cids.values())))
-    assert prompt in recording_handler.inputs_of("ScriptedModel")
+    assert prompt in recording_handler.inputs_of("ScriptedModel: request")
 
 
 def test_a_subagent_prompt_is_a_different_asset(recording_handler):
