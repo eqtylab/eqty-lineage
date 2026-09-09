@@ -246,6 +246,24 @@ equivalent:
 ```bash
 python3 - <<'PY'
 import json, base64, collections, glob
+def leaked(paths, needle=b'do-not-record-me'):
+    """Where the secret would actually be, which is not where a raw grep looks.
+
+    Blob values are base64, so content that leaked through one is not literal bytes in the file:
+    `one\\ntwo\\nthree\\n` is provably stored in a Codex manifest and a raw grep for it returns
+    False [R]. Scan the decoded blobs as well, or this check cannot fail.
+    """
+    for q in paths:
+        if needle in open(q, 'rb').read():
+            return q                                    # verbatim, e.g. in a path or a plain field
+        for value in json.load(open(q)).get('blobs', {}).values():
+            try:
+                if needle in base64.b64decode(value):
+                    return q                            # decoded, which is where content lives
+            except Exception:
+                pass
+    return None
+
 p = sorted(glob.glob('/tmp/relay-live/.eqty/manifests/*.json'))
 print('manifests:', len(p), '-- more than one means a session was split')
 m = json.load(open(p[-1])); B = m['blobs']
@@ -270,7 +288,7 @@ print('agents    ', sorted(agents))
 print('assets    ', dict(assets))
 print('coverage  ', cov)
 print('withheld  ', redacted)
-print('secret leaked:', b"do-not-record-me" in open(p[-1],'rb').read())
+print('secret leaked:', leaked(p) or False)          # every manifest, not just the graded one
 required = [
     ('FileRead',        'a file was read into the graph at all'),
     ('FileWritten',     'a file version was written'),
@@ -335,6 +353,12 @@ coverage   {'Activity': 13, 'Agent': 2, 'ContentDenied': 1, 'ContentUnknown': 3,
             'PayloadTooLarge': 31, 'Tool': 5}
 secret leaked: False
 ```
+
+**That `secret leaked: False` is not evidence.** It was printed by the raw-grep check this section
+predates, which could not fail. Re-run with the `leaked()` above and a later session on the same
+script reports the manifest path instead: `deny_globs` withholds the `.env` node and the `Read`
+payloads attributed to it, and the model `prompt` and `completion` carrying the same bytes are
+stored with `redacted: false` [R]. A `False` here means only that this line has not been re-derived.
 
 with documents
 
@@ -444,6 +468,15 @@ The same harvester, a different expectation table — and the difference is the 
 `FileRead` and `ContentDenied` are health; here their absence is the finding, and `ContentRecovered`
 inverts from expected-absent to required.
 
+**Expect one more manifest than you ran sessions.** Codex issues an ancillary model call to title the
+conversation, through a different provider and under a session id of its own. It registers no agent,
+so it is not a session anyone ran, and it exports as `{id}.unattributed.json` — 20 statements whose
+whole completion is `{"title":"…"}`. One interactive run therefore leaves two files. **Grade the
+session file and skip the fragment**, which is what the filter below does: `.unattributed.json` sorts
+*after* the session file, so selecting `p[-1]` from an unfiltered glob grades the title call and
+reports `ContentUnknown`, `ContentRecovered` and `Document nodes` all missing on a healthy run [R].
+Check the secret against every file, though — a leak in the fragment is still a leak.
+
 ```bash
 python3 - <<'PY'
 import json, base64, collections, glob
@@ -451,8 +484,30 @@ import json, base64, collections, glob
 # content established by an earlier turn of the same session. Set this to the run you did.
 INTERACTIVE = True
 
-p = sorted(glob.glob('/tmp/relay-codex/.eqty/manifests/*.json'))
-print('manifests:', len(p), '-- one per session, so two `codex exec` calls give two')
+def leaked(paths, needle=b'do-not-record-me'):
+    """Where the secret would actually be, which is not where a raw grep looks.
+
+    Blob values are base64, so content that leaked through one is not literal bytes in the file:
+    `one\\ntwo\\nthree\\n` is provably stored in a Codex manifest and a raw grep for it returns
+    False [R]. Scan the decoded blobs as well, or this check cannot fail.
+    """
+    for q in paths:
+        if needle in open(q, 'rb').read():
+            return q                                    # verbatim, e.g. in a path or a plain field
+        for value in json.load(open(q)).get('blobs', {}).values():
+            try:
+                if needle in base64.b64decode(value):
+                    return q                            # decoded, which is where content lives
+            except Exception:
+                pass
+    return None
+
+everything = sorted(glob.glob('/tmp/relay-codex/.eqty/manifests/*.json'))
+# A `.unattributed.json` fragment is Codex's conversation-titling call: a model call with no agent,
+# under a session id of its own. It is not a session anyone ran, so it is not what to grade.
+p = [q for q in everything if not q.endswith('.unattributed.json')]
+print(f'manifests: {len(everything)} -- {len(p)} session, {len(everything)-len(p)} title fragment')
+print('grading   ->', p[-1].split('/')[-1])
 m = json.load(open(p[-1])); B = m['blobs']
 def blob(c):
     raw = B.get(c.replace('urn:cid:','')) or B.get(c)
@@ -466,7 +521,8 @@ for c in B:
     if d.get('name') == 'coverage': cov = d['coverage']
 print('statements', len(m['statements']), ' assets', dict(assets))
 print('coverage  ', cov)
-print('secret leaked:', b"do-not-record-me" in open(p[-1],'rb').read())
+# `everything`, not `p`: a leak in the title fragment is still a leak.
+print('secret leaked:', leaked(everything) or False)
 
 required = [
     ('ContentUnknown', '`*** Update File` carries hunks and no pre-image, so its v1 is identity-only'),
