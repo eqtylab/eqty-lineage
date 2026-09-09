@@ -1494,3 +1494,32 @@ fn a_nested_metadata_value_survives_being_encoded() {
         "the content stays a real object: {body}"
     );
 }
+
+#[test]
+fn the_plugins_own_manifest_mark_is_not_recorded_as_lineage() {
+    // Export emits an `eqty.manifest` mark on the host's event stream, and this plugin subscribes
+    // to that stream -- so the announcement comes back as an event. It must classify to nothing.
+    //
+    // Today it does, because `classify_mark` matches `session.start` by name and everything else by
+    // `hook_event_name`, which our mark does not carry. That is a property of the current match
+    // arms rather than a decision anyone recorded, and the next name-based arm could quietly turn a
+    // recording into one that records its own announcements -- growing a session that has already
+    // been exported, and on Codex re-opening one at teardown.
+    let announced = mark(
+        "01a040aa-0000-0000-0000-000000000fc1",
+        "01a040aa-0000-0000-0000-000000000fc2",
+        "01a040aa-0000-0000-0000-000000000fc3",
+        "eqty.manifest",
+        serde_json::json!({
+            "cid": "bafkr4iaq4gqw6cafxvysrux7cete77jtkzxqvuozqdv5b4vtqsebluxhfm",
+            "path": "/work/.eqty/manifests/session.json",
+            "statements": 300,
+            "unattributed": false,
+        }),
+    );
+
+    assert!(
+        classify(&announced).is_none(),
+        "the plugin's own announcement is not lineage"
+    );
+}
