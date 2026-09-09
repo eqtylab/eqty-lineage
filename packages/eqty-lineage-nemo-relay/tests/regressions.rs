@@ -1054,3 +1054,102 @@ async fn an_unanswered_model_call_says_why_its_inputs_dangle() {
         "the marker names the prompt it could not link: {marker}"
     );
 }
+
+/// Coverage states how many bytes were behind the nodes, split by what was done with them.
+///
+/// The counters answer "how many times", never "how much", and putting a size into that flat map
+/// would have made `PayloadTooLarge: 70` even easier to read as a size than it already was. So the
+/// totals are their own field, and they are in the metadata rather than the content because the
+/// content is what this node is addressed by: two sessions that saw the same things should produce
+/// the same coverage node, and the same session against a different ceiling sees exactly as much
+/// while storing a different amount.
+#[tokio::test]
+async fn coverage_states_how_many_bytes_were_behind_the_nodes() {
+    let signer = Ed25519Signer::create().expect("a signer");
+    let mut rec = Recorder::new(
+        LineageSession::new(SignerType::ED25519(signer)),
+        Policy::new(vec![".env*".into()], 8),
+    );
+
+    // One of each disposition, with lengths chosen so the three totals cannot be confused.
+    rec.observe_file(
+        &seen("/at.txt", Some(b"12345678"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(
+        &seen("/over.txt", Some(b"123456789"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(
+        &seen("/.env", Some(b"secret\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    // No content established: nothing to attribute, and zero stored bytes would claim an empty file.
+    rec.observe_file(&seen("/never.txt", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+
+    let manifest = exported(rec).await;
+    let coverage = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .find(|value| value["name"] == "coverage")
+        .expect("a coverage node");
+
+    let bytes = &coverage["contentBytes"];
+    assert_eq!(bytes["stored"], 8, "the file inside the ceiling: {bytes}");
+    assert_eq!(bytes["tooLarge"], 9, "the file over it: {bytes}");
+    assert_eq!(bytes["denied"], 7, "the file the policy withheld: {bytes}");
+
+    // The counters stay counts, and stay where they were.
+    assert_eq!(coverage["coverage"]["FileWritten"], 2);
+    assert_eq!(coverage["coverage"]["ContentUnknown"], 1);
+    assert!(
+        coverage["coverage"]["stored"].is_null(),
+        "sizes do not leak into the counter map: {coverage}"
+    );
+}
+
+/// Content never established contributes no bucket at all, not a zero one.
+///
+/// Separated from the test above because a zero is invisible beside a real total: attributing
+/// `0` bytes there passed that test untouched. On its own it is the whole difference between "we
+/// withheld nothing" and "there was nothing to withhold", which is the distinction `contentState`
+/// exists to keep and the totals must not undo.
+#[tokio::test]
+async fn content_never_established_contributes_no_byte_total() {
+    let signer = Ed25519Signer::create().expect("a signer");
+    let mut rec = Recorder::new(
+        LineageSession::new(SignerType::ED25519(signer)),
+        Policy::new(vec![".env*".into()], 8),
+    );
+    rec.observe_file(&seen("/never.txt", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+
+    let manifest = exported(rec).await;
+    let coverage = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .find(|value| value["name"] == "coverage")
+        .expect("a coverage node");
+
+    assert_eq!(
+        coverage["contentBytes"],
+        serde_json::json!({}),
+        "no content, so no bucket -- not `denied: 0`: {coverage}"
+    );
+    assert_eq!(
+        coverage["coverage"]["ContentUnknown"], 1,
+        "it was still seen"
+    );
+}

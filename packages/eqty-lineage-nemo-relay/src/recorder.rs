@@ -78,6 +78,10 @@ pub struct Recorder {
     /// outside: the subscriber counts what it could not hand over, and the recorder is by definition
     /// unaware of it.
     events_dropped: u64,
+    /// Bytes of content behind the nodes, split by what was done with them. Kept apart from
+    /// `stats` because those are counts of occurrences and these are sizes, and a reader who meets
+    /// `PayloadTooLarge: 70` in the same flat map has every reason to read it as a size.
+    bytes: BTreeMap<String, u64>,
     /// How many compactions have happened, which is not how many compaction hooks have fired.
     compactions: u64,
     /// Whether the compaction currently counted is still waiting for its second half.
@@ -96,6 +100,7 @@ impl Recorder {
             stats: BTreeMap::new(),
             actors: HashMap::new(),
             events_dropped: 0,
+            bytes: BTreeMap::new(),
             compactions: 0,
             awaiting_post_compaction: false,
         }
@@ -104,6 +109,19 @@ impl Recorder {
     /// Counts of what was seen and what could not be established.
     pub fn stats(&self) -> &BTreeMap<String, u64> {
         &self.stats
+    }
+
+    /// Attribute `len` bytes to what the policy decided about them.
+    ///
+    /// Only called where content actually existed. A file whose content was never established has
+    /// no length to attribute, and counting it as zero stored bytes would say we saw an empty file.
+    fn note_bytes(&mut self, disposition: Disposition, len: usize) {
+        let key = match disposition {
+            Disposition::Store => "stored",
+            Disposition::Denied => "denied",
+            Disposition::TooLarge => "tooLarge",
+        };
+        *self.bytes.entry(key.to_string()).or_insert(0) += len as u64;
     }
 
     fn count(&mut self, key: &str) {
@@ -214,6 +232,9 @@ impl Recorder {
             (Some(_), true) => "withheld",
             (None, _) => "unknown",
         };
+        if let Some(bytes) = &data {
+            self.note_bytes(disposition, bytes.len());
+        }
 
         let metadata = json!({
             "name": path,
@@ -354,6 +375,7 @@ impl Recorder {
             quoted = Some(path.as_str());
         }
         let withheld = disposition != Disposition::Store;
+        self.note_bytes(disposition, bytes.len());
         let reason = match (disposition, quoted) {
             (Disposition::Store, _) => None,
             (Disposition::Denied, Some(_)) => Some("quotes-a-denied-file"),
@@ -768,13 +790,26 @@ impl Recorder {
         // Content-addressed like everything else. Two runs that saw the same things produce the
         // same coverage node, which is what lets a reader compare what two sessions could observe
         // rather than only what they did.
+        let bytes_total: Value = self
+            .bytes
+            .iter()
+            .map(|(key, total)| (key.clone(), json!(total)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+
         let body = serde_json::to_vec(&coverage).unwrap_or_default();
         self.register_payload(
             "Dataset",
             "coverage",
             "What this recording saw, and what it could not: counts a reader needs to weigh the graph.",
             &body,
-            json!({ "provType": "Entity", "coverage": coverage }),
+            // The totals ride in the metadata rather than the body on purpose. The body is what
+            // this node is addressed by, and the comment above is the reason: two sessions that saw
+            // the same things should produce the same coverage node. Byte volume is not an
+            // observability fact -- the same session recorded twice against a different ceiling
+            // sees exactly as much and stores a different amount -- so folding it into the content
+            // would make comparable runs stop matching. The metadata is signed either way.
+            json!({ "provType": "Entity", "coverage": coverage, "contentBytes": bytes_total }),
             at,
         )
         .await?;
