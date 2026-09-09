@@ -351,7 +351,7 @@ fn completes_work(event: &LineageEvent) -> bool {
             | LineageEvent::ModelCallEnded { .. }
             | LineageEvent::ToolCallEnded { .. }
             | LineageEvent::SubagentEnded { .. }
-            | LineageEvent::Compacted
+            | LineageEvent::Compacted { .. }
     )
 }
 
@@ -423,11 +423,14 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 .live_subagents
                 .retain(|(live, _)| *live != subagent_id);
         }
-        LineageEvent::Compacted => {
+        LineageEvent::Compacted { phase } => {
             // A compaction is a real transformation of the agent's context: everything before it has
             // left the model's window. Recorded as an activity so a reader can see which later steps
             // could no longer have been informed by earlier ones.
-            let _ = state.recorder.record_compaction(at).await;
+            //
+            // Both halves are recorded and the phase reaches the recorder, which is what keeps one
+            // compaction from reading as two.
+            let _ = state.recorder.record_compaction(phase, at).await;
         }
         // Keyed by tool-call id when there is one. Relay synthesizes ids for post-only hooks, so a
         // missing one means the pre hook never arrived and the end will have to stand alone.

@@ -42,6 +42,7 @@ use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
 use serde_json::{Value, json};
 
+use crate::classify::CompactionPhase;
 use crate::files::{FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit};
 use crate::lineage::{AssetRef, LineageSession};
 use crate::redaction::{Disposition, Policy};
@@ -77,6 +78,10 @@ pub struct Recorder {
     /// outside: the subscriber counts what it could not hand over, and the recorder is by definition
     /// unaware of it.
     events_dropped: u64,
+    /// How many compactions have happened, which is not how many compaction hooks have fired.
+    compactions: u64,
+    /// Whether the compaction currently counted is still waiting for its second half.
+    awaiting_post_compaction: bool,
 }
 
 impl Recorder {
@@ -91,6 +96,8 @@ impl Recorder {
             stats: BTreeMap::new(),
             actors: HashMap::new(),
             events_dropped: 0,
+            compactions: 0,
+            awaiting_post_compaction: false,
         }
     }
 
@@ -482,21 +489,58 @@ impl Recorder {
     /// A node rather than a log line, because compaction changes what the agent could possibly have
     /// known: everything before it has left the model's window. A reader tracing why a later step
     /// ignored an earlier one needs to see where the boundary was.
-    pub async fn record_compaction(&mut self, at: Option<String>) -> Result<AssetRef> {
-        let index = self.stats.get("Compaction").copied().unwrap_or(0) + 1;
-        let name = format!("compaction {index}");
-        let asset = self
-            .register_payload(
-                "Dataset",
-                &name,
-                "A context compaction: everything before this point left the model's window.",
-                &serde_json::to_vec(&json!({ "compaction": index }))?,
-                json!({ "provType": "Activity" }),
-                at,
-            )
-            .await?;
-        self.count("Compaction");
-        Ok(asset)
+    /// The ordinal counts compactions, and the name says which half of one this is.
+    ///
+    /// It used to count hook events and name the node after that count, so Claude Code -- which
+    /// fires `PreCompact` and `PostCompact` around a single compaction -- produced `compaction 1`
+    /// and `compaction 2`. Two nodes is right, because the boundary has two edges and each is a real
+    /// observation. Calling the second one a second compaction was not.
+    ///
+    /// The ordinal stays in the content as well as the name because these nodes are content
+    /// addressed: two compactions in one session whose descriptors matched would collapse into one
+    /// node, and the graph would then under-report rather than over-report.
+    ///
+    /// An `After` with no `Before` ahead of it still opens a new ordinal. A host that emits only the
+    /// second hook, or an auto-compaction that skips the first, is better recorded as the half we saw
+    /// than not recorded at all.
+    pub async fn record_compaction(
+        &mut self,
+        phase: CompactionPhase,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
+        let fresh = match phase {
+            CompactionPhase::Before => true,
+            CompactionPhase::After => !self.awaiting_post_compaction,
+        };
+        if fresh {
+            self.compactions += 1;
+            self.count("Compaction");
+        }
+        self.awaiting_post_compaction = matches!(phase, CompactionPhase::Before);
+
+        let index = self.compactions;
+        let (label, description) = match phase {
+            CompactionPhase::Before => (
+                "pre-compaction",
+                "The last moment before a context compaction: everything so far is still in the \
+                 model's window.",
+            ),
+            CompactionPhase::After => (
+                "post-compaction",
+                "The first moment after a context compaction: everything before it has left the \
+                 model's window.",
+            ),
+        };
+        let name = format!("{label} {index}");
+        self.register_payload(
+            "Dataset",
+            &name,
+            description,
+            &serde_json::to_vec(&json!({ "compaction": index, "phase": label }))?,
+            json!({ "provType": "Activity" }),
+            at,
+        )
+        .await
     }
 
     /// Record a tool run that consumed and produced the given files.

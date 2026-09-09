@@ -806,12 +806,21 @@ fn full_session(session: &str) -> Vec<Event> {
         "subagent",
         serde_json::json!({ "hook_event_name": "SubagentStop", "subagent_id": "sub-1" }),
     ));
+    // Both halves, because Claude Code sends both. Sending only `PreCompact` is what let a single
+    // compaction record as `compaction 1` and `compaction 2` without a test noticing.
     events.push(mark(
         session,
         "01a040aa-0000-0000-0000-0000000000c6",
         turn,
         "compact",
         serde_json::json!({ "hook_event_name": "PreCompact" }),
+    ));
+    events.push(mark(
+        session,
+        "01a040aa-0000-0000-0000-0000000000c7",
+        turn,
+        "compact",
+        serde_json::json!({ "hook_event_name": "PostCompact" }),
     ));
 
     events
@@ -880,7 +889,10 @@ fn a_full_session_records_every_kind_of_activity_it_saw() {
 
     for (key, what) in [
         ("\"ModelCall\":1", "the model call"),
+        // One, not two, though two hooks fired and two nodes exist.
         ("\"Compaction\":1", "the compaction"),
+        ("pre-compaction 1", "the node for the moment before it"),
+        ("post-compaction 1", "the node for the moment after it"),
         ("\"Activity\":1", "the tool run"),
         ("\"Agent\":2", "the agent and its subagent"),
         ("\"Tool\":1", "the tool it used"),

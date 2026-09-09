@@ -131,9 +131,25 @@ pub enum LineageEvent {
     /// Worth a node of its own: everything before a compaction has left the model's context, so a
     /// reader who cannot see where it happened cannot tell which later steps could still have been
     /// informed by earlier ones.
-    Compacted,
+    ///
+    /// The phase is carried rather than collapsed. Claude Code fires `PreCompact` and `PostCompact`
+    /// around one compaction, and mapping both to the same event made a single compaction record as
+    /// two indistinguishable nodes -- `compaction 1` and `compaction 2` -- which is a claim about
+    /// the session that was not true.
+    Compacted { phase: CompactionPhase },
     /// The session ended. This is the export trigger.
     SessionEnded,
+}
+
+/// Which side of a compaction a `Compacted` event describes.
+///
+/// Both halves are recorded. `Before` is the last moment the earlier context was still in the
+/// window; `After` is the first moment it was not. A reader tracing why a later step ignored an
+/// earlier one wants the boundary, and the boundary has two edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionPhase {
+    Before,
+    After,
 }
 
 /// Classify one Relay event, or `None` when it carries no lineage.
@@ -158,7 +174,12 @@ fn classify_mark(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent>
             model: string_at(metadata, "model").map(str::to_string),
         }),
         _ => match string_at(metadata, "hook_event_name") {
-            Some("PreCompact" | "PostCompact") => Some(LineageEvent::Compacted),
+            Some("PreCompact") => Some(LineageEvent::Compacted {
+                phase: CompactionPhase::Before,
+            }),
+            Some("PostCompact") => Some(LineageEvent::Compacted {
+                phase: CompactionPhase::After,
+            }),
             Some("SubagentStart") => Some(LineageEvent::SubagentStarted {
                 subagent_id: subagent_id(event, metadata)?,
                 name: string_at(metadata, "agent_type")
