@@ -1105,10 +1105,23 @@ async fn coverage_states_how_many_bytes_were_behind_the_nodes() {
         .find(|value| value["name"] == "coverage")
         .expect("a coverage node");
 
-    let bytes = &coverage["contentBytes"];
-    assert_eq!(bytes["stored"], 8, "the file inside the ceiling: {bytes}");
-    assert_eq!(bytes["tooLarge"], 9, "the file over it: {bytes}");
-    assert_eq!(bytes["denied"], 7, "the file the policy withheld: {bytes}");
+    // Scalars, not a nested object: the graph explorer renders each metadata value as a string, so
+    // an object reaches a reader as `[object Object]`. It did, on a real run.
+    assert_eq!(
+        coverage["bytesStored"], 8,
+        "the file inside the ceiling: {coverage}"
+    );
+    assert_eq!(coverage["bytesTooLarge"], 9, "the file over it: {coverage}");
+    assert_eq!(
+        coverage["bytesDenied"], 7,
+        "the file the policy withheld: {coverage}"
+    );
+    for key in ["bytesStored", "bytesTooLarge", "bytesDenied"] {
+        assert!(
+            coverage[key].is_number(),
+            "{key} renders as a number, not `[object Object]`: {coverage}"
+        );
+    }
 
     // The counters stay counts, and stay where they were.
     assert_eq!(coverage["coverage"]["FileWritten"], 2);
@@ -1143,11 +1156,12 @@ async fn content_never_established_contributes_no_byte_total() {
         .find(|value| value["name"] == "coverage")
         .expect("a coverage node");
 
-    assert_eq!(
-        coverage["contentBytes"],
-        serde_json::json!({}),
-        "no content, so no bucket -- not `denied: 0`: {coverage}"
-    );
+    for key in ["bytesStored", "bytesTooLarge", "bytesDenied"] {
+        assert!(
+            coverage[key].is_null(),
+            "no content, so no total -- not `{key}: 0`: {coverage}"
+        );
+    }
     assert_eq!(
         coverage["coverage"]["ContentUnknown"], 1,
         "it was still seen"

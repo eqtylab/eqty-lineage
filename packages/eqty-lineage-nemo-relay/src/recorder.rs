@@ -116,10 +116,19 @@ impl Recorder {
     /// Only called where content actually existed. A file whose content was never established has
     /// no length to attribute, and counting it as zero stored bytes would say we saw an empty file.
     fn note_bytes(&mut self, disposition: Disposition, len: usize) {
+        // The field name, not a bucket name, because these are merged into the coverage node's
+        // metadata as scalars rather than as a nested object. The graph explorer renders each
+        // metadata value as a string, so an object arrives as `[object Object]` -- documented in
+        // `eqty-lineage-langchain`'s README, which JSON-encodes for the same reason. It encodes
+        // because it forwards nested context it does not control; this shape is three known keys,
+        // so flat numbers beat an encoded string.
+        //
+        // Still prefixed rather than folded into the counter map: those are counts of occurrences
+        // and these are sizes, and `PayloadTooLarge: 70` has been read as a size more than once.
         let key = match disposition {
-            Disposition::Store => "stored",
-            Disposition::Denied => "denied",
-            Disposition::TooLarge => "tooLarge",
+            Disposition::Store => "bytesStored",
+            Disposition::Denied => "bytesDenied",
+            Disposition::TooLarge => "bytesTooLarge",
         };
         *self.bytes.entry(key.to_string()).or_insert(0) += len as u64;
     }
@@ -790,26 +799,31 @@ impl Recorder {
         // Content-addressed like everything else. Two runs that saw the same things produce the
         // same coverage node, which is what lets a reader compare what two sessions could observe
         // rather than only what they did.
-        let bytes_total: Value = self
-            .bytes
-            .iter()
-            .map(|(key, total)| (key.clone(), json!(total)))
-            .collect::<serde_json::Map<_, _>>()
-            .into();
-
         let body = serde_json::to_vec(&coverage).unwrap_or_default();
+
+        // The totals ride in the metadata rather than the body on purpose. The body is what this
+        // node is addressed by, and the comment above is the reason: two sessions that saw the same
+        // things should produce the same coverage node. Byte volume is not an observability fact --
+        // the same session recorded twice against a different ceiling sees exactly as much and
+        // stores a different amount -- so folding it into the content would make comparable runs
+        // stop matching. The metadata statement is signed either way.
+        //
+        // A bucket with no bytes is absent rather than zero, which is the same distinction
+        // `contentState` keeps: "we withheld nothing" is not "there was nothing to withhold".
+        let mut extra = json!({ "provType": "Entity", "coverage": coverage });
+        let totals: Vec<(String, u64)> = self.bytes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        if let Some(target) = extra.as_object_mut() {
+            for (key, total) in totals {
+                target.insert(key, json!(total));
+            }
+        }
+
         self.register_payload(
             "Dataset",
             "coverage",
             "What this recording saw, and what it could not: counts a reader needs to weigh the graph.",
             &body,
-            // The totals ride in the metadata rather than the body on purpose. The body is what
-            // this node is addressed by, and the comment above is the reason: two sessions that saw
-            // the same things should produce the same coverage node. Byte volume is not an
-            // observability fact -- the same session recorded twice against a different ceiling
-            // sees exactly as much and stores a different amount -- so folding it into the content
-            // would make comparable runs stop matching. The metadata is signed either way.
-            json!({ "provType": "Entity", "coverage": coverage, "contentBytes": bytes_total }),
+            extra,
             at,
         )
         .await?;
