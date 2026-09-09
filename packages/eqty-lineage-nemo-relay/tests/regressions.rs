@@ -879,3 +879,76 @@ fn a_second_agentless_recording_gets_its_own_manifest() {
         "both still say what they are: {written:?}"
     );
 }
+
+/// Every node states the size of the content behind it, stored or not.
+///
+/// A `larger-than-ceiling` node used to say only that it was too big. A reader could not tell 8 KiB
+/// from 8 GiB, could not tell whether raising the ceiling would recover the content or bury the
+/// manifest, and could not audit the decision at all -- the one number that justified withholding
+/// was the one number missing. It is `decide`'s own argument, so it was known where it was dropped.
+///
+/// Null only for content never established, which is the single case with no length to state rather
+/// than a length deliberately not stored.
+#[tokio::test]
+async fn a_node_states_how_large_its_content_was() {
+    let signer = Ed25519Signer::create().expect("a signer");
+    let mut rec = Recorder::new(
+        LineageSession::new(SignerType::ED25519(signer)),
+        // Eight bytes, so a short string trips the ceiling and the test needs no megabyte.
+        Policy::new(vec![".env*".into()], 8),
+    );
+
+    rec.observe_file(
+        &seen("/at.txt", Some(b"12345678"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(
+        &seen("/over.txt", Some(b"123456789"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(&seen("/unknown.txt", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+
+    let manifest = exported(rec).await;
+    let nodes: Vec<serde_json::Value> = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| value["assetType"] == "Document")
+        .collect();
+
+    let node = |path: &str| -> serde_json::Value {
+        nodes
+            .iter()
+            .find(|value| value["filePath"] == path)
+            .unwrap_or_else(|| panic!("a node for {path}"))
+            .clone()
+    };
+
+    let at = node("/at.txt");
+    assert_eq!(at["contentBytes"], 8, "a stored node states its length");
+    assert_eq!(
+        at["contentState"], "stored",
+        "eight bytes is at the ceiling, not over it"
+    );
+
+    let over = node("/over.txt");
+    assert_eq!(over["contentState"], "withheld");
+    assert_eq!(
+        over["contentBytes"], 9,
+        "the size that tripped the ceiling is the point of recording it"
+    );
+
+    let unknown = node("/unknown.txt");
+    assert_eq!(unknown["contentState"], "unknown");
+    assert!(
+        unknown["contentBytes"].is_null(),
+        "content never established has no length to state: {unknown}"
+    );
+}

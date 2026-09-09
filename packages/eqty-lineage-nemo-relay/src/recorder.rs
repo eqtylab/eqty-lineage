@@ -229,6 +229,9 @@ impl Recorder {
             "redacted": data.is_some() && withheld,
             "reconstructed": basis,
             "content-cid": content_cid,
+            // Null when content was never established, which is the one case where there is no
+            // length to state rather than a length we chose not to store.
+            "contentBytes": data.as_ref().map(Vec::len),
         });
 
         let asset = match (&data, withheld) {
@@ -368,6 +371,12 @@ impl Recorder {
             "withheldBecause": reason,
             "withheldFor": quoted,
             "content-cid": content_cid,
+            // The size of what was registered, stated whether or not the bytes were kept. A
+            // `larger-than-ceiling` node used to say only that it was too big: a reader could not
+            // tell 8 KiB from 8 GiB, could not tell whether raising the ceiling would recover the
+            // content or bury the manifest, and could not audit the decision at all. The length is
+            // `decide`'s own argument, so it was known at the moment it was discarded.
+            "contentBytes": bytes.len(),
         });
         if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
             for (key, value) in extra {
