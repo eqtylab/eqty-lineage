@@ -280,14 +280,20 @@ required = [
 expected_absent = [
     ('ContentRecovered','Edit states its new content, so the replay chain is never needed'),
     ('ContentTooLarge', 'Read truncates near 21 KB and truncation is detected first'),
+    # The replay chain's four refusals. A refusal is silent -- the node simply carries no content --
+    # so they are checked rather than assumed. On a host that never needs the chain, none can fire.
+    ('EditTooAmbiguousToReplay',      'old_string matched more than once'),
+    ('EditDidNotMatchHeldContent',    'old_string did not match the content we hold'),
+    ('EditAtUnterminatedEof',         'the match ran to an unterminated end of file'),
+    ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
 ]
 for key, why in required:
-    print(f'  {key:18} {"YES" if cov and key in cov else "MISSING":8} {why}')
+    print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')
 for key, why in expected_absent:
     seen = cov and key in cov
-    print(f'  {key:18} {"YES" if seen else "absent":8} {"unexpected -- investigate" if seen else why}')
-print(f'  {"Document nodes":18} {"YES" if assets.get("Document") else "MISSING":8} file lineage produced nodes')
-print(f'  {"subagent":18} {"YES" if assets.get("Agent",0) >= 2 else "MISSING":8} a subagent was recorded')
+    print(f'  {key:30} {"YES" if seen else "absent":8} {"unexpected -- investigate" if seen else why}')
+print(f'  {"Document nodes":30} {"YES" if assets.get("Document") else "MISSING":8} file lineage produced nodes')
+print(f'  {"subagent":30} {"YES" if assets.get("Agent",0) >= 2 else "MISSING":8} a subagent was recorded')
 PY
 ```
 
@@ -307,12 +313,16 @@ The survivor read as a complete short session rather than the tail of a truncate
 A run reporting no `Agent` has a related cause — `session.start` was never seen, so nothing is
 attributed to an actor.
 
-**Two counters are expected absent on Claude Code**, and their absence is correct. `ContentTooLarge`
+**Six counters are expected absent on Claude Code**, and their absence is correct. `ContentTooLarge`
 is unreachable through `Read`: the tool caps its output near 21 KB and truncation is detected before
 the size decision, so the node records no content and never reaches the ceiling. `ContentRecovered`
 is unreachable because `Edit` states its new content, so the `_last_content` replay chain is never
-needed — it earns its place on Codex and older hosts, not this one. If either reports `YES`,
-something changed upstream.
+needed — it earns its place on Codex and older hosts, not this one. The four `Edit*` counters are
+that chain's refusal modes, and a host that never enters the chain cannot reach them either.
+
+The refusals are listed rather than left implicit because **a refusal produces no error**: the node
+records no content and the session continues, so the only trace is the counter. If one reports `YES`
+here, a file version failed to reconstruct and the graph is quietly less complete than it looks.
 
 ### A known-good result
 
@@ -427,6 +437,70 @@ nemo-relay run -- codex exec "Change line 2 of report.md from 'two' to 'TWO'. Th
 because `/tmp` is not a repository. Relay requires codex-cli >= 0.143.0.
 
 Neither command passes `-c`, which is deliberate — see the `-c` rule below before adding one.
+
+### Verify a Codex run
+
+The same harvester, a different expectation table — and the difference is the point. On Claude Code
+`FileRead` and `ContentDenied` are health; here their absence is the finding, and `ContentRecovered`
+inverts from expected-absent to required.
+
+```bash
+python3 - <<'PY'
+import json, base64, collections, glob
+# The interactive path can reach the replay chain. A `codex exec` one-shot cannot: the chain needs
+# content established by an earlier turn of the same session. Set this to the run you did.
+INTERACTIVE = True
+
+p = sorted(glob.glob('/tmp/relay-codex/.eqty/manifests/*.json'))
+print('manifests:', len(p), '-- one per session, so two `codex exec` calls give two')
+m = json.load(open(p[-1])); B = m['blobs']
+def blob(c):
+    raw = B.get(c.replace('urn:cid:','')) or B.get(c)
+    try: return json.loads(base64.b64decode(raw)) if raw else None
+    except Exception: return None
+assets, cov = collections.Counter(), None
+for c in B:
+    d = blob(c)
+    if not isinstance(d, dict): continue
+    if 'assetType' in d: assets[d['assetType']] += 1
+    if d.get('name') == 'coverage': cov = d['coverage']
+print('statements', len(m['statements']), ' assets', dict(assets))
+print('coverage  ', cov)
+print('secret leaked:', b"do-not-record-me" in open(p[-1],'rb').read())
+
+required = [
+    ('ContentUnknown', '`*** Update File` carries hunks and no pre-image, so its v1 is identity-only'),
+]
+known_gap = [
+    ('FileRead',      'Codex has no read tool; every read goes through the shell and is invisible'),
+    ('ContentDenied', 'the redaction gate never sees a file it was never told about'),
+]
+expected_absent = [
+    ('EditTooAmbiguousToReplay',      'a hunk matched more than once'),
+    ('EditDidNotMatchHeldContent',    'a hunk did not match the content we hold'),
+    ('EditAtUnterminatedEof',         'a hunk ran to an unterminated end of file'),
+    ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
+]
+for key, why in required:
+    print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')
+for key, why in known_gap:
+    seen = bool(cov and key in cov)
+    print(f'  {key:30} {"YES -- upstream fixed it?" if seen else "absent":8} {why}')
+for key, why in expected_absent:
+    seen = bool(cov and key in cov)
+    print(f'  {key:30} {"YES" if seen else "absent":8} {"a version failed to reconstruct -- investigate" if seen else why}')
+seen = bool(cov and 'ContentRecovered' in cov)
+label = ("YES" if seen else "MISSING") if INTERACTIVE else ("YES" if seen else "absent")
+why = ('the replay chain ran -- this host is the only one where it can'
+       if INTERACTIVE else 'a one-shot has no earlier turn to establish content from')
+print(f'  {"ContentRecovered":30} {label:8} {why}')
+print(f'  {"Document nodes":30} {"YES" if assets.get("Document") else "MISSING":8} apply_patch produced nodes')
+PY
+```
+
+`known_gap` is its own list rather than folded into `expected_absent` because the two mean opposite
+things. An `absent` there is not the recorder working — it is §"The finding: Codex has no read tool"
+still being true. A `YES` would mean the upstream gap closed, which is worth knowing immediately.
 
 ### What the two runs established
 
