@@ -296,9 +296,10 @@ impl LineageSession {
     async fn push_metadata(
         &mut self,
         subject: String,
-        metadata: Value,
+        mut metadata: Value,
         at: Option<String>,
     ) -> Result<()> {
+        encode_nested_values(&mut metadata);
         let (metadata_cid, canonical) = integrity::cid::jcs::compute_jcs_cid(&metadata)?;
         self.put_blob(metadata_cid.clone(), canonical);
 
@@ -347,5 +348,41 @@ impl LineageSession {
         let store: Arc<dyn BlobStore + Send + Sync> = Arc::new(InMemoryStore { blobs });
         let resolved = resolve_blobs(&statements, store, BLOB_CONCURRENCY).await?;
         generate_manifest(true, statements, resolved).await
+    }
+}
+
+/// JSON-encode every nested metadata value, because the graph explorer displays each value as a
+/// string and renders an object or an array as the literal text `[object Object]`.
+///
+/// Applied here rather than at each call site because this is the one place every metadata
+/// statement passes through, and doing it per site is how the same bug shipped three times: as
+/// `contentBytes` (a `{stored, denied}` map), then as the coverage counts, then as a model call's
+/// `usage` -- thirteen nodes a session, on a manifest a reader was expected to read.
+///
+/// Only the top level is rewritten. A nested object becomes a JSON string that still contains its
+/// own structure, so nothing is lost and a reader who wants the values parses one string. The
+/// authoritative copy is unaffected either way: the coverage counts are also this node's *content*,
+/// which stays real JSON and keeps the node's identity comparable across runs.
+///
+/// `null` is left alone. It is a value a reader acts on -- `withheldBecause: null` is "nothing was
+/// withheld" -- and it renders as itself rather than as `[object Object]`.
+///
+/// This is the same treatment `eqty-lineage-langchain` applies before values reach the SDK, and its
+/// README documents the trap: "dicts and lists are JSON-encoded (otherwise they'd display as
+/// `[object Object]`)".
+fn encode_nested_values(metadata: &mut Value) {
+    let Some(fields) = metadata.as_object_mut() else {
+        return;
+    };
+    for value in fields.values_mut() {
+        if value.is_object() || value.is_array() {
+            // A value that will not serialize cannot be rendered either, so dropping to `null` is
+            // the honest outcome -- and `serde_json` only fails here on a map with non-string keys,
+            // which JSON cannot express and this crate never builds.
+            *value = match serde_json::to_string(value) {
+                Ok(text) => Value::String(text),
+                Err(_) => Value::Null,
+            };
+        }
     }
 }

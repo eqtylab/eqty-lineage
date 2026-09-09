@@ -432,6 +432,27 @@ fn await_manifests(dir: &TempDir, how_many: usize) -> Vec<PathBuf> {
     );
 }
 
+/// Every decoded blob that parses as a JSON object, for assertions about metadata *shape*.
+///
+/// Substring matching on the concatenated blobs cannot see shape: a nested value and the JSON
+/// string encoding of that value differ only by escaping, which is exactly the difference the
+/// explorer renders as `[object Object]`.
+fn metadata_nodes(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    manifest["blobs"]
+        .as_object()
+        .expect("a blobs map")
+        .values()
+        .filter_map(|blob| blob.as_str())
+        .filter_map(|blob| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(blob).ok()
+        })
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| value.is_object())
+        .collect()
+}
+
 fn decoded_blobs(path: &std::path::Path) -> String {
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     manifest["blobs"]
@@ -519,11 +540,23 @@ fn a_model_call_becomes_a_prompt_and_a_completion() {
     );
     assert!(decoded.contains("\"assetType\":\"Prompt\""), "{decoded}");
     assert!(decoded.contains("\"assetType\":\"Reasoning\""), "{decoded}");
-    assert!(
-        decoded.contains("\"finishReason\":\"complete\"")
-            && decoded.contains("\"total_tokens\":14"),
-        "usage and finish reason travel with the completion"
+    let completion = metadata_nodes(&manifests(&into)[0])
+        .into_iter()
+        .find(|node| node["assetType"] == "Reasoning")
+        .expect("the completion's metadata");
+    assert_eq!(
+        completion["finishReason"], "complete",
+        "the finish reason travels with the completion: {completion}"
     );
+    // Carried as a JSON string, not as a nested object -- see `encode_nested_values`. Parsed here
+    // rather than substring-matched, so the assertion is about the value and not about escaping.
+    let usage: serde_json::Value = serde_json::from_str(
+        completion["usage"]
+            .as_str()
+            .expect("usage is a JSON string, so the explorer can render it"),
+    )
+    .expect("and it parses back");
+    assert_eq!(usage["total_tokens"], 14, "and so does the usage: {usage}");
 }
 
 #[test]

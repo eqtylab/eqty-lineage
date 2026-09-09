@@ -278,7 +278,12 @@ for c in B:
     if 'assetType' in d:
         assets[d['assetType']] += 1
         if d['assetType'] == 'Agent': agents.append(d.get('name'))
-    if d.get('name') == 'coverage': cov = d['coverage']
+    if d.get('name') == 'coverage':
+        # JSON-encoded, because the explorer renders each metadata value as a string and shows a
+        # nested one as `[object Object]`. Older manifests carry it as an object -- accept both,
+        # or this harvester only reads recordings made after the commit that changed it.
+        cov = d['coverage']
+        cov = json.loads(cov) if isinstance(cov, str) else cov
     if d.get('redacted'): redacted.append(str(d.get('name')).split('/')[-1])
 prompts = [d for d in map(blob, B) if isinstance(d, dict)
            and d.get('assetType') == 'Prompt' and d.get('name') == 'user prompt']
@@ -518,7 +523,12 @@ for c in B:
     d = blob(c)
     if not isinstance(d, dict): continue
     if 'assetType' in d: assets[d['assetType']] += 1
-    if d.get('name') == 'coverage': cov = d['coverage']
+    if d.get('name') == 'coverage':
+        # JSON-encoded, because the explorer renders each metadata value as a string and shows a
+        # nested one as `[object Object]`. Older manifests carry it as an object -- accept both,
+        # or this harvester only reads recordings made after the commit that changed it.
+        cov = d['coverage']
+        cov = json.loads(cov) if isinstance(cov, str) else cov
 print('statements', len(m['statements']), ' assets', dict(assets))
 print('coverage  ', cov)
 # `everything`, not `p`: a leak in the title fragment is still a leak.

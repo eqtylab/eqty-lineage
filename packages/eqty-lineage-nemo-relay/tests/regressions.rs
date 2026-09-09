@@ -21,6 +21,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
+/// Parse a metadata field that `encode_nested_values` renders as a JSON string.
+///
+/// Nested metadata reaches the manifest JSON-encoded, because the graph explorer displays each
+/// value as a string and shows an object as `[object Object]`. A reader wanting the structure
+/// parses one string; these tests do the same rather than asserting on the escaping.
+fn nested(node: &serde_json::Value, key: &str) -> serde_json::Value {
+    let text = node[key]
+        .as_str()
+        .unwrap_or_else(|| panic!("`{key}` should be a JSON string, got {}", node[key]));
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("`{key}` should parse back: {text}"))
+}
+
 fn signer_factory() -> SignerFactory {
     Box::new(|| {
         Ed25519Signer::create()
@@ -1055,7 +1067,8 @@ async fn an_unanswered_model_call_says_why_its_inputs_dangle() {
         .iter()
         .find(|n| n["assetType"] == "Prompt")
         .expect("the prompt was registered before the response was known");
-    let listed = marker["unlinkedInputs"]
+    let inputs = nested(marker, "unlinkedInputs");
+    let listed = inputs
         .as_array()
         .expect("the inputs it could not link")
         .iter()
@@ -1136,10 +1149,11 @@ async fn coverage_states_how_many_bytes_were_behind_the_nodes() {
     }
 
     // The counters stay counts, and stay where they were.
-    assert_eq!(coverage["coverage"]["FileWritten"], 2);
-    assert_eq!(coverage["coverage"]["ContentUnknown"], 1);
+    let counts = nested(&coverage, "coverage");
+    assert_eq!(counts["FileWritten"], 2);
+    assert_eq!(counts["ContentUnknown"], 1);
     assert!(
-        coverage["coverage"]["stored"].is_null(),
+        counts["stored"].is_null(),
         "sizes do not leak into the counter map: {coverage}"
     );
 }
@@ -1175,7 +1189,8 @@ async fn content_never_established_contributes_no_byte_total() {
         );
     }
     assert_eq!(
-        coverage["coverage"]["ContentUnknown"], 1,
+        nested(&coverage, "coverage")["ContentUnknown"],
+        1,
         "it was still seen"
     );
 }
@@ -1366,4 +1381,116 @@ fn an_agentless_fragment_announces_itself_as_one() {
         marks[0].path
     );
     assert_eq!(marks[0].path, manifests(&into)[0]);
+}
+
+// ------------------------------------------------------- rendering in the explorer
+
+#[test]
+fn no_metadata_value_is_a_bare_object_or_array() {
+    // The graph explorer displays each metadata value as a string, so an object or an array renders
+    // as the literal text `[object Object]`. This shipped three times before it was fixed as a
+    // class: as `contentBytes` (a `{stored, denied}` map), then as the coverage counts, then as a
+    // model call's `usage` -- thirteen nodes a session, on a manifest a reader was meant to read.
+    //
+    // Asserted over every node of a full session rather than per field, because the bug is not any
+    // one field: it is that nothing stopped the next one.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-000000000fb1";
+    let root = "01a040aa-0000-0000-0000-000000000fb2";
+    let mut events = vec![mark(
+        session,
+        root,
+        root,
+        "session.start",
+        serde_json::json!({"model":"opus"}),
+    )];
+    events.extend([
+        tool_scope(
+            session,
+            root,
+            root,
+            "start",
+            "Read",
+            "toolu_fb",
+            serde_json::json!({ "file_path": "/app/.env" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            root,
+            root,
+            "end",
+            "Read",
+            "toolu_fb",
+            serde_json::json!("SECRET=x\n"),
+            Some("ok"),
+        ),
+    ]);
+    replay(&events, &into);
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifests(&into)[0]).unwrap()).unwrap();
+    let mut offenders: Vec<String> = Vec::new();
+    for (_, bytes) in blobs_of(&manifest) {
+        let Ok(node) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(fields) = node.as_object() else {
+            continue;
+        };
+        // The coverage node's *content* is a bare object and must stay one: it is what the node is
+        // addressed by, so two sessions that saw the same things produce the same node. Only
+        // metadata is displayed field by field, and metadata always names what it describes.
+        if !fields.contains_key("assetType") {
+            continue;
+        }
+        for (key, value) in fields {
+            if value.is_object() || value.is_array() {
+                offenders.push(format!("{key} = {value}"));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these would render as `[object Object]`: {offenders:#?}"
+    );
+}
+
+#[test]
+fn a_nested_metadata_value_survives_being_encoded() {
+    // Encoding for display must not cost a reader the values. The string is JSON, so the structure
+    // is still there for anyone who parses it -- which is the difference between this and
+    // flattening or dropping the field.
+    let into = TempDir::new().unwrap();
+    let marks = replay(
+        &one_attributed_write(
+            "01a040aa-0000-0000-0000-000000000fb3",
+            "01a040aa-0000-0000-0000-000000000fb4",
+        ),
+        &into,
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&marks[0].path).unwrap()).unwrap();
+    let coverage = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .find(|value| value["name"] == "coverage")
+        .expect("a coverage node");
+
+    let counts = nested(&coverage, "coverage");
+    assert_eq!(
+        counts["FileWritten"], 1,
+        "the counts are still readable: {counts}"
+    );
+    // And the content is untouched, because that is what the node's identity is over.
+    let body = blobs_of(&manifest)
+        .into_iter()
+        .find(|(cid, _)| Some(cid.as_str()) == coverage["content-cid"].as_str())
+        .map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"))
+        .expect("the coverage content");
+    assert!(
+        body.is_object() && body["FileWritten"] == 1,
+        "the content stays a real object: {body}"
+    );
 }
