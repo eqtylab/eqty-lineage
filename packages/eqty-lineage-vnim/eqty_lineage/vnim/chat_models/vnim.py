@@ -4,7 +4,8 @@ import json
 import logging
 import time
 from copy import deepcopy
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,20 @@ from pydantic import Field, PrivateAttr, model_validator
 from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
+
+# LangChain caches one HTTPX client per (base URL, timeout, socket options), so the transport the tee
+# is installed on is shared by every chat model built on that endpoint.  The tee therefore cannot
+# belong to whichever model installed it: it hands bytes to the model that is making the request, in
+# that request's own context, and to nothing at all for a plain ``ChatOpenAI`` sharing the client.
+_active_response_body_sink: ContextVar[Callable[[bytes], None] | None] = ContextVar(
+    "eqty_vnim_active_response_body_sink", default=None
+)
+
+
+def _dispatch_response_body(body: bytes) -> None:
+    sink = _active_response_body_sink.get()
+    if sink is not None:
+        sink(body)
 
 
 class _ResponseBodyCapturingStream(httpx.SyncByteStream):
@@ -133,8 +148,33 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         """Observe raw upstream bytes before HTTPX and LangChain parse the SSE stream."""
         client = getattr(getattr(self, "root_client", None), "_client", None)
         transport = getattr(client, "_transport", None)
-        if transport is not None and not isinstance(transport, _ResponseBodyCapturingTransport):
-            client._transport = _ResponseBodyCapturingTransport(transport, self._record_response_body)
+        if transport is None:
+            logger.warning(
+                "eqty_vnim.response_body_capture_unavailable client=%s: response CIDs will be absent "
+                "from lineage, so the response node will not match what vNIM registered",
+                type(client).__name__,
+            )
+            return
+        if not isinstance(transport, _ResponseBodyCapturingTransport):
+            client._transport = _ResponseBodyCapturingTransport(transport, _dispatch_response_body)
+        # A client built for a proxy resolves every request through ``_mounts``, which HTTPX consults
+        # before ``_transport``; wrapping ``_transport`` alone would then tee nothing.
+        for pattern, mounted in list((getattr(client, "_mounts", None) or {}).items()):
+            if mounted is not None and not isinstance(mounted, _ResponseBodyCapturingTransport):
+                client._mounts[pattern] = _ResponseBodyCapturingTransport(mounted, _dispatch_response_body)
+
+    @contextmanager
+    def _receiving_response_bodies(self) -> Iterator[None]:
+        """Claim the shared tee for the duration of one request on this model."""
+        self._install_response_body_capture()
+        previous = _active_response_body_sink.get()
+        # Restored by value rather than by token: a generator's cleanup can run in a different
+        # context than its first step did, and ContextVar.reset rejects a token from another context.
+        _active_response_body_sink.set(self._record_response_body)
+        try:
+            yield
+        finally:
+            _active_response_body_sink.set(previous)
 
     def _record_response_body(self, body: bytes) -> None:
         """Save the raw-binary CID of a fully consumed upstream response body."""
@@ -142,10 +182,12 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
             cid = str(get_cid_for_bytes(body))
             self._last_response_cid.set(cid)
             logger.info("eqty_vnim.response_body_received cid=%s bytes=%d", cid, len(body))
-        except RuntimeError as error:
-            # The SDK may be deliberately uninitialized when this class is used without
-            # lineage capture.  Do not change normal ChatOpenAI behavior in that case.
-            logger.warning("eqty_vnim.response_body_cid_unavailable error=%s", error)
+        except BaseException as error:  # noqa: BLE001
+            # The SDK may be deliberately uninitialized when this class is used without lineage
+            # capture, and it then raises pyo3's PanicException -- which derives from BaseException,
+            # not Exception.  This runs while HTTPX tears a response down, so nothing raised here may
+            # reach the caller: normal ChatOpenAI behavior must not change.
+            logger.warning("eqty_vnim.response_body_cid_unavailable error=%r", error)
 
     @staticmethod
     def _eqty_request_id_from_chunk(chunk: ChatGenerationChunk) -> tuple[UUID | None, str | None]:
@@ -297,9 +339,10 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         """Preserve the upstream SSE stream and enrich only its final parsed chunk."""
-        # ChatOpenAI creates its root OpenAI client in its own validation hook.  Install
-        # here as well so the wrapper is present even when validator ordering changes.
-        self._install_response_body_capture()
+        with self._receiving_response_bodies():
+            yield from self._stream_with_integrity(*args, **kwargs)
+
+    def _stream_with_integrity(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         self._last_integrity_result.set(None)
         self._last_response_cid.set(None)
         request_id, header_error, pending = None, None, None
@@ -335,10 +378,10 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        self._install_response_body_capture()
         self._last_integrity_result.set(None)
         self._last_response_cid.set(None)
-        result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        with self._receiving_response_bodies():
+            result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         if result.generations:
             generation = result.generations[0]
             request_id, header_error = self._eqty_request_id_from_chunk(generation)
