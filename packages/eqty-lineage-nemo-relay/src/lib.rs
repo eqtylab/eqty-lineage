@@ -36,7 +36,7 @@ mod recorder;
 mod redaction;
 mod session;
 
-pub use classify::{Correlation, LineageEvent, classify};
+pub use classify::{CompactionPhase, Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{
     EditAttempt, FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit,

@@ -541,12 +541,29 @@ impl Recorder {
             ),
         };
         let name = format!("{label} {index}");
+        // An `Entity`, not an `Activity`, and the distinction is structural rather than pedantic.
+        // An activity in this manifest *is* a `ComputationRegistration` -- that statement carries the
+        // inputs, the outputs and the `performedBy` attribution. This is a `DataRegistration`, so a
+        // consumer enumerating activities never reaches it and one trusting `provType` finds an
+        // activity with no statement behind the claim. It was the only node in the manifest making
+        // it.
+        //
+        // What is actually captured is a marker: an ordinal, a phase and a timestamp, recording that
+        // a boundary existed at a moment. That is a thing. The compaction event is genuinely an
+        // activity, but nothing about it was observed beyond its having happened -- no inputs, no
+        // outputs, no performer -- and `record_tool_run` refuses an empty computation for that same
+        // reason (`ActivityWithoutOutputs`). The name and description carry what a reader needs;
+        // `provType` is a claim about graph structure and should be backed by some.
+        //
+        // Phase 4's context snapshots (§8) are what would earn the other type: the pre- and
+        // post-compaction contexts as entities, and one real computation using the first to generate
+        // the second. Until then this node takes the ordinary default and overrides nothing.
         self.register_payload(
             "Dataset",
             &name,
             description,
             &serde_json::to_vec(&json!({ "compaction": index, "phase": label }))?,
-            json!({ "provType": "Activity" }),
+            json!({}),
             at,
         )
         .await

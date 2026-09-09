@@ -8,9 +8,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use eqty_lineage_nemo_relay::{
-    EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, Policy, Recorder, ReplayRefusal,
-    SessionFinished, SessionRouter, SignerFactory, apply_edit, apply_line_edit, classify,
-    file_events_from_patch,
+    CompactionPhase, EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, Policy,
+    Recorder, ReplayRefusal, SessionFinished, SessionRouter, SignerFactory, apply_edit,
+    apply_line_edit, classify, file_events_from_patch,
 };
 use integrity::lineage::models::manifest::Manifest;
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
@@ -950,5 +950,50 @@ async fn a_node_states_how_large_its_content_was() {
     assert!(
         unknown["contentBytes"].is_null(),
         "content never established has no length to state: {unknown}"
+    );
+}
+
+/// A compaction node is an `Entity`, because nothing backs the other claim.
+///
+/// It used to be the only node in the manifest carrying `provType: "Activity"`, and it carried it in
+/// the metadata of a `DataRegistration`. An activity here *is* a `ComputationRegistration` -- that
+/// statement holds the inputs, the outputs and the `performedBy` attribution -- so a consumer
+/// enumerating activities never reached this node, and one trusting `provType` found an activity
+/// with no statement behind it. `record_tool_run` refuses an empty computation for the same reason.
+///
+/// What is recorded is a marker: an ordinal, a phase and a timestamp. Phase 4's context snapshots
+/// would earn the other type; asserting it without them did not.
+#[tokio::test]
+async fn a_compaction_is_an_entity_not_an_activity() {
+    let mut rec = recorder();
+    rec.record_compaction(CompactionPhase::Before, None)
+        .await
+        .unwrap();
+    rec.record_compaction(CompactionPhase::After, None)
+        .await
+        .unwrap();
+
+    let manifest = exported(rec).await;
+    let nodes: Vec<serde_json::Value> = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .filter(|value| {
+            value["name"]
+                .as_str()
+                .is_some_and(|name| name.contains("compaction"))
+        })
+        .collect();
+
+    assert_eq!(nodes.len(), 2, "both halves of one compaction: {nodes:?}");
+    for node in &nodes {
+        assert_eq!(
+            node["provType"], "Entity",
+            "a marker is a thing, not a process: {node}"
+        );
+    }
+    let names: Vec<&str> = nodes.iter().filter_map(|n| n["name"].as_str()).collect();
+    assert!(
+        names.contains(&"pre-compaction 1") && names.contains(&"post-compaction 1"),
+        "one compaction, its two halves named for what they are: {names:?}"
     );
 }
