@@ -153,7 +153,15 @@ jobs:
   # One place to read the outcome. Parallel jobs already fail the run on their own -- this exists so
   # the run summary names which one failed without opening each job. `if: always()` is what makes it
   # report a failure rather than being skipped by one.
-  summary:
+  #
+  # **Named `checks` because the branch ruleset requires a status context of exactly that name.**
+  # It is the one job that gates a merge, so it has to be the one that aggregates: `needs` both
+  # halves and fails when either does. Renaming it, or dropping a job from `needs`, silently makes
+  # the required check pass on a run that did not test everything -- the ruleset only knows this
+  # name. A single job called `checks` used to run the whole suite; splitting CI by language
+  # replaced it and left the ruleset requiring a context nothing published, which blocks a PR at
+  # "Expected -- Waiting for status to be reported" with no failure to look at.
+  checks:
     runs-on: ubuntu-latest
     needs: [python, rust]
     if: always()
