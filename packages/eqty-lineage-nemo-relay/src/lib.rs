@@ -43,7 +43,7 @@ pub use files::{
     file_events_from_patch, file_events_from_result,
 };
 pub use lineage::{AssetRef, LineageSession};
-pub use mailbox::{Mailbox, SessionFinished, SignerFactory};
+pub use mailbox::{Mailbox, ManifestAnnounced, ManifestMark, SessionFinished, SignerFactory};
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
@@ -54,10 +54,10 @@ use std::sync::{Arc, Mutex};
 
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::{
-    ConfigDiagnostic, DiagnosticLevel, Event, Json, NativePlugin, PluginContext, Result,
-    nemo_relay_plugin,
+    ConfigDiagnostic, DiagnosticLevel, Event, Json, NativePlugin, PluginContext, PluginRuntime,
+    Result, nemo_relay_plugin,
 };
-use serde_json::Map;
+use serde_json::{Map, json};
 
 /// The stable plugin kind. This string must equal `[plugin] id` in `relay-plugin.toml`, and it is
 /// what `components[].kind` in a host's `plugins.toml` refers to.
@@ -86,6 +86,12 @@ pub struct Tally {
     pub queue_overflow: AtomicU64,
     /// Callback invocations that panicked and were contained.
     pub panicked: AtomicU64,
+    /// Manifests written whose location could not be announced on the host's event stream.
+    ///
+    /// The manifest is on disk regardless -- this counts recordings a consumer can only find by
+    /// path convention. Silent would be the wrong default for the one step whose entire purpose is
+    /// making a recording discoverable.
+    pub unannounced: AtomicU64,
 }
 
 /// The plugin object Relay owns for the lifetime of the component.
@@ -161,6 +167,12 @@ impl NativePlugin for EqtyLineagePlugin {
         let router = Arc::new(Mutex::new(SessionRouter::new()));
 
         let finished = Arc::clone(&router);
+        // `PluginRuntime` owns the host table by value and retains a reference-counted host
+        // capability, and the SDK declares it `Send + Sync` -- so it can be moved onto the worker
+        // thread, which is the only place a final manifest is written. `ctx` itself cannot: it
+        // borrows the host table for the duration of registration.
+        let runtime = ctx.runtime();
+        let announced = Arc::clone(&self.tally);
         let mailbox = Arc::new(Mailbox::start(
             config.manifest_dir.clone(),
             policy,
@@ -171,6 +183,7 @@ impl NativePlugin for EqtyLineagePlugin {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .forget(session_id);
             }),
+            Box::new(move |mark: &ManifestMark| announce(&announced, &runtime, mark)),
         ));
         self.mailbox = Some(Arc::clone(&mailbox));
 
@@ -180,6 +193,59 @@ impl NativePlugin for EqtyLineagePlugin {
         })?;
 
         Ok(())
+    }
+}
+
+/// The mark a finished recording puts on Relay's own event stream.
+///
+/// The name is namespaced because a mark's name is the only thing a consumer filters on.
+const MANIFEST_MARK: &str = "eqty.manifest";
+
+/// Tell the host where the manifest is, so it is discoverable without knowing our path convention.
+///
+/// This closes the loop the rest of the plugin opens: a recording of a session that says nothing
+/// *inside* that session leaves a consumer to find `.eqty/manifests/{session}.json` by convention,
+/// and a convention is not an attestation.
+///
+/// Two things make this more than one call. The scope stack is **thread-local**, and a mark with no
+/// parent is emitted under whatever scope is current -- but a final manifest is written from the
+/// worker thread, which Relay never bound a stack to, and on Codex that write happens at teardown
+/// when the session's scopes are gone regardless. So a stack is created and bound for the call when
+/// there is none, which puts the mark on the stream under a root of its own rather than under the
+/// session's scope. That is a real limitation and the honest version of it: the mark's *data* names
+/// the session's manifest, its position in the scope tree does not.
+///
+/// And nothing here may fail loudly. This runs on the worker thread while a session is being torn
+/// down; a panic crossing the ABI takes the gateway with it, and an error is not worth a manifest.
+/// The manifest is already on disk either way -- the mark is how it is *found*, not whether it
+/// exists. So a failure is counted rather than raised, and `unannounced` is where a reader sees it.
+///
+/// **Not exercised across the ABI.** `tests/regressions.rs` drives the mark through the seam this
+/// closure sits behind, which pins what is announced and when. It does not prove `emit_mark`
+/// reaches a real host from this thread: `abi-test` activates the plugin but never drives events
+/// through the subscriber, so no export -- and no mark -- happens there. Confirming that needs
+/// either a live session or an `abi-test` that pumps Relay's event pipeline.
+fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
+    let data = json!({
+        "cid": mark.cid,
+        "path": mark.path.to_string_lossy(),
+        "statements": mark.statements,
+        // Named in the data rather than left to the filename, because counting manifests to count
+        // sessions is a mistake a reader makes silently.
+        "unattributed": mark.unattributed,
+    });
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        if runtime.scope_stack_active() {
+            return runtime.emit_mark(MANIFEST_MARK, Some(&data), None);
+        }
+        let stack = runtime.create_scope_stack()?;
+        let _bound = runtime.bind_scope_stack_thread(&stack)?;
+        runtime.emit_mark(MANIFEST_MARK, Some(&data), None)
+    }));
+    // A panic and an `Err` are the same outcome for a reader -- the manifest is on disk and nothing
+    // on the stream points at it -- so they share a counter rather than pretending to differ.
+    if !matches!(outcome, Ok(Ok(()))) {
+        tally.unannounced.fetch_add(1, Ordering::Relaxed);
     }
 }
 

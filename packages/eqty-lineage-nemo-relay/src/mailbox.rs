@@ -22,6 +22,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use integrity::cid::blake3::blake3_cid_raw_binary;
 use nemo_relay_plugin::{AnnotatedLlmRequest, AnnotatedLlmResponse};
 use serde_json::Value as Json;
 
@@ -179,13 +180,24 @@ impl Mailbox {
         policy: Policy,
         signer: SignerFactory,
         on_finished: SessionFinished,
+        on_manifest: ManifestAnnounced,
     ) -> Self {
         let (sender, receiver) = sync_channel(QUEUE_DEPTH);
         let dropped: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let counts = Arc::clone(&dropped);
         let worker = std::thread::Builder::new()
             .name("eqty-lineage".into())
-            .spawn(move || run(receiver, manifest_dir, policy, signer, counts, on_finished))
+            .spawn(move || {
+                run(
+                    receiver,
+                    manifest_dir,
+                    policy,
+                    signer,
+                    counts,
+                    on_finished,
+                    on_manifest,
+                )
+            })
             .ok();
 
         Self {
@@ -264,6 +276,27 @@ pub type SignerFactory = Box<dyn Fn() -> Option<LineageSession> + Send>;
 /// capture -- so the map grows fastest in the process least able to afford it.
 pub type SessionFinished = Box<dyn Fn(&str) + Send>;
 
+/// What a finished recording says about itself.
+///
+/// The `cid` is over the manifest bytes as written, not over anything inside it: `Manifest` has no
+/// identity of its own, and the question a consumer asks is whether the file they fetched is the
+/// file that was announced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestMark {
+    pub cid: String,
+    pub path: PathBuf,
+    pub statements: usize,
+    /// True for a `{id}.unattributed.json` fragment, so a consumer counting sessions can skip it
+    /// without parsing the filename -- the mistake `docs/live-session-script.md` made.
+    pub unattributed: bool,
+}
+
+/// Announce a written manifest on the host's own event stream.
+///
+/// Passed in for the same reason `on_finished` is: this module must not know what Relay is. The
+/// plugin supplies a closure over `PluginRuntime`; tests supply one that records.
+pub type ManifestAnnounced = Box<dyn Fn(&ManifestMark) + Send>;
+
 fn run(
     receiver: Receiver<Message>,
     manifest_dir: PathBuf,
@@ -271,6 +304,7 @@ fn run(
     signer: SignerFactory,
     dropped: Arc<Mutex<HashMap<String, u64>>>,
     on_finished: SessionFinished,
+    on_manifest: ManifestAnnounced,
 ) {
     // A current-thread runtime: this thread is the only one driving these futures, and a
     // multi-threaded pool would add threads to a process we are only supposed to observe.
@@ -326,7 +360,7 @@ fn run(
         };
 
         if finished && let Some(state) = sessions.remove(&session_id) {
-            export(&runtime, &session_id, state, &dropped);
+            export(&runtime, &session_id, state, &dropped, &on_manifest);
             on_finished(&session_id);
         }
     }
@@ -334,7 +368,7 @@ fn run(
     // The channel closed. Everything still open is a session whose agent never told us it ended --
     // which on Codex is every session.
     for (session_id, state) in sessions {
-        export(&runtime, &session_id, state, &dropped);
+        export(&runtime, &session_id, state, &dropped, &on_manifest);
         on_finished(&session_id);
     }
 }
@@ -932,6 +966,7 @@ fn export(
     session_id: &str,
     mut state: SessionState,
     dropped: &Arc<Mutex<HashMap<String, u64>>>,
+    on_manifest: &ManifestAnnounced,
 ) {
     // What the queue lost for this session, taken out of the shared map so it does not outlive the
     // session it describes -- the same unbounded-growth mistake this export path exists to close.
@@ -955,11 +990,8 @@ fn export(
     // `session.start` -- the failure this recorder is least willing to have.
     // Resolved against the *final* name, not the session-shaped one. Two agentless recordings under
     // one session id are two recordings, and the second must not replace the first.
-    let path = match (
-        state.agent.is_none(),
-        state.path.parent(),
-        state.path.file_stem(),
-    ) {
+    let unattributed = state.agent.is_none();
+    let path = match (unattributed, state.path.parent(), state.path.file_stem()) {
         (true, Some(dir), Some(stem)) => {
             unclobbered(dir, &format!("{}.unattributed", stem.to_string_lossy()))
         }
@@ -974,6 +1006,23 @@ fn export(
         // The checkpoints went to the session-shaped name before we knew this was a fragment.
         if path != checkpoint {
             let _ = std::fs::remove_file(&checkpoint);
+        }
+        // Announced only here, never from `checkpoint`. A checkpoint is superseded by the next one,
+        // so announcing each would put a mark on the stream per unit of work and leave a consumer
+        // to guess which is final -- and the CID of a manifest that is still growing identifies
+        // nothing a reader can hold onto.
+        //
+        // After the write, and only if it happened: a mark naming a manifest that is not on disk is
+        // worse than no mark, because it is the one claim a consumer would act on without checking.
+        if path.exists()
+            && let Ok(cid) = blake3_cid_raw_binary(&json)
+        {
+            on_manifest(&ManifestMark {
+                cid,
+                path,
+                statements: manifest.statements.len(),
+                unattributed,
+            });
         }
     }
 }

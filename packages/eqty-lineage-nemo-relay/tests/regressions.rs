@@ -8,10 +8,11 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use eqty_lineage_nemo_relay::{
-    CompactionPhase, EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, Policy,
-    Recorder, ReplayRefusal, SessionFinished, SessionRouter, SignerFactory, apply_edit,
+    CompactionPhase, EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, ManifestMark,
+    Policy, Recorder, ReplayRefusal, SessionFinished, SessionRouter, SignerFactory, apply_edit,
     apply_line_edit, classify, file_events_from_patch,
 };
+use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::Event;
@@ -74,13 +75,18 @@ fn forget_with(router: &Arc<Mutex<SessionRouter>>) -> SessionFinished {
     })
 }
 
-fn replay(events: &[Event], into: &TempDir) {
+fn replay(events: &[Event], into: &TempDir) -> Vec<ManifestMark> {
     let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let announced: Arc<Mutex<Vec<ManifestMark>>> = Arc::new(Mutex::new(Vec::new()));
+    let marks = Arc::clone(&announced);
     let mailbox = Mailbox::start(
         into.path().to_path_buf(),
         policy(),
         signer_factory(),
         forget_with(&router),
+        Box::new(move |mark: &ManifestMark| {
+            marks.lock().expect("the marks lock").push(mark.clone())
+        }),
     );
     for event in events {
         let Some(session_id) = router.lock().expect("lock").attribute(event) else {
@@ -90,7 +96,13 @@ fn replay(events: &[Event], into: &TempDir) {
             mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
         }
     }
+    // Dropped before the marks are read: the final export runs when the last handle goes, so a
+    // read before this returns whatever the checkpoints managed rather than what the session says.
     drop(mailbox);
+    Arc::into_inner(announced)
+        .expect("the mailbox thread has ended, so this is the only handle")
+        .into_inner()
+        .expect("the marks lock")
 }
 
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
@@ -1166,4 +1178,192 @@ async fn content_never_established_contributes_no_byte_total() {
         coverage["coverage"]["ContentUnknown"], 1,
         "it was still seen"
     );
+}
+
+// ------------------------------------------------------- announcing the manifest
+
+/// A session with an agent, so the export is a real session rather than a fragment.
+fn one_attributed_write(session: &str, root: &str) -> Vec<Event> {
+    let mut events = vec![mark(
+        session,
+        root,
+        root,
+        "session.start",
+        serde_json::json!({"model":"opus"}),
+    )];
+    events.extend([
+        tool_scope(
+            session,
+            root,
+            root,
+            "start",
+            "Write",
+            "toolu_mark",
+            serde_json::json!({ "file_path": "/work/announced.md", "content": "hi\n" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            root,
+            root,
+            "end",
+            "Write",
+            "toolu_mark",
+            serde_json::json!("wrote 3 bytes\n"),
+            Some("ok"),
+        ),
+    ]);
+    events
+}
+
+#[test]
+fn a_finished_recording_says_where_it_was_written() {
+    // Without this the manifest is discoverable only by knowing our path convention, and a
+    // convention is not an attestation. The mark is the one thing that puts the recording's
+    // location inside the event stream it was recorded from.
+    let into = TempDir::new().unwrap();
+    let marks = replay(
+        &one_attributed_write(
+            "01a040aa-0000-0000-0000-000000000fa1",
+            "01a040aa-0000-0000-0000-000000000fa2",
+        ),
+        &into,
+    );
+
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "one session, one manifest: {written:?}");
+    assert_eq!(marks.len(), 1, "and one mark for it: {marks:?}");
+    let mark = &marks[0];
+    assert_eq!(mark.path, written[0], "the mark names the file on disk");
+    assert!(!mark.unattributed, "this session registered an agent");
+
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(&written[0]).expect("read")).expect("parse");
+    assert_eq!(
+        mark.statements,
+        manifest.statements.len(),
+        "and counts what is in it"
+    );
+    assert!(mark.statements > 0, "a recording with nothing in it");
+}
+
+#[test]
+fn the_announced_cid_is_the_cid_of_the_bytes_on_disk() {
+    // A CID over anything else -- the statements, the graph, a re-serialization -- cannot answer the
+    // only question the mark exists for: is the file I just fetched the file that was announced?
+    let into = TempDir::new().unwrap();
+    let marks = replay(
+        &one_attributed_write(
+            "01a040aa-0000-0000-0000-000000000fa3",
+            "01a040aa-0000-0000-0000-000000000fa4",
+        ),
+        &into,
+    );
+
+    let bytes = fs::read(&marks[0].path).expect("the announced path is readable");
+    assert_eq!(
+        marks[0].cid,
+        blake3_cid_raw_binary(&bytes).expect("a cid over the file"),
+        "the announced CID must verify against the file, byte for byte"
+    );
+}
+
+#[test]
+fn a_checkpoint_is_not_announced() {
+    // Checkpoints are superseded by the next one, so a mark per checkpoint would put one on the
+    // stream per unit of work and leave a consumer to guess which named the finished recording --
+    // and the CID of a manifest that is still growing identifies nothing worth holding onto.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-000000000fa5";
+    let root = "01a040aa-0000-0000-0000-000000000fa6";
+    let mut events = vec![mark(
+        session,
+        root,
+        root,
+        "session.start",
+        serde_json::json!({"model":"opus"}),
+    )];
+    for (index, tag) in ["toolu_c1", "toolu_c2", "toolu_c3"].iter().enumerate() {
+        events.extend([
+            tool_scope(
+                session,
+                root,
+                root,
+                "start",
+                "Write",
+                tag,
+                serde_json::json!({ "file_path": format!("/work/{index}.md"), "content": "x\n" }),
+                None,
+            ),
+            tool_scope(
+                session,
+                root,
+                root,
+                "end",
+                "Write",
+                tag,
+                serde_json::json!("wrote 2 bytes\n"),
+                Some("ok"),
+            ),
+        ]);
+    }
+
+    let marks = replay(&events, &into);
+
+    assert_eq!(
+        marks.len(),
+        1,
+        "three completed tool calls checkpoint three times and finish once: {marks:?}"
+    );
+}
+
+#[test]
+fn an_agentless_fragment_announces_itself_as_one() {
+    // Codex's title-generation call exports as `{id}.unattributed.json`, and a consumer counting
+    // manifests to count sessions gets the wrong answer. The flag is in the mark's data so that
+    // does not require parsing a filename -- which is the mistake the live-session script made.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-000000000fa7";
+    let root = "01a040aa-0000-0000-0000-000000000fa8";
+    // No `session.start`, so no agent is ever registered.
+    let marks = replay(
+        &[
+            tool_scope(
+                session,
+                root,
+                root,
+                "start",
+                "Bash",
+                "toolu_frag",
+                serde_json::json!({ "command": "title this" }),
+                None,
+            ),
+            tool_scope(
+                session,
+                root,
+                root,
+                "end",
+                "Bash",
+                "toolu_frag",
+                serde_json::json!("a title"),
+                None,
+            ),
+        ],
+        &into,
+    );
+
+    assert_eq!(marks.len(), 1, "a fragment is still announced: {marks:?}");
+    assert!(
+        marks[0].unattributed,
+        "and says it is one, rather than being counted as a session"
+    );
+    assert!(
+        marks[0]
+            .path
+            .to_string_lossy()
+            .ends_with(".unattributed.json"),
+        "naming the fragment it wrote: {:?}",
+        marks[0].path
+    );
+    assert_eq!(marks[0].path, manifests(&into)[0]);
 }

@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
-    LineageSession, Mailbox, Policy, SessionFinished, SessionRouter, SignerFactory, classify,
+    LineageSession, Mailbox, ManifestAnnounced, ManifestMark, Policy, SessionFinished,
+    SessionRouter, SignerFactory, classify,
 };
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::Event;
@@ -31,13 +32,18 @@ fn policy() -> Policy {
 ///
 /// The router is shared with the mailbox exactly as `register` shares it, so the scope-map pruning
 /// at export is on the path these tests drive rather than a production-only branch.
-fn replay(events: &[Event], into: &TempDir) {
+fn replay(events: &[Event], into: &TempDir) -> Vec<ManifestMark> {
     let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let announced: Arc<Mutex<Vec<ManifestMark>>> = Arc::new(Mutex::new(Vec::new()));
+    let marks = Arc::clone(&announced);
     let mailbox = Mailbox::start(
         into.path().to_path_buf(),
         policy(),
         signer_factory(),
         forget_with(&router),
+        Box::new(move |mark: &ManifestMark| {
+            marks.lock().expect("the marks lock").push(mark.clone())
+        }),
     );
 
     for event in events {
@@ -53,7 +59,17 @@ fn replay(events: &[Event], into: &TempDir) {
     }
 
     // Dropping is the flush. On Codex it is the only export trigger there will ever be.
+    // Dropped before the marks are read: the final export runs when the last handle goes.
     drop(mailbox);
+    Arc::into_inner(announced)
+        .expect("the mailbox thread has ended, so this is the only handle")
+        .into_inner()
+        .expect("the marks lock")
+}
+
+/// For tests about something other than the manifest mark. `replay` collects them instead.
+fn ignore_marks() -> ManifestAnnounced {
+    Box::new(|_mark: &ManifestMark| {})
 }
 
 /// The session-finished callback the plugin installs: prune the finished session's scopes.
@@ -1275,6 +1291,7 @@ fn a_manifest_exists_before_the_session_ends() {
         policy(),
         signer_factory(),
         forget_with(&router),
+        ignore_marks(),
     );
     for event in &mid {
         let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
@@ -1936,6 +1953,7 @@ fn a_finished_session_stops_being_tracked() {
         policy(),
         signer_factory(),
         forget_with(&router),
+        ignore_marks(),
     );
 
     let events = full_session("01a040aa-0000-0000-0000-000000000f71");
@@ -2090,6 +2108,7 @@ fn an_event_that_completes_nothing_writes_no_manifest() {
         policy(),
         signer_factory(),
         forget_with(&router),
+        ignore_marks(),
     );
 
     // A session start and a tool call that has not come back yet. Neither completes anything.
