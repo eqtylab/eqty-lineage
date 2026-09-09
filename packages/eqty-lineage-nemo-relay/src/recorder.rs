@@ -472,6 +472,36 @@ impl Recorder {
 
         let Some(completion) = completion else {
             self.count("ModelCallWithoutResponse");
+            // The inputs above are already registered and nothing will link them, because an
+            // activity needs an output and there is none. Left alone they are nodes a reader finds
+            // dangling with no reason on them, and the only explanation is a session-level counter.
+            //
+            // The reason goes on a marker for the call rather than as a field on those nodes,
+            // because the nodes are content addressed and shared. One live session had a single
+            // `Model` node feeding 31 successful calls and this one failure: writing "unlinked" onto
+            // it would have been false, and at registration time there is no way to know whether a
+            // node will later be reused by a call that did answer. What failed is the call, so the
+            // claim belongs on the call.
+            let index = self
+                .stats
+                .get("ModelCallWithoutResponse")
+                .copied()
+                .unwrap_or(1);
+            self.register_payload(
+                "Dataset",
+                &format!("unanswered model call {index}"),
+                "A model call whose response never arrived. Its inputs were registered and no \
+                 computation links them, because an activity with no output is not one.",
+                // The ordinal is in the content for the reason it is in a compaction's: two failures
+                // with identical inputs would otherwise collapse into one node.
+                &serde_json::to_vec(&json!({ "unansweredCall": index }))?,
+                json!({
+                    "unlinkedBecause": "model-call-had-no-response",
+                    "unlinkedInputs": inputs.iter().map(AssetRef::as_str).collect::<Vec<_>>(),
+                }),
+                at,
+            )
+            .await?;
             return Ok(false);
         };
 

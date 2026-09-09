@@ -997,3 +997,60 @@ async fn a_compaction_is_an_entity_not_an_activity() {
         "one compaction, its two halves named for what they are: {names:?}"
     );
 }
+
+/// A call that never answered leaves a reason in the graph, not just a counter.
+///
+/// Its inputs are registered before the response is known and nothing links them afterwards, because
+/// an activity with no output is not one. They used to dangle with the explanation living only in
+/// `ModelCallWithoutResponse` at session level, so a reader inspecting the node saw no reason at all.
+///
+/// The reason is on a marker for the call rather than a field on those nodes, because the nodes are
+/// content addressed and shared: one live session had a single `Model` node feeding 31 successful
+/// calls and one failure, and writing "unlinked" onto it would have been false.
+#[tokio::test]
+async fn an_unanswered_model_call_says_why_its_inputs_dangle() {
+    let mut rec = recorder();
+    let recorded = rec
+        .record_model_call(
+            Some("some-model"),
+            None,
+            b"[{\"role\":\"user\",\"content\":\"quota\"}]",
+            None, // no completion ever arrived
+            None,
+            serde_json::json!({}),
+            serde_json::json!({}),
+            true,
+            None,
+        )
+        .await
+        .expect("registering the inputs still succeeds");
+    assert!(!recorded, "no computation is claimed without an output");
+
+    let manifest = exported(rec).await;
+    let nodes: Vec<serde_json::Value> = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .collect();
+
+    let marker = nodes
+        .iter()
+        .find(|n| n["unlinkedBecause"] == "model-call-had-no-response")
+        .unwrap_or_else(|| panic!("a marker naming the reason: {nodes:#?}"));
+    assert_eq!(marker["provType"], "Entity", "a marker is a thing");
+
+    // The prompt is reachable through the marker, which is the point of recording it.
+    let prompt = nodes
+        .iter()
+        .find(|n| n["assetType"] == "Prompt")
+        .expect("the prompt was registered before the response was known");
+    let listed = marker["unlinkedInputs"]
+        .as_array()
+        .expect("the inputs it could not link")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|cid| cid == prompt["content-cid"].as_str().unwrap_or_default());
+    assert!(
+        listed,
+        "the marker names the prompt it could not link: {marker}"
+    );
+}
