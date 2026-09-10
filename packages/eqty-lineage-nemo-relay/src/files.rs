@@ -249,6 +249,39 @@ fn flush_update(
     });
 }
 
+/// Every path a patch document names, without reconstructing anything it describes.
+///
+/// Kept separate from [`file_events_from_patch`] because the questions differ in both directions.
+/// That parser answers *what happened to which file*, so it emits one observation per block, at the
+/// **destination** when a block moves a file -- the source survives only in `replay_from`, and in
+/// the identity-only arm not at all. For deciding whose policy a payload inherits, the source
+/// matters exactly as much: a patch moving `secrets.pem` to `secrets.txt` carries the pem's lines in
+/// its own body, and a list of destinations alone never matches `*.pem`.
+///
+/// It is also the cheap half. `file_events_from_patch` materializes the full content of every
+/// `*** Add File`, and this runs on the thread draining the event queue, so asking it for paths
+/// alone would line-split, join and allocate a whole patch body to read four strings.
+pub fn paths_in_patch(patch: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let named = [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Move to: ",
+            "*** Delete File: ",
+        ]
+        .iter()
+        .find_map(|directive| line.strip_prefix(directive));
+        if let Some(path) = named {
+            let path = path.trim();
+            if !path.is_empty() && !paths.iter().any(|seen| seen == path) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths
+}
+
 /// One `*** Update File` block, accumulated as its lines arrive.
 struct Update {
     path: String,

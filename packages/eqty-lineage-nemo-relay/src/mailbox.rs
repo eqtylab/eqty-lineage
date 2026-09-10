@@ -27,7 +27,9 @@ use nemo_relay_plugin::{AnnotatedLlmRequest, AnnotatedLlmResponse};
 use serde_json::Value as Json;
 
 use crate::classify::LineageEvent;
-use crate::files::{FileMode, FileObserved, file_events_from_patch, file_events_from_result};
+use crate::files::{
+    FileMode, FileObserved, file_events_from_patch, file_events_from_result, paths_in_patch,
+};
 use crate::lineage::{AssetRef, LineageSession};
 use crate::recorder::Recorder;
 use crate::redaction::Policy;
@@ -609,11 +611,10 @@ fn paths_named_in_arguments(open: Option<&OpenTool>) -> Vec<String> {
     if let Some(path) = path_from_arguments(open) {
         paths.push(path);
     }
-    // The same parser the observation path uses, called here for its paths alone.
     if let Some(patch) = patch_in_arguments(open) {
-        for observed in file_events_from_patch(patch, None) {
-            if !paths.contains(&observed.path) {
-                paths.push(observed.path);
+        for path in paths_in_patch(patch) {
+            if !paths.contains(&path) {
+                paths.push(path);
             }
         }
     }
@@ -1083,11 +1084,16 @@ async fn checkpoint(state: &mut SessionState) {
             return;
         }
     }
+    // Charged before the work, not after it, because the work is what has to be paced. Snapshotting
+    // signs the whole recording and serializing copies it, and both fail for reasons that do not
+    // clear up -- a signer that errors keeps erroring. Advancing only on the far side of them left
+    // the interval below unengaged for the entire session, which is the same hot loop this watermark
+    // exists to prevent, reached through a different failure than the one it was fixed for.
+    state.attempted_at = count;
     let Ok(manifest) = state.recorder.snapshot().await else {
         return;
     };
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        state.attempted_at = count;
         // The result is deliberately unused here: a checkpoint is superseded by the next one and by
         // the final export, so a failed one costs nothing a later write does not replace. It is the
         // *export* that must know, because it announces and deletes on the strength of it.

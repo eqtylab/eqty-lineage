@@ -70,6 +70,26 @@ fn replay(events: &[Event], into: &TempDir) -> Vec<ManifestMark> {
         .expect("the marks lock")
 }
 
+/// Make `path` impossible to write to, for any user.
+///
+/// A directory rather than a permission bit, because `just linux-check` runs the suite as root and a
+/// read-only directory does not fail there at all -- the test would pass while proving nothing.
+///
+/// Retried because a checkpoint may be holding the very temporary file being claimed: the poll that
+/// precedes this waits for the *first* checkpoint to land, and a fixture large enough to cross
+/// `CHECKPOINT_EVERY` again can have another one in flight at exactly this moment. Taking the
+/// `AlreadyExists` at face value would fail the test for a reason that has nothing to do with it.
+fn block(path: &std::path::Path) {
+    for _ in 0..500 {
+        let _ = std::fs::remove_file(path);
+        if std::fs::create_dir(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("could not claim {} to make the write fail", path.display());
+}
+
 /// For tests about something other than the manifest mark. `replay` collects them instead.
 fn ignore_marks() -> ManifestAnnounced {
     Box::new(|_mark: &ManifestMark| {})
@@ -2943,8 +2963,7 @@ fn a_manifest_that_could_not_be_written_is_not_announced() {
     let checkpoint_bytes = std::fs::read(&manifest).expect("the checkpoint");
 
     // Now make the final write fail, and only the final write.
-    std::fs::create_dir(into.path().join(format!("{session}.json.writing")))
-        .expect("a directory where the temporary file wants to go");
+    block(&into.path().join(format!("{session}.json.writing")));
 
     drop(mailbox);
     let marks = Arc::into_inner(announced)
@@ -3003,11 +3022,11 @@ fn a_failed_final_write_does_not_take_the_checkpoint_with_it() {
     );
 
     // The export will resolve to `{session}.unattributed.json`; block only that write.
-    std::fs::create_dir(
-        into.path()
+    block(
+        &into
+            .path()
             .join(format!("{session}.unattributed.json.writing")),
-    )
-    .expect("a directory where the temporary file wants to go");
+    );
 
     drop(mailbox);
 
@@ -3107,8 +3126,7 @@ fn no_view_is_announced_for_a_manifest_that_could_not_be_written() {
         waited += 10;
     }
     assert!(manifest.exists(), "a checkpoint should have landed");
-    std::fs::create_dir(into.path().join(format!("{session}.json.writing")))
-        .expect("a directory where the temporary file wants to go");
+    block(&into.path().join(format!("{session}.json.writing")));
 
     drop(mailbox);
     let marks = Arc::into_inner(announced)
@@ -3124,5 +3142,60 @@ fn no_view_is_announced_for_a_manifest_that_could_not_be_written() {
         views(&into).is_empty(),
         "and no view may be written beside a manifest that is not there: {:?}",
         views(&into)
+    );
+}
+
+#[test]
+fn a_patch_that_moves_a_denied_file_is_withheld_by_its_source_path() {
+    // The third place this same asymmetry hid. `file_events_from_patch` emits one observation per
+    // block, at the *destination* when the block moves a file -- the source survives only in
+    // `replay_from`, and in the identity-only arm not at all. So a list built from observations
+    // holds `secrets.txt` and never `secrets.pem`, the deny glob does not match, and the patch body
+    // -- which carries the pem's own lines -- is stored verbatim.
+    //
+    // Note the call *succeeds* here: unlike the two cases before it, this one never depended on the
+    // failure gate at all.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-0000000009fa";
+    let root = "01a040aa-0000-0000-0000-0000000009fb";
+    let call = "01a040aa-0000-0000-0000-0000000009fc";
+
+    let patch = "*** Begin Patch\n*** Update File: /app/secrets.pem\n*** Move to: /app/secrets.txt\n@@\n-BEGIN KEY moved-secret-value\n+BEGIN KEY rotated\n*** End Patch";
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "apply_patch",
+            "toolu_m1",
+            serde_json::json!({ "command": patch }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "apply_patch",
+            "toolu_m1",
+            serde_json::json!("Success. Updated the following files:\nM /app/secrets.txt"),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    assert!(
+        !decoded_blobs(path).contains("moved-secret-value"),
+        "a denied source path must reach the policy even when the patch moves the file away from it:\n{}",
+        decoded_blobs(path)
     );
 }

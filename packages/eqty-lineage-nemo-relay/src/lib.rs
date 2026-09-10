@@ -41,7 +41,7 @@ pub use classify::{CompactionPhase, Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{
     EditAttempt, FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit,
-    file_events_from_patch, file_events_from_result,
+    file_events_from_patch, file_events_from_result, paths_in_patch,
 };
 pub use lineage::{AssetRef, LineageSession};
 pub use mailbox::{
