@@ -25,7 +25,7 @@ defaults:
 jobs:
   publish:
     # `eqty-lineage-nemo-relay` is a Rust cdylib with no `pyproject.toml`, so this workflow cannot
-    # release it and `release-relay-plugin.yml` does. Skipped rather than left to fail: the tag
+    # release it and `release-nemo-relay-plugin.yml` does. Skipped rather than left to fail: the tag
     # resolution below ends in "Expected one pyproject.toml, found 0", which reads as a broken
     # release rather than as the wrong workflow for the tag.
     if: ${{ !startsWith(github.event.release.tag_name || inputs.release_tag, 'eqty-lineage-nemo-relay@') }}

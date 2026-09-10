@@ -30,7 +30,7 @@ env:
   PUBLISHED_KEY: "ed25519:EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4="
 
 concurrency:
-  group: release-relay-plugin-${{ github.event.release.id || inputs.release_tag }}
+  group: release-nemo-relay-plugin-${{ github.event.release.id || inputs.release_tag }}
   cancel-in-progress: false # a half-uploaded release is worse than a slow one
 
 jobs:

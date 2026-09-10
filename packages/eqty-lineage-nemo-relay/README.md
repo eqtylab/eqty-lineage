@@ -263,7 +263,7 @@ shasum -a 256 target/release/libeqty_lineage_nemo_relay.dylib
 
 The digest goes in `relay-plugin.toml` under `[integrity] sha256`, which Relay verifies against the
 library before loading it regardless of attestation policy. `just nemo-relay-package` stamps it, and
-`release-relay-plugin.yml` re-checks it against the artifact before attaching anything to a release
+`release-nemo-relay-plugin.yml` re-checks it against the artifact before attaching anything to a release
 — a stale digest is an install Relay refuses, and that should be caught before release rather than
 by a user.
 

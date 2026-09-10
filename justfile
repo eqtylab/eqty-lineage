@@ -20,7 +20,7 @@ build-python:
 # Kept out of PR CI: it recompiles the whole dependency tree at a profile nothing else on the PR path
 # uses, measured at 107s and still climbing when that step was cancelled.
 #
-# Which leaves the release profile exercised on the PR path by nothing. `release-relay-plugin.yml`
+# Which leaves the release profile exercised on the PR path by nothing. `release-nemo-relay-plugin.yml`
 # now builds it for every shipped target on a release, so it is covered at the point it matters --
 # but not before, so a release is still the first time a release build runs for a given commit.
 # `release.yml` cannot do this: it resolves a `PACKAGE@X.Y.Z` tag to a `pyproject.toml` and this
