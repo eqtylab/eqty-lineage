@@ -11,15 +11,18 @@
       "default": ".eqty/manifests",
       "description": "Directory manifests are written to, resolved relative to Relay's working directory. One manifest per session, named by session id."
     },
-    "triples": {
-      "type": "boolean",
-      "default": false,
-      "description": "Reserved, not yet implemented: no RDF triples sidecar is written whatever this is set to. Setting it to true is accepted and reported as a warning by `nemo-relay plugins validate`."
-    },
     "deny_globs": {
       "type": "array",
-      "items": { "type": "string" },
-      "default": [".env*", "*.pem", "id_rsa*", "*/.ssh/*", "*credentials*"],
+      "items": {
+        "type": "string"
+      },
+      "default": [
+        ".env*",
+        "*.pem",
+        "id_rsa*",
+        "*/.ssh/*",
+        "*credentials*"
+      ],
       "description": "Paths whose contents are withheld. A matching file still becomes a graph node carrying its path and its true content CID, computed before redaction; only the bytes are withheld. Provenance does not require publication."
     },
     "max_content_bytes": {
@@ -33,7 +36,10 @@
       "description": "Relay's own per-component executor override.",
       "additionalProperties": false,
       "properties": {
-        "worker_threads": { "type": "integer", "exclusiveMinimum": 0 }
+        "worker_threads": {
+          "type": "integer",
+          "exclusiveMinimum": 0
+        }
       }
     }
   }

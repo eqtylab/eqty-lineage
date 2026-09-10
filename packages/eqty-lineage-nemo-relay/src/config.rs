@@ -35,13 +35,6 @@ const DEFAULT_DENY_GLOBS: &[&str] = &[".env*", "*.pem", "id_rsa*", "*/.ssh/*", "
 pub struct Config {
     /// Directory manifests are written to.
     pub manifest_dir: PathBuf,
-    /// Whether to write the RDF triples sidecar alongside the manifest.
-    ///
-    /// **Reserved, and not yet implemented.** Nothing reads this field: no sidecar is written
-    /// whatever it is set to. Kept so the field name is claimed rather than free for something else
-    /// to mean later, and defaulted to `false` -- a default of `true` describing behaviour that does
-    /// not exist tells an operator their triples are being written when they are not.
-    pub triples: bool,
     /// Glob patterns whose file contents are withheld.
     pub deny_globs: Vec<String>,
     /// Ceiling on stored content size, in bytes.
@@ -52,7 +45,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             manifest_dir: PathBuf::from(DEFAULT_MANIFEST_DIR),
-            triples: false,
             deny_globs: DEFAULT_DENY_GLOBS
                 .iter()
                 .map(|glob| (*glob).to_string())
@@ -78,28 +70,6 @@ impl Config {
                     "manifest_dir.invalid",
                     "manifest_dir",
                     "manifest_dir must be a non-empty string",
-                )),
-            }
-        }
-
-        if let Some(value) = raw.get("triples") {
-            match value.as_bool() {
-                // Accepted, stored, and acted on by nothing. Warned about rather than accepted in
-                // silence: an operator who set it did so expecting a file to appear, and finding out
-                // from an empty directory is worse than finding out from `plugins validate`.
-                Some(true) => {
-                    config.triples = true;
-                    diagnostics.push(warning(
-                        "triples.unimplemented",
-                        "triples",
-                        "triples is reserved and not yet implemented: no sidecar will be written",
-                    ));
-                }
-                Some(false) => config.triples = false,
-                None => diagnostics.push(error(
-                    "triples.invalid",
-                    "triples",
-                    "triples must be a boolean",
                 )),
             }
         }
@@ -135,16 +105,13 @@ impl Config {
     }
 }
 
+/// Every diagnostic this config can produce is an error, since `triples` -- the one setting that was
+/// understood but did not do what its name suggested -- is gone. `register` still refuses only on
+/// errors rather than on any diagnostic, which is deliberate and currently unexercised: a warning
+/// must not cost a session its manifest, and the next reserved field should not have to rediscover
+/// that. The level stays an explicit argument for the same reason.
 fn error(code: &str, field: &str, message: &str) -> ConfigDiagnostic {
     diagnostic(DiagnosticLevel::Error, code, field, message)
-}
-
-/// A setting that is understood but will not do what its name suggests.
-///
-/// Distinct from an error on purpose: registration proceeds. Refusing to record a session because
-/// one field is aspirational would trade a missing sidecar for a missing manifest.
-fn warning(code: &str, field: &str, message: &str) -> ConfigDiagnostic {
-    diagnostic(DiagnosticLevel::Warning, code, field, message)
 }
 
 fn diagnostic(level: DiagnosticLevel, code: &str, field: &str, message: &str) -> ConfigDiagnostic {
