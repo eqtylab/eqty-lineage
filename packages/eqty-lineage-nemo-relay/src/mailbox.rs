@@ -571,16 +571,30 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
 ///
 /// Claude Code spells the input in snake case (`file_path`) and the result in camel case
 /// (`filePath`); both are checked because a tool that only reports one of them still moved a file.
+/// The file path a tool call names in its own arguments, if it names one.
+///
+/// Split out from [`observation_from_arguments`] because the two questions it used to answer
+/// together are not the same question. *Did a file change?* must not be inferred from a call that
+/// failed -- the mode comes from the tool's name, so a `Write` that returned `EACCES` would be
+/// recorded as a file written. *Whose policy do this call's payloads inherit?* has no such
+/// dependency: a `Write` to a denied path carries that file's content in its arguments whether the
+/// write succeeded, failed, or never said. Answering both through one failure gate meant a failed
+/// write to `/app/.env` stored the secret it was refused permission to write.
+fn path_from_arguments(open: Option<&OpenTool>) -> Option<String> {
+    let input = open?.input.as_ref()?;
+    ["file_path", "filePath", "path", "notebook_path"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(Json::as_str))
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+}
+
 fn observation_from_arguments(
     open: Option<&OpenTool>,
     tool_use_id: Option<&str>,
 ) -> Option<FileObserved> {
     let open = open?;
-    let input = open.input.as_ref()?;
-    let path = ["file_path", "filePath", "path", "notebook_path"]
-        .iter()
-        .find_map(|key| input.get(*key).and_then(Json::as_str))
-        .filter(|path| !path.is_empty())?;
+    let path = path_from_arguments(Some(open))?;
 
     // Named by a tool whose purpose is to write, so the file is an output; anything else is a read.
     let writes = matches!(
@@ -788,10 +802,23 @@ async fn record_tool(
     // a `Read` result *is* the file, a `Write` input *is* the file -- so they inherit those paths'
     // policy. Without this, withholding `/app/.env` on its own node stored the same bytes verbatim
     // in the call that produced them, and the manifest reported a redaction it had not performed.
-    let touched: Vec<String> = observations
+    let mut touched: Vec<String> = observations
         .iter()
         .map(|observation| observation.path.clone())
         .collect();
+
+    // And the path the call named in its own arguments, whether or not a file effect could be
+    // inferred from it. The list above is built from *observations*, which a failed call never has:
+    // the fallback that reads a path out of the arguments is gated on success, deliberately, so a
+    // `Write` that returned `EACCES` is not recorded as a file written. That gate belongs to the
+    // question "did a file change". It does not belong to this one -- the arguments of a failed
+    // `Write` hold exactly the bytes a successful one would have held, so the policy that would
+    // have withheld them still applies. Without this the deny list was disabled by failure.
+    if let Some(path) = path_from_arguments(open.as_ref())
+        && !touched.contains(&path)
+    {
+        touched.push(path);
+    }
 
     let mut inputs: Vec<AssetRef> = Vec::new();
     let mut outputs: Vec<AssetRef> = Vec::new();
@@ -969,21 +996,31 @@ fn unclobbered(dir: &Path, stem: &str) -> PathBuf {
 /// Written to a sibling and renamed, because a checkpoint runs while an agent is working and a
 /// reader may open the file at any moment. A partial write would hand them a truncated JSON
 /// document, which is worse than the slightly older complete one it replaced.
-fn write_atomically(path: &Path, bytes: &[u8]) {
+/// Returns whether `path` now holds `bytes`.
+///
+/// The answer is `#[must_use]` because both callers act on it irreversibly. One announces a mark,
+/// which is the single claim a consumer acts on without re-reading the file; the other removes a
+/// checkpoint, which may be the only surviving copy of the session. `path.exists()` cannot stand in
+/// for either: checkpoints are written to the very path the final manifest replaces, so a failed
+/// replacement leaves the *older* file exactly where a successful one would have left the new one.
+#[must_use]
+fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
     let Some(parent) = path.parent() else {
-        return;
+        return false;
     };
     if std::fs::create_dir_all(parent).is_err() {
-        return;
+        return false;
     }
     let temporary = path.with_extension("json.writing");
     if std::fs::write(&temporary, bytes).is_err() {
         let _ = std::fs::remove_file(&temporary);
-        return;
+        return false;
     }
     if std::fs::rename(&temporary, path).is_err() {
         let _ = std::fs::remove_file(&temporary);
+        return false;
     }
+    true
 }
 
 /// Write what has been recorded so far, so the session is not all-or-nothing.
@@ -1010,8 +1047,12 @@ async fn checkpoint(state: &mut SessionState) {
         return;
     };
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        write_atomically(&state.path, &json);
-        state.written_at = count;
+        // Only when it landed. Advancing the watermark on a failed write makes the next checkpoint
+        // measure its interval from a snapshot that is not on disk, so a session can go long
+        // stretches believing it is checkpointed while nothing has been written since the last one.
+        if write_atomically(&state.path, &json) {
+            state.written_at = count;
+        }
     }
 }
 
@@ -1056,9 +1097,13 @@ fn export(
         return;
     };
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        write_atomically(&path, &json);
+        let written = write_atomically(&path, &json);
         // The checkpoints went to the session-shaped name before we knew this was a fragment.
-        if path != checkpoint {
+        //
+        // Gated on the write: this is the only copy of the session once it runs, so removing it
+        // after a failed replacement trades a stale recording for none at all -- the worst outcome
+        // available here, and the one the unconditional version produced.
+        if written && path != checkpoint {
             let _ = std::fs::remove_file(&checkpoint);
         }
         // Announced only here, never from `checkpoint`. A checkpoint is superseded by the next one,
@@ -1068,9 +1113,12 @@ fn export(
         //
         // After the write, and only if it happened: a mark naming a manifest that is not on disk is
         // worse than no mark, because it is the one claim a consumer would act on without checking.
-        if path.exists()
-            && let Ok(cid) = blake3_cid_raw_binary(&json)
-        {
+        // `path.exists()` used to stand for "it happened" and could not: for an attributed session
+        // this path *is* the checkpoint path, so a failed final write leaves the previous checkpoint
+        // sitting there and the file passes the test while holding older bytes. The mark would then
+        // carry the final manifest's CID over a file that does not hash to it -- the exact question
+        // a mark exists to answer, answered wrongly.
+        if written && let Ok(cid) = blake3_cid_raw_binary(&json) {
             on_manifest(&ManifestMark {
                 kind: ManifestKind::Full,
                 cid,
@@ -1092,8 +1140,9 @@ fn export(
             && let Some(view) = crate::view::session_view(&value)
         {
             let view_path = path.with_extension("view.json");
-            write_atomically(&view_path, &view.bytes);
-            if view_path.exists()
+            // Same rule as the manifest above, and for the same reason: a view left over from an
+            // earlier export satisfies `exists()` while holding different bytes.
+            if write_atomically(&view_path, &view.bytes)
                 && let Ok(cid) = blake3_cid_raw_binary(&view.bytes)
             {
                 on_manifest(&ManifestMark {

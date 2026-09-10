@@ -209,13 +209,21 @@ impl Recorder {
 
         let key = (path.clone(), content_cid.clone());
         if let Some(existing) = self.by_content.get(&key).cloned() {
-            // The node already exists, but the replay base must still move. A file that went from A
-            // to B and back to A leaves B cached otherwise, and the next edit anchored on A is either
-            // refused or -- if its `old` text happens to occur in B as well -- replayed against
-            // content the file no longer holds.
-            if let Some(bytes) = data {
-                self.last_content.insert(path, bytes);
-            }
+            // The node already exists, but the replay base must still move -- by exactly the rule
+            // the new-node path uses below, because the base is a fact about the file and not about
+            // whether we happened to have seen this version before.
+            //
+            // A file that went from A to B and back to A leaves B cached otherwise, and the next
+            // edit anchored on A is either refused or -- if its `old` text happens to occur in B as
+            // well -- replayed against content the file no longer holds.
+            //
+            // The contentless-write arm is the one that was missing, and it is reachable: an
+            // unreconstructable write keys on `unknown:{path}`, so the *second* such observation for
+            // a path deduplicates against the first and returned here without clearing the base. A
+            // truncated read seeds that key without touching the base, so `read (truncated)`,
+            // `read (full)`, `write (unreconstructable)`, `edit` replayed the edit against the
+            // pre-write bytes and signed a version of the file that never existed.
+            Self::move_replay_base(&mut self.last_content, path, data, event.mode);
             return Ok(Some(existing));
         }
 
@@ -286,27 +294,40 @@ impl Recorder {
             }
         };
 
-        match (data, event.mode) {
-            (Some(bytes), _) => {
-                self.last_content.insert(path.clone(), bytes);
-            }
-            // A write we could not reconstruct means what is on disk is no longer what we hold.
-            // Keeping the old bytes lets a later edit "recover" a version built from content that
-            // write replaced -- a fabricated file version, content-addressed and signed. Every Codex
-            // `Update File` whose hunk does not replay lands here, so this is the common path.
-            (None, FileMode::Wrote) => {
-                self.last_content.remove(&path);
-            }
-            // A read we could not establish -- a truncated `Read` -- changed nothing on disk, so
-            // what we already hold is still the file's content and still a valid base.
-            (None, FileMode::Read) => {}
-        }
+        Self::move_replay_base(&mut self.last_content, path.clone(), data, event.mode);
         self.by_content.insert(key, asset.clone());
         self.count(match event.mode {
             FileMode::Read => "FileRead",
             FileMode::Wrote => "FileWritten",
         });
         Ok(Some(asset))
+    }
+
+    /// What a later edit replays against, after observing `path`.
+    ///
+    /// One function because both call sites must agree: the deduplication path skipped the
+    /// contentless-write arm for as long as it was written out twice.
+    fn move_replay_base(
+        last_content: &mut HashMap<String, Vec<u8>>,
+        path: String,
+        data: Option<Vec<u8>>,
+        mode: FileMode,
+    ) {
+        match (data, mode) {
+            (Some(bytes), _) => {
+                last_content.insert(path, bytes);
+            }
+            // A write we could not reconstruct means what is on disk is no longer what we hold.
+            // Keeping the old bytes lets a later edit "recover" a version built from content that
+            // write replaced -- a fabricated file version, content-addressed and signed. Every Codex
+            // `Update File` whose hunk does not replay lands here, so this is the common path.
+            (None, FileMode::Wrote) => {
+                last_content.remove(&path);
+            }
+            // A read we could not establish -- a truncated `Read` -- changed nothing on disk, so
+            // what we already hold is still the file's content and still a valid base.
+            (None, FileMode::Read) => {}
+        }
     }
 
     /// Register a payload that is not a file: a prompt, a completion, a set of instructions.

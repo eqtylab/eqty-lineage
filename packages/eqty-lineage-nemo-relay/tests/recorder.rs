@@ -699,3 +699,73 @@ async fn a_payload_over_the_ceiling_still_reports_its_size() {
     assert_eq!(rec.stats().get("PayloadTooLarge"), Some(&1));
     assert_eq!(rec.stats().get("PayloadDenied"), None);
 }
+
+#[tokio::test]
+async fn a_contentless_write_moves_the_replay_base_even_when_its_node_already_exists() {
+    // The deduplication path used to return before the base was invalidated, and the second
+    // contentless observation of a path is what reaches it: both key on `unknown:{path}`.
+    //
+    // A truncated read seeds that key without disturbing the base -- correctly, since a read that
+    // failed changed nothing on disk -- so the write that follows deduplicates against it and used
+    // to leave the pre-write bytes in place for the next edit to replay against.
+    let mut rec = recorder();
+    rec.observe_file(&seen("/a.py", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+    rec.observe_file(&seen("/a.py", Some(b"x = 1\n"), FileMode::Read), true, None)
+        .await
+        .unwrap();
+    rec.observe_file(&seen("/a.py", None, FileMode::Wrote), true, None)
+        .await
+        .unwrap();
+
+    let mut edit = seen("/a.py", None, FileMode::Wrote);
+    edit.edit = Some(EditAttempt {
+        old: "x = 1".into(),
+        new: "x = 2".into(),
+        replace_all: false,
+        unique_only: false,
+        line_oriented: false,
+        replay_from: None,
+    });
+    rec.observe_file(&edit, true, None).await.unwrap();
+
+    assert_eq!(
+        rec.stats().get("ContentRecovered"),
+        None,
+        "an edit must not replay against bytes an earlier write already replaced: {:?}",
+        rec.stats()
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_read_still_leaves_the_replay_base_standing() {
+    // The guard on the test above: the fix must invalidate on writes, not on everything contentless.
+    // A read that established nothing changed nothing, so what the session already holds is still
+    // the file -- and replaying against it is the recovery this recorder exists to do.
+    let mut rec = recorder();
+    rec.observe_file(&seen("/a.py", Some(b"x = 1\n"), FileMode::Read), true, None)
+        .await
+        .unwrap();
+    rec.observe_file(&seen("/a.py", None, FileMode::Read), true, None)
+        .await
+        .unwrap();
+
+    let mut edit = seen("/a.py", None, FileMode::Wrote);
+    edit.edit = Some(EditAttempt {
+        old: "x = 1".into(),
+        new: "x = 2".into(),
+        replace_all: false,
+        unique_only: false,
+        line_oriented: false,
+        replay_from: None,
+    });
+    rec.observe_file(&edit, true, None).await.unwrap();
+
+    assert_eq!(
+        rec.stats().get("ContentRecovered"),
+        Some(&1),
+        "a truncated read must not discard a base that is still valid: {:?}",
+        rec.stats()
+    );
+}

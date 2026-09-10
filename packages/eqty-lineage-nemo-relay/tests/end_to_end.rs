@@ -2835,3 +2835,130 @@ fn agentless_but_busy(session: &str) -> Vec<Event> {
         ),
     ]
 }
+
+#[test]
+fn a_denied_path_is_withheld_from_a_failed_calls_arguments_too() {
+    // The deny list was reachable only through the observations a call produced, and a failed call
+    // produces none: the fallback that reads a path out of the arguments is gated on success so a
+    // `Write` returning `EACCES` is not recorded as a file written. That gate is right about file
+    // effects and was wrong about redaction -- the arguments of a failed `Write` hold exactly the
+    // bytes a successful one would have held.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-0000000009f1";
+    let root = "01a040aa-0000-0000-0000-0000000009f2";
+    let call = "01a040aa-0000-0000-0000-0000000009f3";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "Write",
+            "toolu_d1",
+            serde_json::json!({
+                "file_path": "/app/.env",
+                "content": "TOKEN=super-secret-value\n"
+            }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "Write",
+            "toolu_d1",
+            serde_json::json!("EACCES: permission denied, open '/app/.env'"),
+            Some("error"),
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    assert!(
+        !decoded_blobs(path).contains("super-secret-value"),
+        "a failed write must not store the content the deny list refused:\n{}",
+        decoded_blobs(path)
+    );
+}
+
+#[test]
+fn a_manifest_that_could_not_be_written_is_not_announced() {
+    // The mark is the one claim a consumer acts on without re-reading the file, so announcing one
+    // for a file holding different bytes is worse than announcing nothing.
+    //
+    // `path.exists()` cannot answer "did the write happen", and this is the case that proves it:
+    // checkpoints go to the very path the final manifest replaces, so once one has landed the file
+    // is there whether or not the final write succeeded. The old guard passed on the checkpoint's
+    // existence and announced the *final* manifest's CID over the checkpoint's bytes.
+    //
+    // Blocked with a directory rather than with permissions: `just linux-check` runs the suite as
+    // root, where a read-only directory does not fail at all. And blocked on the temporary file
+    // rather than the manifest, because a session picks an unclobbered name at startup and steps
+    // around anything already sitting on the manifest path.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-0000000009e1";
+    let manifest = into.path().join(format!("{session}.json"));
+
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let announced: Arc<Mutex<Vec<ManifestMark>>> = Arc::new(Mutex::new(Vec::new()));
+    let marks = Arc::clone(&announced);
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        Box::new(move |mark: &ManifestMark| {
+            marks.lock().expect("the marks lock").push(mark.clone())
+        }),
+    );
+
+    for event in &only_a_tool(session) {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            assert!(mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage));
+        }
+    }
+
+    // Wait for a checkpoint to land, so the manifest path is occupied before the export runs.
+    let mut waited = 0;
+    while !manifest.exists() && waited < 5_000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(
+        manifest.exists(),
+        "a checkpoint should have landed within {waited}ms, or this test proves nothing"
+    );
+    let checkpoint_bytes = std::fs::read(&manifest).expect("the checkpoint");
+
+    // Now make the final write fail, and only the final write.
+    std::fs::create_dir(into.path().join(format!("{session}.json.writing")))
+        .expect("a directory where the temporary file wants to go");
+
+    drop(mailbox);
+    let marks = Arc::into_inner(announced)
+        .expect("the mailbox thread has ended")
+        .into_inner()
+        .expect("the marks lock");
+
+    assert_eq!(
+        std::fs::read(&manifest).expect("the file is still there"),
+        checkpoint_bytes,
+        "the failed write must have left the checkpoint untouched"
+    );
+    assert!(
+        !marks.iter().any(|mark| mark.kind == ManifestKind::Full),
+        "a manifest that never landed must not be announced: {marks:#?}"
+    );
+}
