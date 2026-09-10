@@ -3203,9 +3203,13 @@ fn a_patch_that_moves_a_denied_file_is_withheld_by_its_source_path() {
 #[test]
 fn a_patch_that_moves_a_file_into_a_denied_path_is_withheld_by_its_destination() {
     // The mirror of the test above, and the half that pins `*** Move to:` itself. There the denied
-    // path was the source and the directive that names it is `*** Update File:`; here the file
-    // arrives *at* the denied path, so the destination is the only mention of it in the patch --
-    // and the body carries the content that ends up there.
+    // path is the source, which `*** Update File:` already names; here the file arrives *at* the
+    // denied path, so the destination is the patch's only mention of it.
+    //
+    // Rejected, deliberately. On the success path the observation walk emits its event at the
+    // destination, so `touched` holds it however `paths_in_patch` behaves and this would pass
+    // vacuously -- mutating `*** Move to:` away survived exactly that version of the test. A
+    // rejected call has no observations, which leaves the directive walk as the only source.
     let into = TempDir::new().expect("a temp dir");
     let session = "01a040aa-0000-0000-0000-0000000009fd";
     let root = "01a040aa-0000-0000-0000-0000000009fe";
@@ -3237,8 +3241,8 @@ fn a_patch_that_moves_a_file_into_a_denied_path_is_withheld_by_its_destination()
             "end",
             "apply_patch",
             "toolu_m2",
-            serde_json::json!("Success. Updated the following files:\nM /app/secrets.pem"),
-            None,
+            serde_json::json!("patch failed: could not apply"),
+            Some("error"),
         ),
     ];
     replay(&events, &into);
@@ -3247,6 +3251,58 @@ fn a_patch_that_moves_a_file_into_a_denied_path_is_withheld_by_its_destination()
     assert!(
         !decoded_blobs(path).contains("arriving-secret-value"),
         "a denied destination must reach the policy as surely as a denied source:\n{}",
+        decoded_blobs(path)
+    );
+}
+
+#[test]
+fn a_rejected_patch_that_deletes_a_denied_file_withholds_the_whole_body() {
+    // `*** Delete File:` carries no content of its own, so it protects nothing on its own account.
+    // What it does is make a rejected patch behave like the identical successful one: on the success
+    // path the observation walk already puts the deleted path in `touched`, and the payload -- the
+    // whole patch, including whatever *else* the patch carries -- inherits its policy. Leaving the
+    // directive out of the walk would restore the asymmetry one directive over.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000a01";
+    let root = "01a040aa-0000-0000-0000-000000000a02";
+    let call = "01a040aa-0000-0000-0000-000000000a03";
+
+    let patch = "*** Begin Patch\n*** Delete File: /app/old.pem\n*** Add File: /app/notes.md\n+rotated the key deleted-alongside-secret\n*** End Patch";
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "apply_patch",
+            "toolu_x1",
+            serde_json::json!({ "command": patch }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "apply_patch",
+            "toolu_x1",
+            serde_json::json!("patch failed: could not apply"),
+            Some("error"),
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    assert!(
+        !decoded_blobs(path).contains("deleted-alongside-secret"),
+        "a denied path anywhere in a rejected patch withholds the body that carries it:\n{}",
         decoded_blobs(path)
     );
 }
