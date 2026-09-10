@@ -104,10 +104,13 @@ jobs:
           skipPush: true
         continue-on-error: true
 
+      # A release builds its own tag. A dispatch builds the ref it was dispatched from: its
+      # `release_tag` input is a version label for the bundle names, and that tag does not exist
+      # yet -- checking it out would fail before anything worth rehearsing had run.
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.release_tag }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
 
       # The dev shell's toolchain, for the same reason CI uses it: the compiler that built the
       # tested artifact is the compiler that builds the released one.
@@ -221,6 +224,10 @@ jobs:
           echo "at least one target did not build (${{ needs.bundle.result }}) -- publishing nothing" >&2
           exit 1
 
+      - name: Say that a dispatch publishes nothing
+        if: github.event_name != 'release'
+        run: echo "::notice::dispatch: bundles are built, signed and verified, and attached to nothing"
+
       - name: Collect the bundles
         uses: actions/download-artifact@v4
         with:
@@ -237,7 +244,10 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           ls -la ./*.tar.gz
 
+      # Skipped on a dispatch, which makes one a real rehearsal: build, sign, verify and archive all
+      # run, and the only step that needs a release to exist is the only one that does not.
       - name: Attach to the release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
