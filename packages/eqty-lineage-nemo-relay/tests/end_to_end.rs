@@ -2962,3 +2962,57 @@ fn a_manifest_that_could_not_be_written_is_not_announced() {
         "a manifest that never landed must not be announced: {marks:#?}"
     );
 }
+
+#[test]
+fn a_failed_final_write_does_not_take_the_checkpoint_with_it() {
+    // The other half of gating on the write, and the more costly one. An agentless recording is
+    // renamed at export -- the checkpoints went to the session-shaped name before we knew it was a
+    // fragment -- so the old name is removed once the new one is written. Removing it *whether or
+    // not* the new one was written trades a stale but real recording for nothing at all, which is
+    // the outcome this recorder is least willing to have.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-0000000009e2";
+    let checkpoint = into.path().join(format!("{session}.json"));
+
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        ignore_marks(),
+    );
+
+    for event in &agentless_but_busy(session) {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            assert!(mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage));
+        }
+    }
+
+    let mut waited = 0;
+    while !checkpoint.exists() && waited < 5_000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(
+        checkpoint.exists(),
+        "a checkpoint should have landed within {waited}ms, or this test proves nothing"
+    );
+
+    // The export will resolve to `{session}.unattributed.json`; block only that write.
+    std::fs::create_dir(
+        into.path()
+            .join(format!("{session}.unattributed.json.writing")),
+    )
+    .expect("a directory where the temporary file wants to go");
+
+    drop(mailbox);
+
+    assert!(
+        checkpoint.exists(),
+        "the only surviving copy of the session must not be deleted for a write that failed"
+    );
+}
