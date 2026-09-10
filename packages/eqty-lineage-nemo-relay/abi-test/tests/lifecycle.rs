@@ -42,7 +42,6 @@ async fn the_built_cdylib_loads_and_registers_its_kind() {
 
     let config = config(json!({
         "manifest_dir": manifests.path().to_string_lossy(),
-        "triples": false,
     }));
 
     let (activation, report) = PluginHostActivation::activate(
