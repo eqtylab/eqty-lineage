@@ -9,9 +9,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
-    LineageSession, Mailbox, ManifestAnnounced, ManifestMark, Policy, SessionFinished,
-    SessionRouter, SignerFactory, classify,
+    LineageSession, Mailbox, ManifestAnnounced, ManifestKind, ManifestMark, Policy,
+    SessionFinished, SessionRouter, SignerFactory, classify,
 };
+use integrity::cid::blake3::blake3_cid_raw_binary;
+use integrity::lineage::models::manifest::Manifest;
+use integrity::lineage::models::statements::Statement;
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::Event;
 use tempfile::TempDir;
@@ -80,14 +83,40 @@ fn forget_with(router: &Arc<Mutex<SessionRouter>>) -> SessionFinished {
     })
 }
 
+/// The manifests a session wrote, excluding the session views beside them.
+///
+/// A directory listing is not a session count: an export writes `{id}.json` and, when there is
+/// anything to show, `{id}.view.json`. Globbing `*.json` doubles every count -- the same trap
+/// `{id}.unattributed.json` set for the harvester in `docs/live-session-script.md`.
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = fs::read_dir(dir.path())
-        .expect("the manifest directory exists")
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+    let mut found: Vec<PathBuf> = written_json(dir)
+        .into_iter()
+        .filter(|path| !is_view(path))
         .collect();
     found.sort();
     found
+}
+
+/// The session views a session wrote.
+fn views(dir: &TempDir) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = written_json(dir)
+        .into_iter()
+        .filter(|path| is_view(path))
+        .collect();
+    found.sort();
+    found
+}
+
+fn is_view(path: &std::path::Path) -> bool {
+    path.to_string_lossy().ends_with(".view.json")
+}
+
+fn written_json(dir: &TempDir) -> Vec<PathBuf> {
+    fs::read_dir(dir.path())
+        .expect("the manifest directory exists")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect()
 }
 
 fn fixture() -> Vec<Event> {
@@ -769,6 +798,44 @@ fn mark(session: &str, uuid: &str, parent: &str, name: &str, metadata: serde_jso
 
 /// A whole session: agent, prompt, a model call, a tool call that reads and writes, a subagent, and
 /// a compaction. Everything the plugin can currently record, in one run.
+/// A session that opens, runs one tool, and never calls a model.
+///
+/// The case a view must decline: with no conversation there is nothing to drop, so writing one would
+/// repeat the manifest under a second name.
+fn only_a_tool(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000c0";
+    let call = "01a040aa-0000-0000-0000-0000000000c1";
+    vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        claude_read(
+            session,
+            call,
+            root,
+            "start",
+            serde_json::json!({ "file_path": "/only.md" }),
+        ),
+        claude_read(
+            session,
+            call,
+            root,
+            "end",
+            serde_json::json!({
+                "type": "text",
+                "file": {
+                    "filePath": "/only.md", "content": "hi\n",
+                    "numLines": 1, "totalLines": 1, "startLine": 1
+                }
+            }),
+        ),
+    ]
+}
+
 fn full_session(session: &str) -> Vec<Event> {
     let root = "01a040aa-0000-0000-0000-0000000000c0";
     let turn = "01a040aa-0000-0000-0000-0000000000c1";
@@ -2361,4 +2428,220 @@ fn an_event_that_completes_nothing_writes_no_manifest() {
         decoded_blobs(&final_manifests[0]).contains("\"coverage\""),
         "the finished recording states its coverage"
     );
+}
+
+// ------------------------------------------------------- the session view
+
+#[test]
+fn the_session_view_is_written_beside_the_manifest_and_announced_as_itself() {
+    // Written at export rather than on demand, so a consumer never waits for a second pass or
+    // discovers one never ran -- and announced under its own mark name, because a mark's name is
+    // what a consumer filters on.
+    let into = TempDir::new().unwrap();
+    let marks = replay(&full_session("01a040aa-0000-0000-0000-000000000fc5"), &into);
+
+    let manifest = &manifests(&into)[0];
+    let view = &views(&into)[0];
+    assert_eq!(
+        view,
+        &manifest.with_extension("view.json"),
+        "the view sits beside the manifest it reduces"
+    );
+
+    let kinds: Vec<ManifestKind> = marks.iter().map(|mark| mark.kind).collect();
+    assert!(
+        kinds.contains(&ManifestKind::Full) && kinds.contains(&ManifestKind::SessionView),
+        "both documents are announced: {marks:#?}"
+    );
+    // Different mark *names*, not one name with a field: a mark's name is what a consumer filters
+    // on, so a consumer wanting the reduced document should not have to receive every announcement
+    // and read its data to find out which it got.
+    assert_ne!(
+        ManifestKind::Full.mark_name(),
+        ManifestKind::SessionView.mark_name(),
+        "two documents, two mark names"
+    );
+
+    let announced = marks
+        .iter()
+        .find(|mark| mark.kind == ManifestKind::SessionView)
+        .expect("a mark for the view");
+    assert_eq!(&announced.path, view);
+    assert_eq!(
+        announced.cid,
+        blake3_cid_raw_binary(&fs::read(view).unwrap()).unwrap(),
+        "the announced CID is over the view's own bytes, not the manifest's"
+    );
+}
+
+#[test]
+fn the_view_drops_the_conversation_and_keeps_what_happened() {
+    let into = TempDir::new().unwrap();
+    replay(&full_session("01a040aa-0000-0000-0000-000000000fc6"), &into);
+
+    let named = |path: &std::path::Path| -> Vec<(String, String)> {
+        blob_objects(path)
+            .into_iter()
+            .filter_map(|node| {
+                Some((
+                    node["assetType"].as_str()?.to_string(),
+                    node["name"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    };
+
+    let full = named(&manifests(&into)[0]);
+    let view = named(&views(&into)[0]);
+
+    for gone in [
+        ("Prompt", "prompt"),
+        ("Reasoning", "completion"),
+        ("System_Prompt", "system prompt"),
+    ] {
+        let gone = (gone.0.to_string(), gone.1.to_string());
+        assert!(full.contains(&gone), "the fixture produces {gone:?}");
+        assert!(!view.contains(&gone), "the view drops {gone:?}");
+    }
+
+    // The instruction is not the monologue, and it shares `Prompt` with the conversation -- which is
+    // why the rule is keyed on the name as well as the type.
+    //
+    // Asserted against the view's `DataRegistration`s rather than its surviving blobs: a kept tool
+    // call still names the instruction in its inputs, so the blob is retained either way and a
+    // blob-level check passes even when the node was dropped.
+    let registered = registered_nodes(&views(&into)[0]);
+    let instruction = blob_objects(&manifests(&into)[0])
+        .into_iter()
+        .find(|node| node["name"] == "user prompt")
+        .and_then(|node| node["content-cid"].as_str().map(str::to_string))
+        .expect("the fixture submits an instruction");
+    assert!(
+        registered.contains(&instruction),
+        "the human's instruction is still a node, not just a retained blob"
+    );
+    assert!(
+        view.iter().any(|(kind, _)| kind == "Tool"),
+        "and so do the tools that ran"
+    );
+}
+
+#[test]
+fn a_view_that_would_repeat_the_manifest_is_not_written() {
+    // A session with no model calls has no conversation to drop, so a view would be the manifest
+    // under a second name and a second mark: a document a reader must open to learn it says the
+    // same thing.
+    let into = TempDir::new().unwrap();
+    // A tool call and no model call: `only_a_tool` opens a session and runs one `Write`.
+    let marks = replay(&only_a_tool("01a040aa-0000-0000-0000-000000000fc7"), &into);
+
+    assert!(
+        views(&into).is_empty(),
+        "no conversation, no view: {:?}",
+        views(&into)
+    );
+    assert_eq!(marks.len(), 1, "and only the manifest is announced");
+    assert_eq!(marks[0].kind, ManifestKind::Full);
+}
+
+#[test]
+fn the_view_still_verifies_as_a_manifest() {
+    // The point of a subset rather than a re-recording: every kept statement carries its original
+    // CID and its original credential, so the view is an attestation and not a summary of one.
+    let into = TempDir::new().unwrap();
+    replay(&full_session("01a040aa-0000-0000-0000-000000000fc9"), &into);
+    let view = &views(&into)[0];
+
+    let parsed: Manifest = serde_json::from_slice(&fs::read(view).unwrap())
+        .expect("the view round-trips through Manifest");
+    assert!(
+        parsed
+            .statements
+            .values()
+            .any(|statement| matches!(statement, Statement::CredentialRegistration(_))),
+        "the credentials that sign it come along"
+    );
+
+    // Every CID a kept statement references resolves, in blobs or in contexts -- the §11 property
+    // that makes a manifest internally sound, asserted on the reduced one too.
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(view).unwrap()).unwrap();
+    let blobs = raw["blobs"].as_object().unwrap();
+    let contexts = raw["contexts"].as_object().unwrap();
+    let statements = raw["statements"].as_object().unwrap();
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    collect(&raw["statements"], &mut seen);
+    for cid in seen {
+        let bare = cid.trim_start_matches("urn:cid:").to_string();
+        let known = blobs.contains_key(&bare)
+            || contexts
+                .keys()
+                .any(|key| key.trim_start_matches("urn:cid:") == bare)
+            || statements
+                .keys()
+                .any(|key| key.trim_start_matches("urn:cid:") == bare);
+        if !known {
+            missing.push(bare);
+        }
+    }
+    assert!(missing.is_empty(), "unresolved references: {missing:?}");
+
+    // Stronger than "the CID resolves somewhere": an activity's inputs and outputs must be
+    // *registered* in the view. A blob can survive because some kept statement mentions its CID
+    // while the `DataRegistration` for it was dropped -- an edge to a node the document does not
+    // contain, which reads as a complete graph and is not one.
+    let registered = registered_nodes(view);
+    let mut unregistered: Vec<String> = Vec::new();
+    for statement in statements.values() {
+        if statement["@type"] != "ComputationRegistration" {
+            continue;
+        }
+        for field in ["input", "output"] {
+            let mut edges: Vec<String> = Vec::new();
+            collect(&statement[field], &mut edges);
+            for cid in edges {
+                let bare = cid.trim_start_matches("urn:cid:").to_string();
+                if !registered.contains(&bare) {
+                    unregistered.push(bare);
+                }
+            }
+        }
+    }
+    assert!(
+        unregistered.is_empty(),
+        "activities reference nodes the view did not register: {unregistered:?}"
+    );
+}
+
+/// The bare CIDs the view registers as data -- the nodes it actually contains.
+fn registered_nodes(path: &std::path::Path) -> std::collections::HashSet<String> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let mut found = std::collections::HashSet::new();
+    for statement in manifest["statements"].as_object().unwrap().values() {
+        if statement["@type"] != "DataRegistration" {
+            continue;
+        }
+        let mut cids: Vec<String> = Vec::new();
+        collect(&statement["data"], &mut cids);
+        for cid in cids {
+            found.insert(cid.trim_start_matches("urn:cid:").to_string());
+        }
+    }
+    found
+}
+
+/// Every CID-shaped string inside a JSON value.
+fn collect(value: &serde_json::Value, found: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text)
+            if text.starts_with("urn:cid:")
+                || text.starts_with("baf")
+                || text.starts_with("bag") =>
+        {
+            found.push(text.clone())
+        }
+        serde_json::Value::Object(fields) => fields.values().for_each(|v| collect(v, found)),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect(v, found)),
+        _ => {}
+    }
 }

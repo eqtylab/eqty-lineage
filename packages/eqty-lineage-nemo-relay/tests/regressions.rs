@@ -117,14 +117,23 @@ fn replay(events: &[Event], into: &TempDir) -> Vec<ManifestMark> {
         .expect("the marks lock")
 }
 
+/// The manifests a session wrote, excluding the session views beside them. A directory listing is
+/// not a session count -- see the note on the same helper in `end_to_end.rs`.
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = fs::read_dir(dir.path())
-        .expect("dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+    let mut found: Vec<PathBuf> = written_json(dir)
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().ends_with(".view.json"))
         .collect();
     found.sort();
     found
+}
+
+fn written_json(dir: &TempDir) -> Vec<PathBuf> {
+    fs::read_dir(dir.path())
+        .expect("dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect()
 }
 
 fn blobs_of(manifest: &serde_json::Value) -> Vec<(String, Vec<u8>)> {

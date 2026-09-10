@@ -286,13 +286,37 @@ pub type SignerFactory = Box<dyn Fn() -> Option<LineageSession> + Send>;
 /// capture -- so the map grows fastest in the process least able to afford it.
 pub type SessionFinished = Box<dyn Fn(&str) + Send>;
 
+/// Which of a session's two documents a mark is about.
+///
+/// A session writes the full manifest and, when there is anything to show, the session view beside
+/// it. They are announced under different mark names rather than one name with a field, because a
+/// mark's *name* is what a consumer filters on -- a consumer wanting the reduced document should not
+/// have to receive every announcement and read its data to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestKind {
+    /// Everything the session recorded.
+    Full,
+    /// The same graph without the model's conversation. See [`crate::view`].
+    SessionView,
+}
+
+impl ManifestKind {
+    pub fn mark_name(self) -> &'static str {
+        match self {
+            Self::Full => "eqty.manifest",
+            Self::SessionView => "eqty.manifest.view",
+        }
+    }
+}
+
 /// What a finished recording says about itself.
 ///
-/// The `cid` is over the manifest bytes as written, not over anything inside it: `Manifest` has no
+/// The `cid` is over the file's bytes as written, not over anything inside it: `Manifest` has no
 /// identity of its own, and the question a consumer asks is whether the file they fetched is the
 /// file that was announced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestMark {
+    pub kind: ManifestKind,
     pub cid: String,
     pub path: PathBuf,
     pub statements: usize,
@@ -1048,11 +1072,38 @@ fn export(
             && let Ok(cid) = blake3_cid_raw_binary(&json)
         {
             on_manifest(&ManifestMark {
+                kind: ManifestKind::Full,
                 cid,
-                path,
+                path: path.clone(),
                 statements: manifest.statements.len(),
                 unattributed,
             });
+        }
+
+        // Written beside the manifest and at the same time, so a consumer never has to wait for a
+        // second pass or discover that one never ran. Built from the serialized manifest rather than
+        // from recorder state, because the view has to be a subset of the *signed* document -- the
+        // statements it keeps carry their original CIDs and credentials.
+        //
+        // A failure here costs the view and not the manifest: the recording is already on disk, and
+        // an export that refused to finish because a reduction failed would trade the whole session
+        // for a convenience.
+        if let Ok(value) = serde_json::from_slice::<Json>(&json)
+            && let Some(view) = crate::view::session_view(&value)
+        {
+            let view_path = path.with_extension("view.json");
+            write_atomically(&view_path, &view.bytes);
+            if view_path.exists()
+                && let Ok(cid) = blake3_cid_raw_binary(&view.bytes)
+            {
+                on_manifest(&ManifestMark {
+                    kind: ManifestKind::SessionView,
+                    cid,
+                    path: view_path,
+                    statements: view.statements,
+                    unattributed,
+                });
+            }
         }
     }
 }
