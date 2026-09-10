@@ -226,7 +226,8 @@ jobs:
 
       - name: Say that a dispatch publishes nothing
         if: github.event_name != 'release'
-        run: echo "::notice::dispatch: bundles are built, signed and verified, and attached to nothing"
+        run: |
+          echo "::notice::dispatch — bundles are built, signed and verified, and attached to nothing"
 
       - name: Collect the bundles
         uses: actions/download-artifact@v4
