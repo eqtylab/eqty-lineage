@@ -258,6 +258,19 @@ nemo-relay-package target="" out="dist/relay-plugin":
 #
 # The registry and target caches are named volumes, so a re-run is minutes rather than a cold build.
 #
+# **One target volume per workspace, and the plugin's is mounted where the nested build looks for
+# it.** `abi-test` is a second workspace with its own lockfile, and cargo does not isolate workspaces
+# inside one target directory: sharing one made both resolve `darling` -- to different versions --
+# into the same `.fingerprint`, and whichever built second failed with `E0460` naming a crate neither
+# workspace mentions. Separate volumes make that unrepresentable rather than merely unlikely.
+#
+# The plugin's volume lands on `packages/eqty-lineage-nemo-relay/target` because `build_cdylib` in
+# `abi-test/tests/lifecycle.rs` passes exactly that path to `--target-dir`, deliberately: the flag
+# beats `CARGO_TARGET_DIR` so the nested build never waits on the lock its own parent holds. Mounting
+# the cache anywhere else left that path empty inside the container, so the nested build compiled
+# `integrity`, iroh and ssi from nothing on every run -- the cold rebuild `build_cdylib` documents
+# itself as avoiding.
+#
 # Run the Linux checks in Docker: test suite, packaging recipe, and ABI load test
 linux-check:
   #!/usr/bin/env bash
@@ -266,12 +279,13 @@ linux-check:
   trap 'rm -rf "$work"' EXIT
   git archive HEAD | tar x -C "$work"
   docker volume create eqty-cargo-registry >/dev/null
-  docker volume create eqty-cargo-target >/dev/null
+  docker volume create eqty-plugin-target >/dev/null
+  docker volume create eqty-abi-target >/dev/null
   docker run --rm \
     -v "$work:/work" \
     -v "$PWD/packages/eqty-lineage-nemo-relay/docs/linux-check.sh:/linux-check.sh:ro" \
     -v eqty-cargo-registry:/usr/local/cargo/registry \
-    -v eqty-cargo-target:/target \
-    -e CARGO_TARGET_DIR=/target \
+    -v eqty-plugin-target:/work/packages/eqty-lineage-nemo-relay/target \
+    -v eqty-abi-target:/target-abi \
     -e CARGO_TERM_COLOR=never \
     rust:1-bookworm bash /linux-check.sh

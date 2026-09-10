@@ -34,6 +34,12 @@ just --version
 
 cd /work
 
+# One target directory per workspace, each a named volume `just linux-check` mounts -- see the
+# recipe for why sharing one is not merely slow but wrong. The plugin's is mounted *at* the path
+# below, which is also the path `build_cdylib` hands to `--target-dir`, so the nested build inside
+# `abi-test` reuses what this suite just compiled instead of starting from nothing.
+export CARGO_TARGET_DIR=/work/packages/eqty-lineage-nemo-relay/target
+
 banner "plugin test suite"
 # Result lines are never truncated. An earlier version piped this through `tail`, which swallowed
 # the per-suite counts and left the total looking like a fraction of itself -- a measurement that
@@ -84,6 +90,7 @@ else
 fi
 
 banner "abi load test"
+export CARGO_TARGET_DIR=/target-abi
 cargo test --manifest-path packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml 2>&1 \
   | grep -E "^(test |test result|error)"
 abi_status=${PIPESTATUS[0]}
