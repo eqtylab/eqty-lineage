@@ -80,7 +80,17 @@ struct SessionState {
     /// The agent that ran the session.
     agent: Option<AssetRef>,
     /// The prompt that opened the current turn, and an input to everything it caused.
+    ///
+    /// Held for the whole turn rather than spent on the first model call, because the tool calls the
+    /// turn produces are downstream of it too -- and they are what survives a projection that drops
+    /// the conversation. Replaced when the next turn opens.
     turn_prompt: Option<AssetRef>,
+    /// Whether the turn's prompt has already been named as the cause of a model call.
+    ///
+    /// Separate from the prompt itself so the model-call rule is unchanged: the instruction is the
+    /// cause of the *first* call only. Repeating it would assert the user asked the same thing
+    /// several times when the later calls were caused by the tool results in between.
+    turn_prompt_attributed: bool,
     /// Subagents that have started and not yet finished, in the order they started.
     ///
     /// A list rather than one "active" slot, because a session can fan out: a live run delegated to
@@ -338,6 +348,7 @@ fn run(
                     open_calls: HashMap::new(),
                     agent: None,
                     turn_prompt: None,
+                    turn_prompt_attributed: false,
                     live_subagents: Vec::new(),
                 },
             );
@@ -426,6 +437,7 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 .await
             {
                 state.turn_prompt = Some(asset);
+                state.turn_prompt_attributed = false;
             }
         }
         LineageEvent::SubagentStarted { subagent_id, name } => {
@@ -617,10 +629,15 @@ async fn record_model_call(
     // one: repeating it on every subsequent call would assert that the user asked the same thing
     // several times, when the later calls were caused by the tool results in between.
     //
-    // Cloned rather than taken, because a call whose response never arrived is not recorded at all.
+    // Read rather than taken, because a call whose response never arrived is not recorded at all.
     // Taking it there would spend the prompt on an activity that was never written, orphaning the
-    // prompt node and leaving the next call in the turn with nothing to say what it was asked.
-    let caused_by = state.turn_prompt.clone();
+    // prompt node and leaving the next call in the turn with nothing to say what it was asked. The
+    // flag below is what makes "first only" hold; the prompt itself stays for the turn's tools.
+    let caused_by = if state.turn_prompt_attributed {
+        None
+    } else {
+        state.turn_prompt.clone()
+    };
 
     let describes = serde_json::json!({
         "computation_type": "model_call",
@@ -648,7 +665,7 @@ async fn record_model_call(
         .await;
 
     if matches!(recorded, Ok(true)) {
-        state.turn_prompt = None;
+        state.turn_prompt_attributed = true;
     }
 }
 
@@ -754,6 +771,19 @@ async fn record_tool(
 
     let mut inputs: Vec<AssetRef> = Vec::new();
     let mut outputs: Vec<AssetRef> = Vec::new();
+
+    // The instruction this call is serving. Every tool call in a turn takes it, which is a weaker
+    // claim than the one made three functions up for model calls and deliberately so: the prompt is
+    // in the conversation that produced *every* tool request in the turn, so "this ran in service of
+    // that instruction" is true of all of them, while "the user asked for this specifically" is not
+    // -- and is not what an input edge says.
+    //
+    // Without this edge the only path from a prompt to a file runs through the model call that
+    // requested the tool, so any view that drops the conversation leaves the instruction dangling
+    // and the file changes attributed to nothing a reader asked for.
+    if let Some(prompt) = &state.turn_prompt {
+        inputs.push(prompt.clone());
+    }
 
     // The tool that did the work is an input to it. Naming it as a node rather than as a label makes
     // "which runs used this tool" a question the graph answers, and it is the shape the LangChain

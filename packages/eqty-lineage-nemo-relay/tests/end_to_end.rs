@@ -977,6 +977,50 @@ fn dump_a_full_manifest() {
     fs::copy(&manifests(&into)[0], "/tmp/relay-manifest.json").expect("copied");
 }
 
+/// Every computation's `computation_type` paired with its input CIDs.
+///
+/// The prompt rule differs by kind -- one model call, every tool call -- so a test that only counted
+/// inputs could not tell the two apart, and the count alone would pass for the wrong reason.
+fn computations_by_type(path: &std::path::Path) -> Vec<(String, Vec<String>)> {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let statements = manifest["statements"].as_object().expect("statements");
+
+    // `computation_type` lives on a metadata blob whose `subject` is the computation statement, so
+    // the type is reached through that indirection rather than read off the statement.
+    let decode = |metadata: &str| -> Option<String> {
+        use base64::Engine as _;
+        let bare = metadata.trim_start_matches("urn:cid:");
+        let blob = manifest["blobs"][bare].as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(blob)
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value["computation_type"].as_str().map(str::to_string)
+    };
+
+    statements
+        .iter()
+        .filter(|(_, statement)| statement["@type"] == "ComputationRegistration")
+        .map(|(cid, statement)| {
+            let kind = statements
+                .values()
+                .filter(|s| s["@type"] == "MetadataRegistration" && s["subject"] == cid.as_str())
+                .filter_map(|s| s["metadata"].as_str())
+                .find_map(decode)
+                .unwrap_or_default();
+            let inputs = match &statement["input"] {
+                serde_json::Value::String(one) => vec![one.clone()],
+                serde_json::Value::Array(many) => many
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            (kind, inputs)
+        })
+        .collect()
+}
+
 /// Pull the input CIDs of every computation in a manifest.
 fn computation_inputs(path: &std::path::Path) -> Vec<Vec<String>> {
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
@@ -1047,6 +1091,38 @@ fn the_tool_is_an_input_to_the_run_it_performed() {
 }
 
 /// A session that calls the same tool twice and makes two model calls.
+/// Two turns, each opening with its own instruction and making one model call.
+///
+/// `repeated_work` has one instruction and several calls, which pins "the first call only" but says
+/// nothing about the *next* turn -- so a change that never reset the per-turn flag left every later
+/// turn's call with no cause and no test noticed.
+fn two_turns(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000f0";
+    let mut events = Vec::new();
+    for (index, ask) in [(1u8, "first instruction"), (2u8, "second instruction")] {
+        let turn = format!("01a040aa-0000-0000-0000-0000000000f{index}");
+        events.push(turn_scope(session, &turn, root, "start"));
+
+        let mut prompt = turn_scope(session, &turn, root, "start");
+        let mut json = prompt.to_json_value();
+        json["data"] = serde_json::json!({ "prompt": ask });
+        json["metadata"]["nemo_relay_scope_role"] = serde_json::json!("turn");
+        prompt = serde_json::from_value(json).unwrap();
+        events.push(prompt);
+
+        let call = format!("01a040aa-0000-0000-0000-0000000000a{index}");
+        events.push(llm_scope("anthropic.messages", &call, &turn, "start", serde_json::json!({
+            "model_name": "opus",
+            "annotated_request": { "model": "opus", "messages": [{ "role": "user", "content": ask }] }
+        })));
+        events.push(llm_scope("anthropic.messages", &call, &turn, "end", serde_json::json!({
+            "model_name": "opus",
+            "annotated_response": { "model": "opus", "message": ask, "finish_reason": "complete" }
+        })));
+    }
+    events
+}
+
 fn repeated_work(session: &str) -> Vec<Event> {
     let root = "01a040aa-0000-0000-0000-0000000000d0";
     let turn = "01a040aa-0000-0000-0000-0000000000d1";
@@ -1128,15 +1204,78 @@ fn the_user_prompt_feeds_the_call_it_caused_and_not_the_later_ones() {
 
     let path = &manifests(&into)[0];
     let prompt = format!("urn:cid:{}", cid_for_named(path, "user prompt"));
-    let feeding = computation_inputs(path)
-        .iter()
-        .filter(|inputs| inputs.contains(&prompt))
-        .count();
+    let computations = computations_by_type(path);
 
-    assert_eq!(
-        feeding, 1,
-        "the turn's prompt should be an input exactly once"
+    let model_calls: Vec<_> = computations
+        .iter()
+        .filter(|(kind, _)| kind == "model_call")
+        .collect();
+    let fed_model_calls = model_calls
+        .iter()
+        .filter(|(_, inputs)| inputs.contains(&prompt))
+        .count();
+    assert!(
+        model_calls.len() > 1,
+        "this fixture needs several model calls to be worth asserting on"
     );
+    assert_eq!(
+        fed_model_calls, 1,
+        "the instruction caused the first call and not the later ones"
+    );
+
+    // Every tool call in the turn takes it, which is what keeps a prompt joined to the files it led
+    // to once a view drops the conversation. A weaker claim than the model-call one on purpose: the
+    // prompt is in the conversation behind every tool request in the turn.
+    let tool_calls: Vec<_> = computations
+        .iter()
+        .filter(|(kind, _)| kind == "tool_call")
+        .collect();
+    assert!(!tool_calls.is_empty(), "the fixture runs tools");
+    assert!(
+        tool_calls
+            .iter()
+            .all(|(_, inputs)| inputs.contains(&prompt)),
+        "every tool call in the turn serves the instruction: {tool_calls:#?}"
+    );
+}
+
+#[test]
+fn each_turn_is_caused_by_its_own_instruction() {
+    // Every turn's first model call must name *that* turn's instruction. A per-turn flag that is set
+    // and never reset gives the first turn a cause and leaves every later one with none -- which is
+    // invisible in a one-turn fixture and survived a mutation until this existed.
+    let into = TempDir::new().expect("a temp dir");
+    replay(&two_turns("01a040aa-0000-0000-0000-0000000000f9"), &into);
+    let path = &manifests(&into)[0];
+
+    let prompts: Vec<String> = blob_objects(path)
+        .into_iter()
+        .filter(|object| object["name"] == "user prompt")
+        .filter_map(|object| {
+            object["content-cid"]
+                .as_str()
+                .map(|c| format!("urn:cid:{c}"))
+        })
+        .collect();
+    assert_eq!(prompts.len(), 2, "two turns, two instructions: {prompts:?}");
+
+    let model_calls: Vec<Vec<String>> = computations_by_type(path)
+        .into_iter()
+        .filter(|(kind, _)| kind == "model_call")
+        .map(|(_, inputs)| inputs)
+        .collect();
+    assert_eq!(model_calls.len(), 2, "one call per turn");
+
+    for prompt in &prompts {
+        assert_eq!(
+            model_calls
+                .iter()
+                .filter(|inputs| inputs.contains(prompt))
+                .count(),
+            1,
+            "each instruction causes exactly one call: {prompt}"
+        );
+    }
 }
 
 #[test]
