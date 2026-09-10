@@ -264,8 +264,13 @@ def leaked(paths, needle=b'do-not-record-me'):
                 pass
     return None
 
-p = sorted(glob.glob('/tmp/relay-live/.eqty/manifests/*.json'))
-print('manifests:', len(p), '-- more than one means a session was split')
+# An export writes the manifest and, when there is a conversation to drop, `{id}.view.json` beside
+# it -- so a directory listing is not a session count. And `.json` sorts *before* `.view.json`, so
+# `p[-1]` from an unfiltered glob grades the reduced document. [R]
+written = sorted(glob.glob('/tmp/relay-live/.eqty/manifests/*.json'))
+p = [q for q in written if not q.endswith('.view.json')]
+print(f'manifests: {len(p)} ({len(written) - len(p)} session views beside them)'
+      ' -- more than one manifest means a session was split')
 m = json.load(open(p[-1])); B = m['blobs']
 def blob(c):
     raw = B.get(c.replace('urn:cid:','')) or B.get(c)
@@ -293,7 +298,7 @@ print('agents    ', sorted(agents))
 print('assets    ', dict(assets))
 print('coverage  ', cov)
 print('withheld  ', redacted)
-print('secret leaked:', leaked(p) or False)          # every manifest, not just the graded one
+print('secret leaked:', leaked(written) or False)     # every file, not just the graded one
 required = [
     ('FileRead',        'a file was read into the graph at all'),
     ('FileWritten',     'a file version was written'),
@@ -476,7 +481,9 @@ inverts from expected-absent to required.
 **Expect one more manifest than you ran sessions.** Codex issues an ancillary model call to title the
 conversation, through a different provider and under a session id of its own. It registers no agent,
 so it is not a session anyone ran, and it exports as `{id}.unattributed.json` — 20 statements whose
-whole completion is `{"title":"…"}`. One interactive run therefore leaves two files. **Grade the
+whole completion is `{"title":"…"}`. It gets no session view -- a view drops model calls, and a
+fragment whose entire content *is* one would be left with no activities at all -- so an interactive
+run leaves three files: the manifest, its view, and the fragment. **Grade the
 session file and skip the fragment**, which is what the filter below does: `.unattributed.json` sorts
 *after* the session file, so selecting `p[-1]` from an unfiltered glob grades the title call and
 reports `ContentUnknown`, `ContentRecovered` and `Document nodes` all missing on a healthy run [R].
@@ -508,10 +515,15 @@ def leaked(paths, needle=b'do-not-record-me'):
     return None
 
 everything = sorted(glob.glob('/tmp/relay-codex/.eqty/manifests/*.json'))
-# A `.unattributed.json` fragment is Codex's conversation-titling call: a model call with no agent,
-# under a session id of its own. It is not a session anyone ran, so it is not what to grade.
-p = [q for q in everything if not q.endswith('.unattributed.json')]
-print(f'manifests: {len(everything)} -- {len(p)} session, {len(everything)-len(p)} title fragment')
+# Two kinds of file are not the session's manifest. A `.unattributed.json` fragment is Codex's
+# conversation-titling call -- a model call with no agent, under a session id of its own -- so it is
+# not a session anyone ran. A `.view.json` is the same graph without the conversation. Both sort in
+# ways that put them last, so an unfiltered `p[-1]` grades one of them. [R]
+p = [q for q in everything
+     if not q.endswith('.unattributed.json') and not q.endswith('.view.json')]
+views = [q for q in everything if q.endswith('.view.json')]
+print(f'files: {len(everything)} -- {len(p)} session, {len(views)} view, '
+      f'{len(everything)-len(p)-len(views)} title fragment')
 print('grading   ->', p[-1].split('/')[-1])
 m = json.load(open(p[-1])); B = m['blobs']
 def blob(c):
