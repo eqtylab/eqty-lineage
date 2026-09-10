@@ -262,13 +262,69 @@ shasum -a 256 target/release/libeqty_lineage_nemo_relay.dylib
 ```
 
 The digest goes in `relay-plugin.toml` under `[integrity] sha256`, which Relay verifies against the
-library before loading it regardless of attestation policy. Release CI generates it; a stale digest
-is an install Relay refuses, and that should be caught before release rather than by a user.
+library before loading it regardless of attestation policy. `just nemo-relay-package` stamps it, and
+`release-relay-plugin.yml` re-checks it against the artifact before attaching anything to a release
+— a stale digest is an install Relay refuses, and that should be caught before release rather than
+by a user.
+
+`just nemo-relay-package [target] [out]` takes an optional target triple and staging directory, which
+is how one release builds four bundles. Release CI ships:
+
+| target | notes |
+| --- | --- |
+| `aarch64-apple-darwin` | |
+| `x86_64-unknown-linux-gnu` | |
+| `aarch64-unknown-linux-gnu` | built on a native arm64 runner; `aws-lc-sys` and `ring` compile C, so cross-compiling needs a target C toolchain too |
+| `x86_64-unknown-linux-musl` | needs `RUSTFLAGS=-C target-feature=-crt-static`, or rustc drops the cdylib crate type and cargo exits 0 having built no library at all |
+
+Intel macOS and Windows are not shipped. Windows would need a toolchain path that is not `nix
+develop`, and neither has ever been built here.
 
 Note that `[integrity] sha256` is **NVIDIA's** artifact digest and has nothing to do with the EQTY
 `integrity` crate this plugin links. The collision is unfortunate; do not conflate them.
 
-## Installing into Relay
+## Installing a release
+
+Download the bundle for your platform from the repository's releases and register it. Each bundle
+holds the library, its signature, `config.schema.json`, and a `relay-plugin.toml` whose
+`[integrity] sha256` is already stamped for that artifact.
+
+```bash
+tar xzf eqty-lineage-nemo-relay-<version>-<target>.tar.gz
+nemo-relay plugins validate ./eqty-lineage-nemo-relay-<version>-<target>/relay-plugin.toml
+nemo-relay plugins add --user ./eqty-lineage-nemo-relay-<version>-<target>/relay-plugin.toml
+nemo-relay plugins enable eqty.lineage
+```
+
+Then pin EQTY's release key in `~/.config/nemo-relay/plugins.toml`, beside the
+`[[plugins.dynamic]]` entry that `plugins add` wrote:
+
+```toml
+[plugins.policy.overrides."eqty.lineage"]
+attestation = "signature_required"
+trusted_public_keys = ["ed25519:EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4="]
+```
+
+**Pinning this key is the point, and it is not the same as leaving the default alone.** Relay
+hardens `attestation` to `signature_required` on every activation path whether you ask it to or not,
+so an unsigned plugin will not start regardless. What the block above adds is *which* key counts:
+without `trusted_public_keys` the host trusts whatever key the local install happens to hold, and
+with it, a bundle only loads if EQTY signed it. Verify the value against the release notes rather
+than against this file if you cloned the repository from somewhere you do not control.
+
+You can check a bundle before trusting it — the signature is a raw Ed25519 signature over the
+library bytes, base64-encoded:
+
+```bash
+cd eqty-lineage-nemo-relay-<version>-<target>
+shasum -a 256 libeqty_lineage_nemo_relay.dylib     # must match [integrity] sha256
+python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(open('libeqty_lineage_nemo_relay.dylib.sig').read()))" > sig.raw
+python3 -c "import base64,sys; sys.stdout.buffer.write(bytes.fromhex('302a300506032b6570032100')+base64.b64decode('EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4='))" > key.der
+openssl pkey -pubin -inform DER -in key.der -out key.pem
+openssl pkeyutl -verify -rawin -pubin -inkey key.pem -in libeqty_lineage_nemo_relay.dylib -sigfile sig.raw
+```
+
+## Building and installing from source
 
 ```bash
 just nemo-relay-package                                            # stage dist/relay-plugin

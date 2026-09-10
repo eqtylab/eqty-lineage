@@ -20,11 +20,11 @@ build-python:
 # Kept out of PR CI: it recompiles the whole dependency tree at a profile nothing else on the PR path
 # uses, measured at 107s and still climbing when that step was cancelled.
 #
-# Which leaves the release profile exercised only by `just nemo-relay-package` and `just
-# linux-check`, both run by hand. `release.yml` does NOT cover it -- that workflow resolves a
-# `PACKAGE@X.Y.Z` tag to a `pyproject.toml`, and this package has none, so it cannot release the
-# cdylib at all. Closing that is its own piece of work; until then a release build is a manual
-# gate, and this comment is the record of that rather than an assumption someone inherits.
+# Which leaves the release profile exercised on the PR path by nothing. `release-relay-plugin.yml`
+# now builds it for every shipped target on a release, so it is covered at the point it matters --
+# but not before, so a release is still the first time a release build runs for a given commit.
+# `release.yml` cannot do this: it resolves a `PACKAGE@X.Y.Z` tag to a `pyproject.toml` and this
+# package has none, which is why the plugin has a workflow of its own rather than a job in that one.
 #
 # Build the Relay cdylib in release
 build-relay:
@@ -164,7 +164,7 @@ lint-rust-plugin-abi:
 #
 # Override the key with RELAY_SIGNING_KEY=/path/to/ed25519.pem. A dev key is generated on first use;
 # release CI should pass EQTY's real key instead.
-nemo-relay-package:
+nemo-relay-package target="" out="dist/relay-plugin":
   #!/usr/bin/env bash
   set -euo pipefail
   key="${RELAY_SIGNING_KEY:-$HOME/.config/eqty-lineage/relay-dev-signing-key.pem}"
@@ -179,8 +179,13 @@ nemo-relay-package:
   # a stale artifact from an earlier build and packaged it with a digest computed over the same
   # stale bytes, so the check passed while verifying nothing.
   root="$PWD"
+  out="{{out}}"
+  export TARGET_TRIPLE="{{target}}"
   cd packages/eqty-lineage-nemo-relay
+  # `--target` moves the artifact under `target/<triple>/release`, which is exactly why the path is
+  # read from cargo's own output rather than assembled here.
   artifact=$(cargo build --release --lib --message-format=json-render-diagnostics \
+    ${TARGET_TRIPLE:+--target "$TARGET_TRIPLE"} \
     | python3 -c '
   import json, sys
   for line in sys.stdin:
@@ -202,11 +207,11 @@ nemo-relay-package:
     exit 1
   fi
   lib=$(basename "$artifact")
-  rm -rf dist/relay-plugin && mkdir -p dist/relay-plugin
-  cp "$artifact" dist/relay-plugin/
-  cp packages/eqty-lineage-nemo-relay/config.schema.json dist/relay-plugin/
-  cp packages/eqty-lineage-nemo-relay/relay-plugin.toml dist/relay-plugin/
-  cd dist/relay-plugin
+  rm -rf "$out" && mkdir -p "$out"
+  cp "$artifact" "$out/"
+  cp packages/eqty-lineage-nemo-relay/config.schema.json "$out/"
+  cp packages/eqty-lineage-nemo-relay/relay-plugin.toml "$out/"
+  cd "$out"
   # `shasum` is not everywhere; `sha256sum` is the GNU coreutils spelling.
   if command -v shasum >/dev/null 2>&1; then
     digest=$(shasum -a 256 "$lib" | awk '{print $1}')
@@ -232,7 +237,7 @@ nemo-relay-package:
                     f'sha256 = "sha256:{digest}"\nsignature = "{signature}"')
   open(p, "w").write(s)
   EOF
-  echo "staged dist/relay-plugin  sha256:$digest"
+  echo "staged $out  sha256:$digest"
   echo
   echo "Add this to the [plugins.policy] block of your plugins.toml, or activation will refuse:"
   echo
@@ -240,7 +245,7 @@ nemo-relay-package:
   echo "  attestation = \"signature_required\""
   echo "  trusted_public_keys = [\"$pub\"]"
   echo
-  echo "then: nemo-relay plugins add --user ./dist/relay-plugin/relay-plugin.toml"
+  echo "then: nemo-relay plugins add --user ./$out/relay-plugin.toml"
 
 # Development here is on macOS, and three things are only knowable on Linux -- the cdylib's name,
 # the digest over it, and whether the staged `.so` actually loads. `just nemo-relay-package` was
