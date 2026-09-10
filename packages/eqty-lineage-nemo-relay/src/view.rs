@@ -16,11 +16,10 @@
 //! document that looks like an attestation and asserts nothing. Excluding the monologue instead
 //! leaves every session with a true record -- small when the session did little, never empty.
 //!
-//! The reduction is also a disclosure boundary. A live session's full manifest carried a secret in
-//! its `prompt` and `completion` blobs while the file node and the tool payloads were correctly
-//! withheld; the view does not carry it, because it keeps neither. That is a *scope* boundary and
-//! not a redaction mechanism -- the view keeps a kept activity's tool result, so content the gate
-//! failed to withhold there would still be in it.
+//! **A reduction, never a boundary.** It is tempting to read a smaller document as a safer one, and
+//! this is not that: the view keeps a kept activity's tool result, and on Codex every read is a
+//! shell command, so a read's content is in a tool result the view keeps. It reduces what a reader
+//! has to wade through. It does not decide what anyone is allowed to see.
 
 use std::collections::{HashMap, HashSet};
 
