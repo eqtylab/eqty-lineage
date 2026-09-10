@@ -77,8 +77,15 @@ pub enum LineageEvent {
         agent: Option<String>,
         model: Option<String>,
     },
-    /// A user turn opened with a prompt.
-    PromptSubmitted { text: String },
+    /// A turn opened with a prompt.
+    ///
+    /// `source` is Relay's `turn_source`: `user_prompt` when a person typed it, and something else
+    /// when the host opened the turn itself. Not every turn is a human speaking, and the difference
+    /// is an authorship claim the manifest should not invent.
+    PromptSubmitted {
+        text: String,
+        source: Option<String>,
+    },
     /// A model call began, carrying the request that opened it.
     ///
     /// Split from the end for the same reason a tool call is: the request is known at the start and
@@ -231,7 +238,18 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
         // the scope name, which differs per agent (`codex-turn` against `claude-code-turn`).
         ("custom", false) if string_at(metadata, "nemo_relay_scope_role") == Some("turn") => {
             let text = string_at(event.data(), "prompt")?.to_string();
-            Some(LineageEvent::PromptSubmitted { text })
+            // Relay states where the turn came from, and until now this arm discarded it. A turn is
+            // not always a person typing: Claude Code opens one to deliver a background task's
+            // completion, and Codex opens one for an agent it spawned, carrying the instruction the
+            // *model* composed. Both were recorded as `role: user` -- a claim about authorship that
+            // the recorder was in no position to make and that Relay had already answered.
+            //
+            // Carried rather than interpreted. The vocabulary of this field is not yet known beyond
+            // `user_prompt`, and a rule keyed on values guessed from one capture would be the same
+            // mistake in the other direction. Recording it puts the basis in the manifest, where a
+            // live run on either host reports what the host actually sends.
+            let source = string_at(metadata, "turn_source").map(str::to_string);
+            Some(LineageEvent::PromptSubmitted { text, source })
         }
 
         // An `agent` scope is either the session itself or a subagent inside it, and `parent_uuid`

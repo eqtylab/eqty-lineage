@@ -455,7 +455,7 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 state.agent = Some(asset);
             }
         }
-        LineageEvent::PromptSubmitted { text } => {
+        LineageEvent::PromptSubmitted { text, source } => {
             // The turn's instruction. Everything the agent does afterwards is downstream of it, so
             // it becomes the input the turn's activities hang from -- without it a manifest attests
             // what an agent did and not what it was asked to do.
@@ -466,7 +466,10 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                     "user prompt",
                     "The instruction that opened this turn.",
                     text.as_bytes(),
-                    serde_json::json!({ "role": "user" }),
+                    // `turnSource` is what Relay said; `role` is still `user` because changing it
+                    // needs the vocabulary a live run will report, and asserting a new label from a
+                    // single observed value would be inventing the answer rather than reading it.
+                    serde_json::json!({ "role": "user", "turnSource": source }),
                     at,
                 )
                 .await
