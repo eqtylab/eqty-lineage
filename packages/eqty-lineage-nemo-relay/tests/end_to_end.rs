@@ -3199,3 +3199,54 @@ fn a_patch_that_moves_a_denied_file_is_withheld_by_its_source_path() {
         decoded_blobs(path)
     );
 }
+
+#[test]
+fn a_patch_that_moves_a_file_into_a_denied_path_is_withheld_by_its_destination() {
+    // The mirror of the test above, and the half that pins `*** Move to:` itself. There the denied
+    // path was the source and the directive that names it is `*** Update File:`; here the file
+    // arrives *at* the denied path, so the destination is the only mention of it in the patch --
+    // and the body carries the content that ends up there.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-0000000009fd";
+    let root = "01a040aa-0000-0000-0000-0000000009fe";
+    let call = "01a040aa-0000-0000-0000-0000000009ff";
+
+    let patch = "*** Begin Patch\n*** Update File: /app/notes.txt\n*** Move to: /app/secrets.pem\n@@\n-placeholder\n+BEGIN KEY arriving-secret-value\n*** End Patch";
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "apply_patch",
+            "toolu_m2",
+            serde_json::json!({ "command": patch }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "apply_patch",
+            "toolu_m2",
+            serde_json::json!("Success. Updated the following files:\nM /app/secrets.pem"),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    assert!(
+        !decoded_blobs(path).contains("arriving-secret-value"),
+        "a denied destination must reach the policy as surely as a denied source:\n{}",
+        decoded_blobs(path)
+    );
+}
