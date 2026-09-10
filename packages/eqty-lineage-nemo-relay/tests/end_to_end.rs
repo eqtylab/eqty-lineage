@@ -1036,12 +1036,30 @@ fn an_edit_links_the_version_read_to_the_version_written() {
     );
 }
 
+/// Write both hosts' documents to `/tmp` for inspection by hand.
+///
+/// Both hosts, because the question "does this also work on Codex?" has been asked of every graph
+/// change so far and the answer is never obvious from the code: the recorder is host-agnostic, but
+/// what a host *emits* is not. Claude Code comes from a synthetic session, Codex from the committed
+/// capture, and each writes its manifest and -- when there is a conversation to drop -- its view.
+///
+///     cargo test --test end_to_end dump_a_full_manifest -- --ignored
 #[test]
-#[ignore = "diagnostic: writes a manifest to /tmp for inspection"]
+#[ignore = "diagnostic: writes manifests to /tmp for inspection"]
 fn dump_a_full_manifest() {
     let into = TempDir::new().expect("a temp dir");
     replay(&full_session("01a040aa-0000-0000-0000-000000000099"), &into);
     fs::copy(&manifests(&into)[0], "/tmp/relay-manifest.json").expect("copied");
+    if let Some(view) = views(&into).first() {
+        fs::copy(view, "/tmp/relay-view.json").expect("copied");
+    }
+
+    let codex = TempDir::new().expect("a temp dir");
+    replay(&fixture(), &codex);
+    fs::copy(&manifests(&codex)[0], "/tmp/codex-manifest.json").expect("copied");
+    if let Some(view) = views(&codex).first() {
+        fs::copy(view, "/tmp/codex-view.json").expect("copied");
+    }
 }
 
 /// Every computation's `computation_type` paired with its input CIDs.
