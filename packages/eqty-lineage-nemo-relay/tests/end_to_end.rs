@@ -3016,3 +3016,113 @@ fn a_failed_final_write_does_not_take_the_checkpoint_with_it() {
         "the only surviving copy of the session must not be deleted for a write that failed"
     );
 }
+
+#[test]
+fn a_denied_path_inside_a_rejected_patch_is_withheld_too() {
+    // The sibling of the `Write` case, and the one a path-key lookup cannot reach: Codex edits
+    // through a patch document handed to the shell, so the file it touches is named nowhere except
+    // inside the patch body -- alongside the content itself. Skipping the parse for a rejected call
+    // is right for observations and wrong for policy, which is the same asymmetry once removed.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-0000000009f5";
+    let root = "01a040aa-0000-0000-0000-0000000009f6";
+    let call = "01a040aa-0000-0000-0000-0000000009f7";
+
+    let patch =
+        "*** Begin Patch\n*** Add File: /app/.env\n+TOKEN=patched-secret-value\n*** End Patch";
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "apply_patch",
+            "toolu_p1",
+            serde_json::json!({ "command": patch }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "apply_patch",
+            "toolu_p1",
+            serde_json::json!("patch failed: could not apply"),
+            Some("error"),
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    assert!(
+        !decoded_blobs(path).contains("patched-secret-value"),
+        "a rejected patch must not store the content the deny list refused:\n{}",
+        decoded_blobs(path)
+    );
+}
+
+#[test]
+fn no_view_is_announced_for_a_manifest_that_could_not_be_written() {
+    // The view is defined as a subset of the signed manifest, so publishing one when the manifest
+    // did not land announces a reduction of a document nobody has -- and with no manifest mark
+    // beside it, nothing on the stream says so. `full_session` is used because it holds a
+    // conversation to drop; the tool-only fixture produces no view at all and would pass vacuously.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-0000000009e3";
+    let manifest = into.path().join(format!("{session}.json"));
+
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let announced: Arc<Mutex<Vec<ManifestMark>>> = Arc::new(Mutex::new(Vec::new()));
+    let marks = Arc::clone(&announced);
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        Box::new(move |mark: &ManifestMark| {
+            marks.lock().expect("the marks lock").push(mark.clone())
+        }),
+    );
+
+    for event in &full_session(session) {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            assert!(mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage));
+        }
+    }
+
+    let mut waited = 0;
+    while !manifest.exists() && waited < 5_000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        waited += 10;
+    }
+    assert!(manifest.exists(), "a checkpoint should have landed");
+    std::fs::create_dir(into.path().join(format!("{session}.json.writing")))
+        .expect("a directory where the temporary file wants to go");
+
+    drop(mailbox);
+    let marks = Arc::into_inner(announced)
+        .expect("the mailbox thread has ended")
+        .into_inner()
+        .expect("the marks lock");
+
+    assert!(
+        marks.is_empty(),
+        "neither document landed, so neither may be announced: {marks:#?}"
+    );
+    assert!(
+        views(&into).is_empty(),
+        "and no view may be written beside a manifest that is not there: {:?}",
+        views(&into)
+    );
+}

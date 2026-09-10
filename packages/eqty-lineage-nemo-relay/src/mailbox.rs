@@ -109,8 +109,17 @@ struct SessionState {
     /// it per write would either clobber an unrelated session's manifest or, with the
     /// never-overwrite rule, spray a numbered file per turn.
     path: PathBuf,
-    /// Statement count at the last write, so an event that changed nothing writes nothing.
-    written_at: usize,
+    /// Statement count at the last checkpoint *attempt*, so an event that changed nothing writes
+    /// nothing -- and so a directory that cannot be written to is retried on the same widening
+    /// interval as a successful one rather than on every event.
+    ///
+    /// Attempts, not successes, and the distinction is load-bearing. Holding it back on failure
+    /// looks like the more careful choice and is the opposite: the interval below is skipped
+    /// entirely until the first write lands, so an unwritable `manifest_dir` would re-snapshot and
+    /// re-serialize the whole growing manifest once per tool call, on the one thread draining the
+    /// event queue, until events overflow it and are dropped. A recording that cannot be written is
+    /// already lost; spending the session's throughput rediscovering that loses the rest with it.
+    attempted_at: usize,
 }
 
 impl SessionState {
@@ -366,7 +375,7 @@ fn run(
                 session_id.clone(),
                 SessionState {
                     path: manifest_path(&manifest_dir, &session_id),
-                    written_at: 0,
+                    attempted_at: 0,
                     recorder: Recorder::new(lineage, policy.clone()),
                     open_tools: HashMap::new(),
                     open_calls: HashMap::new(),
@@ -567,19 +576,55 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
     false
 }
 
-/// Recover a path from a tool's arguments when its result carried none.
+/// The patch document a call carries in its arguments, if it carries one.
+///
+/// Codex edits files by handing a patch to the shell, so the paths it touches appear nowhere else --
+/// not in the result, and not under any of the path keys below.
+fn patch_in_arguments(open: Option<&OpenTool>) -> Option<&str> {
+    let patch = open?
+        .input
+        .as_ref()
+        .and_then(|input| {
+            ["command", "patch", "input"]
+                .iter()
+                .find_map(|key| input.get(*key))
+        })
+        .and_then(Json::as_str)?;
+    patch.contains("*** Begin Patch").then_some(patch)
+}
+
+/// Every path a call names in its own arguments, for deciding whose policy its payloads inherit.
+///
+/// Separate from the observation path, and asking a different question of the same bytes. *Did a
+/// file change?* must not be inferred from a call that failed -- mode comes from the tool's name, so
+/// a `Write` that returned `EACCES` would be recorded as a file written, and a patch that was
+/// rejected would assert edits nothing applied. *Whose policy do this call's payloads inherit?* has
+/// no such dependency: the arguments of a failed `Write` hold exactly the bytes a successful one
+/// would have held, and a rejected patch still carries its files' content inline in its own body.
+///
+/// Answering both through one failure gate meant a refused write to `/app/.env` stored the secret it
+/// had been refused permission to write.
+fn paths_named_in_arguments(open: Option<&OpenTool>) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(path) = path_from_arguments(open) {
+        paths.push(path);
+    }
+    // The same parser the observation path uses, called here for its paths alone.
+    if let Some(patch) = patch_in_arguments(open) {
+        for observed in file_events_from_patch(patch, None) {
+            if !paths.contains(&observed.path) {
+                paths.push(observed.path);
+            }
+        }
+    }
+    paths
+}
+
+/// The file path a tool call names in its own arguments, if it names one.
 ///
 /// Claude Code spells the input in snake case (`file_path`) and the result in camel case
 /// (`filePath`); both are checked because a tool that only reports one of them still moved a file.
-/// The file path a tool call names in its own arguments, if it names one.
 ///
-/// Split out from [`observation_from_arguments`] because the two questions it used to answer
-/// together are not the same question. *Did a file change?* must not be inferred from a call that
-/// failed -- the mode comes from the tool's name, so a `Write` that returned `EACCES` would be
-/// recorded as a file written. *Whose policy do this call's payloads inherit?* has no such
-/// dependency: a `Write` to a denied path carries that file's content in its arguments whether the
-/// write succeeded, failed, or never said. Answering both through one failure gate meant a failed
-/// write to `/app/.env` stored the secret it was refused permission to write.
 fn path_from_arguments(open: Option<&OpenTool>) -> Option<String> {
     let input = open?.input.as_ref()?;
     ["file_path", "filePath", "path", "notebook_path"]
@@ -589,6 +634,11 @@ fn path_from_arguments(open: Option<&OpenTool>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Recover a file observation from a tool's arguments when its result carried none.
+///
+/// Only ever called for a call that did not fail: the mode is inferred from the tool's *name*, so a
+/// `Write` that returned `EACCES` would otherwise be recorded as a file written. See
+/// [`paths_named_in_arguments`] for the question that gate does not govern.
 fn observation_from_arguments(
     open: Option<&OpenTool>,
     tool_use_id: Option<&str>,
@@ -762,17 +812,7 @@ async fn record_tool(
     // of the scope is what makes the lineage recoverable at all.
     if !rejected
         && observations.is_empty()
-        && let Some(open) = &open
-        && let Some(patch) = open
-            .input
-            .as_ref()
-            .and_then(|input| {
-                ["command", "patch", "input"]
-                    .iter()
-                    .find_map(|key| input.get(*key))
-            })
-            .and_then(Json::as_str)
-        && patch.contains("*** Begin Patch")
+        && let Some(patch) = patch_in_arguments(open.as_ref())
     {
         observations = file_events_from_patch(patch, tool_use_id);
     }
@@ -814,10 +854,10 @@ async fn record_tool(
     // question "did a file change". It does not belong to this one -- the arguments of a failed
     // `Write` hold exactly the bytes a successful one would have held, so the policy that would
     // have withheld them still applies. Without this the deny list was disabled by failure.
-    if let Some(path) = path_from_arguments(open.as_ref())
-        && !touched.contains(&path)
-    {
-        touched.push(path);
+    for path in paths_named_in_arguments(open.as_ref()) {
+        if !touched.contains(&path) {
+            touched.push(path);
+        }
     }
 
     let mut inputs: Vec<AssetRef> = Vec::new();
@@ -1030,16 +1070,16 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
 /// was written mid-session and may still grow.
 async fn checkpoint(state: &mut SessionState) {
     let count = state.recorder.statement_count();
-    if count == state.written_at {
+    if count == state.attempted_at {
         return;
     }
     // The first one happens as soon as there is anything to write: until a manifest exists on disk,
     // a crash loses the session outright. After that the interval widens with the cost of a rewrite,
     // because a snapshot copies the entire recording rather than the part that changed.
-    if state.written_at > 0 {
+    if state.attempted_at > 0 {
         let interval =
             CHECKPOINT_EVERY.max(state.recorder.blob_bytes() / CHECKPOINT_BYTES_PER_STATEMENT);
-        if count - state.written_at < interval {
+        if count - state.attempted_at < interval {
             return;
         }
     }
@@ -1047,12 +1087,11 @@ async fn checkpoint(state: &mut SessionState) {
         return;
     };
     if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        // Only when it landed. Advancing the watermark on a failed write makes the next checkpoint
-        // measure its interval from a snapshot that is not on disk, so a session can go long
-        // stretches believing it is checkpointed while nothing has been written since the last one.
-        if write_atomically(&state.path, &json) {
-            state.written_at = count;
-        }
+        state.attempted_at = count;
+        // The result is deliberately unused here: a checkpoint is superseded by the next one and by
+        // the final export, so a failed one costs nothing a later write does not replace. It is the
+        // *export* that must know, because it announces and deletes on the strength of it.
+        let _ = write_atomically(&state.path, &json);
     }
 }
 
@@ -1136,7 +1175,14 @@ fn export(
         // A failure here costs the view and not the manifest: the recording is already on disk, and
         // an export that refused to finish because a reduction failed would trade the whole session
         // for a convenience.
-        if let Ok(value) = serde_json::from_slice::<Json>(&json)
+        //
+        // Which is exactly why it is gated on `written`. That sentence assumes a manifest on disk,
+        // and when the write failed there is none -- the file at `path` is an older checkpoint, or
+        // for a renamed fragment nothing at all. Writing the view anyway publishes a reduction of a
+        // document nobody has, announced under its own mark with no manifest mark beside it to say
+        // otherwise: a subset whose statements are absent from the manifest it claims to subset.
+        if written
+            && let Ok(value) = serde_json::from_slice::<Json>(&json)
             && let Some(view) = crate::view::session_view(&value)
         {
             let view_path = path.with_extension("view.json");
