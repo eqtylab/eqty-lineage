@@ -43,9 +43,11 @@ here verifies exactly as one produced by the Python SDK today.
 
 ## Status
 
-Phases 2 and 3 of [the plan](../../../eqty-lineage-nemo-relay-plugin-plan.md). The plugin loads,
-validates its configuration, classifies a real event stream, and writes a signed manifest whose
-statement and asset types match the shipped DeepAgents and deep-research manifests.
+Phases 2 through 4 of the design plan, which is tracked outside this repository; workspace
+snapshots are what remains. The plugin loads, validates its configuration, classifies a real event
+stream, and writes a signed manifest whose statement and asset types match the shipped DeepAgents
+and deep-research manifests -- plus a session view beside it, and a mark for each on Relay's own
+event stream.
 
 | | |
 |---|---|
@@ -62,8 +64,11 @@ statement and asset types match the shipped DeepAgents and deep-research manifes
 | model calls recorded from typed payloads | yes — `tests/end_to_end.rs` |
 | prompts, subagents, compaction, `apply_patch` | yes |
 | same document shape as the shipped integrations | yes — see below |
-| a live session writes a manifest | yes — two Claude Code sessions |
-| a live session writes **file** lineage | **not yet** — see `docs/live-session-script.md` |
+| writes a session view beside the manifest | yes — `tests/end_to_end.rs`, `src/view.rs` |
+| announces each document as a mark | yes — `tests/end_to_end.rs` |
+| a live session writes a manifest | yes — Claude Code and Codex |
+| a live session writes **file** lineage | yes on Claude Code — `FileRead: 5`, `FileWritten: 3` |
+| the same, on Codex | `apply_patch` only — every read is a shell command, so `FileRead: 0` |
 
 ## The completeness bar, set by evidence
 
@@ -113,6 +118,7 @@ Relay subscriber (sync, must return promptly)
             └─ worker thread, current-thread runtime
                  └─ one Recorder per session
                       └─ SessionEnded *or* Drop → generate_manifest → {session_id}.json
+                                                                      └→ {session_id}.view.json
 ```
 
 Three constraints decide that shape. The subscriber is synchronous and must return, so it classifies
