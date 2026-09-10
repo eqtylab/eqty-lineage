@@ -275,10 +275,15 @@ is how one release builds four bundles. Release CI ships:
 | `aarch64-apple-darwin` | |
 | `x86_64-unknown-linux-gnu` | |
 | `aarch64-unknown-linux-gnu` | built on a native arm64 runner; `aws-lc-sys` and `ring` compile C, so cross-compiling needs a target C toolchain too |
-| `x86_64-unknown-linux-musl` | needs `RUSTFLAGS=-C target-feature=-crt-static`, or rustc drops the cdylib crate type and cargo exits 0 having built no library at all |
 
-Intel macOS and Windows are not shipped. Windows would need a toolchain path that is not `nix
-develop`, and neither has ever been built here.
+Three others are deliberately not shipped, and build from source instead:
+
+- **`x86_64-unknown-linux-musl`** builds only with `RUSTFLAGS=-C target-feature=-crt-static`. The
+  target links statically by default, so rustc drops the cdylib crate type, prints one warning, and
+  cargo exits 0 having produced no library — a build that looks like it worked. Even with the flag,
+  the result has never been loaded.
+- **Intel macOS** has not been built here.
+- **Windows** would need a toolchain path that is not `nix develop`.
 
 Note that `[integrity] sha256` is **NVIDIA's** artifact digest and has nothing to do with the EQTY
 `integrity` crate this plugin links. The collision is unfortunate; do not conflate them.

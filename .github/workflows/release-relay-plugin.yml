@@ -82,13 +82,13 @@ jobs:
           # label is unavailable to the org the job fails on an unknown runner, which is loud.
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-          # musl needs `-crt-static` or there is no shared library to ship at all: the target links
-          # statically by default, so rustc *drops the cdylib crate type*, prints one warning, and
-          # cargo exits 0 having produced nothing. Measured -- a bundle step without this flag would
-          # have failed on a missing artifact rather than on the build. [R]
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-latest
-            rustflags: "-C target-feature=-crt-static"
+          #
+          # Every target here has been built and its cdylib confirmed to exist. `x86_64-unknown-
+          # linux-musl` is deliberately absent: it *can* be built, but only with
+          # `-C target-feature=-crt-static`, because the target links statically by default and
+          # rustc otherwise drops the cdylib crate type, prints one warning, and cargo exits 0
+          # having produced no library. Even with the flag the result has never been loaded, and a
+          # signed release asset nobody has activated is a worse answer than "build from source".
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Install Nix
@@ -126,13 +126,12 @@ jobs:
         env:
           # The private half never lands on disk unencrypted outside this step's temp file, and the
           # file is inside the runner's workspace, which is discarded with the runner.
-          RELEASE_SIGNING_KEY: ${{ secrets.RELAY_PLUGIN_SIGNING_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.NEMO_RELAY_PLUGIN_SIGNING_KEY }}
           VERSION: ${{ needs.gate.outputs.version }}
           TARGET: ${{ matrix.target }}
-          RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
-            echo "RELAY_PLUGIN_SIGNING_KEY is not set: a release cannot be signed, and an unsigned" >&2
+            echo "NEMO_RELAY_PLUGIN_SIGNING_KEY is not set: a release cannot be signed, and an unsigned" >&2
             echo "plugin installs cleanly, validates cleanly and then refuses to start." >&2
             exit 1
           fi
@@ -232,8 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
-                        x86_64-unknown-linux-musl; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             ls ./*"$target".tar.gz >/dev/null 2>&1 || { echo "missing bundle for $target" >&2; missing=1; }
           done
           [ "$missing" -eq 0 ] || exit 1
