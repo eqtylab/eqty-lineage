@@ -163,9 +163,14 @@ policy of every path their call touched, and say `withheldBecause: quotes-a-deni
 is all-or-nothing per payload: partially scrubbing a JSON blob is a guess about where the bytes are,
 and a wrong guess is a leak wearing the shape of a redaction.
 
-The floor this cannot reach is the shell. `cat /app/.env` through `Bash` attributes its output to no
-path we can see, so nothing marks it — the same visibility gap as tool file effects. `deny_globs` is
-a floor, not a guarantee, and a session that reads secrets through a shell is outside it.
+The floor this cannot reach has two parts. The **shell**: `cat /app/.env` through `Bash` attributes
+its output to no path we can see, so nothing marks it — the same visibility gap as tool file effects,
+and on Codex that is every read. And the **model payloads**: a `prompt` or `completion` carries
+whatever a tool result put into the conversation, and neither is attributed to a path either.
+
+So `deny_globs` withholds a file's node and the tool payloads named against it, and nothing further.
+It is a floor rather than a guarantee. A session that reads secrets through a shell is outside it,
+and so is the conversation that read carried.
 
 ## Running it against a live session
 
