@@ -161,11 +161,29 @@ pub fn session_view(manifest: &Value) -> Option<SessionView> {
     }
 
     let kept = select(statements, &keep);
-    // Nothing to project, and nothing *reduced* to project. The first is a session that recorded
-    // no non-monologue node; the second is one that held no conversation at all, so the view would
-    // repeat the manifest under a second name and a second mark -- a document a reader has to open
-    // to discover says the same thing.
-    if kept.is_empty() || kept.len() == statements.len() {
+    // Three ways there is no view worth writing, and each is a different fact about the session.
+    //
+    // Nothing kept: it recorded no non-monologue node at all.
+    //
+    // Nothing dropped: it held no conversation, so the view would repeat the manifest under a second
+    // name and a second mark -- a document a reader must open to learn it says the same thing.
+    //
+    // No activity left: it did nothing but talk. This is the case Codex produces every session --
+    // its ancillary conversation-titling call exports as an agentless fragment whose entire content
+    // *is* a model call, and a view that drops model calls therefore drops the fragment's only
+    // reason to exist, leaving two nodes and no edges. A record of what happened that contains
+    // nothing that happened is the empty-attestation problem in a new dress, and it doubled the file
+    // count of every Codex session [R].
+    //
+    // Not keyed on the fragment: an agentless recording *can* hold real tool calls, and one that
+    // does has a view worth having. The absence of activities is the signal, not the filename.
+    let kept_activities = kept
+        .values()
+        .filter(|statement| {
+            statement.get("@type").and_then(Value::as_str) == Some("ComputationRegistration")
+        })
+        .count();
+    if kept.is_empty() || kept.len() == statements.len() || kept_activities == 0 {
         return None;
     }
 

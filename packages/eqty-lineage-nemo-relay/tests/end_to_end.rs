@@ -2663,3 +2663,175 @@ fn collect(value: &serde_json::Value, found: &mut Vec<String>) {
         _ => {}
     }
 }
+
+#[test]
+fn a_session_that_only_talked_gets_no_view() {
+    // Codex issues an ancillary call to title the conversation, which exports as an agentless
+    // fragment whose entire content is one model call -- the reason the fragment is written at all.
+    // A view drops model calls, so its view held two nodes, no edges, and nothing that happened,
+    // while doubling the file count of every Codex session.
+    //
+    // Asserted on the absence of activities rather than on the fragment, because an agentless
+    // recording *can* hold real tool calls and one that does has a view worth having.
+    let into = TempDir::new().expect("a temp dir");
+    let marks = replay(
+        &only_a_model_call("01a040aa-0000-0000-0000-000000000fd1"),
+        &into,
+    );
+
+    let manifest = &manifests(&into)[0];
+    assert!(
+        decoded_blobs(manifest).contains("\"completion\""),
+        "the fixture records a model call"
+    );
+    assert!(
+        views(&into).is_empty(),
+        "a view of nothing but conversation is not a view: {:?}",
+        views(&into)
+    );
+    assert_eq!(
+        marks.len(),
+        1,
+        "and only the manifest is announced: {marks:#?}"
+    );
+}
+
+/// A session whose only work is one model call: no tools, no files.
+fn only_a_model_call(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000d8";
+    let call = "01a040aa-0000-0000-0000-0000000000d9";
+    vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        llm_scope(
+            "anthropic.messages",
+            call,
+            root,
+            "start",
+            serde_json::json!({
+                "model_name": "opus",
+                "annotated_request": {
+                    "model": "opus",
+                    "messages": [{ "role": "user", "content": "title this" }]
+                }
+            }),
+        ),
+        llm_scope(
+            "anthropic.messages",
+            call,
+            root,
+            "end",
+            serde_json::json!({
+                "model_name": "opus",
+                "annotated_response": {
+                    "model": "opus",
+                    "message": "{\"title\":\"a title\"}",
+                    "finish_reason": "complete"
+                }
+            }),
+        ),
+    ]
+}
+
+#[test]
+fn an_agentless_recording_that_did_work_still_gets_a_view() {
+    // The other half of the guard above, and the reason it is keyed on activities rather than on
+    // the fragment: a recording with no `session.start` registers no agent, but it can still run
+    // tools -- and one that did has a view worth having.
+    let into = TempDir::new().expect("a temp dir");
+    let marks = replay(
+        &agentless_but_busy("01a040aa-0000-0000-0000-000000000fd2"),
+        &into,
+    );
+
+    let manifest = &manifests(&into)[0];
+    assert!(
+        manifest.to_string_lossy().ends_with(".unattributed.json"),
+        "no agent was registered: {manifest:?}"
+    );
+    let view = views(&into)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("a fragment that ran a tool gets a view"));
+    assert!(view.to_string_lossy().ends_with(".unattributed.view.json"));
+
+    let names = blob_objects(&view)
+        .into_iter()
+        .filter_map(|node| node["name"].as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| name == "Read"),
+        "the tool it ran: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "completion"),
+        "and still without the conversation: {names:?}"
+    );
+    assert!(
+        marks
+            .iter()
+            .any(|mark| mark.kind == ManifestKind::SessionView),
+        "announced like any other view: {marks:#?}"
+    );
+}
+
+/// No `session.start`, so no agent -- but a model call and a tool call all the same.
+fn agentless_but_busy(session: &str) -> Vec<Event> {
+    let root = "01a040aa-0000-0000-0000-0000000000da";
+    let turn = "01a040aa-0000-0000-0000-0000000000dd";
+    let call = "01a040aa-0000-0000-0000-0000000000db";
+    let tool = "01a040aa-0000-0000-0000-0000000000dc";
+    vec![
+        // A turn scope, so the router can attribute the LLM event through the tree -- an `llm`
+        // event carries no session of its own. No `session.start`, so still no agent.
+        turn_scope(session, turn, root, "start"),
+        llm_scope(
+            "anthropic.messages",
+            call,
+            turn,
+            "start",
+            serde_json::json!({
+                "model_name": "opus",
+                "annotated_request": {
+                    "model": "opus",
+                    "messages": [{ "role": "user", "content": "read it" }]
+                }
+            }),
+        ),
+        llm_scope(
+            "anthropic.messages",
+            call,
+            turn,
+            "end",
+            serde_json::json!({
+                "model_name": "opus", "message": "reading",
+                "annotated_response": { "model": "opus", "message": "reading", "finish_reason": "complete" }
+            }),
+        ),
+        claude_read(
+            session,
+            tool,
+            turn,
+            "start",
+            serde_json::json!({ "file_path": "/busy.md" }),
+        ),
+        claude_read(
+            session,
+            tool,
+            turn,
+            "end",
+            serde_json::json!({
+                "type": "text",
+                "file": {
+                    "filePath": "/busy.md", "content": "busy\n",
+                    "numLines": 1, "totalLines": 1, "startLine": 1
+                }
+            }),
+        ),
+    ]
+}
