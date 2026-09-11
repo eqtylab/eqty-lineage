@@ -3349,16 +3349,25 @@ fn a_rejected_patch_that_deletes_a_denied_file_withholds_the_whole_body() {
 }
 
 /// Every kind of turn opener, and what the manifest is allowed to claim about each.
-fn turn_kinds() -> Vec<(
-    &'static str,
-    &'static str,
-    Option<(&'static str, &'static str)>,
-    &'static str,
-    &'static str,
-)> {
+/// One turn opener, and what the manifest is allowed to claim about it.
+struct TurnKind {
+    prompt: &'static str,
+    source: &'static str,
+    agent: Option<(&'static str, &'static str)>,
+    name: &'static str,
+    role: &'static str,
+}
+
+fn turn_kinds() -> Vec<TurnKind> {
+    let kind = |prompt, source, agent, name, role| TurnKind {
+        prompt,
+        source,
+        agent,
+        name,
+        role,
+    };
     vec![
-        // (prompt, turn_source, agent, expected node name, expected role)
-        (
+        kind(
             "count the lines",
             "user_prompt",
             None,
@@ -3368,21 +3377,21 @@ fn turn_kinds() -> Vec<(
         // A real message with a reminder appended is still a real message. The containment test
         // that would have caught the notification below relabels this one, which is why the rule
         // is anchored: this case is the majority, and getting it wrong is the worse failure.
-        (
+        kind(
             "count the lines\n<system-reminder>be concise</system-reminder>",
             "user_prompt",
             None,
             "user prompt",
             "user",
         ),
-        (
+        kind(
             "quota",
             "gateway_request",
             None,
             "gateway prompt",
             "gateway_request",
         ),
-        (
+        kind(
             "<task-notification>\n<status>completed</status>\n</task-notification>",
             "user_prompt",
             None,
@@ -3390,7 +3399,7 @@ fn turn_kinds() -> Vec<(
             "system",
         ),
         // Codex reports `user_prompt` here too -- measured, not assumed -- so `agent_id` has to win.
-        (
+        kind(
             "Read notes.md and report its line count.",
             "user_prompt",
             Some(("01a08db9-3578-73b2-a26e-4494f7e161da", "default")),
@@ -3402,7 +3411,14 @@ fn turn_kinds() -> Vec<(
 
 #[test]
 fn a_turn_is_attributed_to_whoever_actually_opened_it() {
-    for (prompt, source, agent, name, role) in turn_kinds() {
+    for TurnKind {
+        prompt,
+        source,
+        agent,
+        name,
+        role,
+    } in turn_kinds()
+    {
         let into = TempDir::new().expect("a temp dir");
         let session = "01a040aa-0000-0000-0000-000000000b01";
         let root = "01a040aa-0000-0000-0000-000000000b02";
