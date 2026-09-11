@@ -13,3 +13,4 @@ dist/
 # gets `UV_INDEX_EQTY_USERNAME="your-username"` injected and a 401 from the private index.
 .env
 .secrets
+graphify-out/
