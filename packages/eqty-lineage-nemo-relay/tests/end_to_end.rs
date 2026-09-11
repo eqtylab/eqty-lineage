@@ -3512,6 +3512,22 @@ fn a_delegated_turns_work_is_credited_to_the_agent_it_was_delegated_to() {
 
     let path = &manifests(&into)[0];
     let blobs = decoded_blobs(path);
+
+    // The performer itself, not just the basis. Asserting only `attribution` let the preference in
+    // `actor_name` be deleted without a test noticing -- the string said "delegated-turn" while
+    // `performedBy` still pointed at the root agent.
+    let agent = cid_for_named(path, "default");
+    let performers: Vec<String> = tool_activities(path)
+        .into_iter()
+        .filter_map(|activity| activity["performedBy"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        performers
+            .iter()
+            .all(|who| who.trim_start_matches("urn:cid:") == agent),
+        "the tool call must be credited to the agent the turn was delegated to, got {performers:?} \
+         against the spawned agent {agent}"
+    );
     assert!(
         blobs.contains("\"attribution\":\"delegated-turn\""),
         "the activity must say the turn was delegated:\n{blobs}"
