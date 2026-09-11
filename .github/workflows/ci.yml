@@ -8,9 +8,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    # `opened` matters: without it a pull request created directly as ready-for-review gets no run at
-    # all until someone pushes to it, and reads as "no checks" rather than "not checked yet".
-    # `reopened` covers a PR closed and brought back, which likewise produces no synchronize event.
+    # `opened` and `reopened` produce no synchronize event, so without them a PR opened ready-for-
+    # review, or closed and brought back, gets no run until someone pushes to it.
     types: [opened, reopened, ready_for_review, synchronize]
   workflow_dispatch:
 
@@ -52,24 +51,20 @@ jobs:
         run: just lint-python
       - name: Test
         run: just test-python
-      # Wheels only. The cargo release build is `just build-relay`, deliberately off the PR path --
-      # see that recipe for what does and does not cover it.
+      # Wheels only. The cargo release build is `just build-relay`, deliberately off the PR path.
       - name: Build
         run: just build-python
 
-  # One leg per Cargo workspace. They have separate Cargo.locks and separate target directories, so
-  # unlike a lint/test split they share no compiled artifact and duplicate no compile. A matrix
-  # rather than two copied jobs, so the job id stays `rust` for `needs:` below.
+  # One leg per Cargo workspace. Separate Cargo.locks and target directories, so unlike a lint/test
+  # split the legs share no compiled artifact and duplicate no compile.
   rust:
     runs-on: ubuntu-latest
-    # Line tables rather than full debug info: enough for the backtrace a failing test prints, and
-    # roughly half the target directory to build, cache and restore. An environment variable rather
-    # than a committed profile, so anyone debugging locally keeps variable inspection. `rust-cache`
-    # hashes CARGO_* into its key, so changing this rotates the cache once.
+    # Enough for the backtrace a failing test prints, at roughly half the target directory. Set here
+    # rather than in a committed profile so local debugging keeps variable inspection; `rust-cache`
+    # hashes CARGO_* into its key, so changing it rotates the cache once.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
-      # Both results are wanted; a failure in one workspace should not hide the other's.
       fail-fast: false
       matrix:
         suite: [plugin, plugin-abi]
@@ -87,30 +82,24 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # A leg wants 8 GB of the 14 GB a runner starts with. These readings say which phase took the
-      # space if one ever runs out.
       - name: Disk at start
         shell: bash -e {0}
         run: df -h / | tail -1 | xargs echo "free at start:"
-      # `rust-cache` is a node action and does not run through `defaults.run.shell`, so left alone it
-      # keys the cache on the runner image's rustup toolchain -- a compiler we never build with, and
-      # not a homogeneous pool, so the key flips between runner images and rebuilds everything. Two
-      # directories because nixpkgs ships cargo and rustc separately. `NIX_RUSTC_VERSION` stays as a
-      # key input: redundant while the PATH holds, and what pins the key if it ever does not.
+      # `rust-cache` is a node action and bypasses `defaults.run.shell`, so left alone it keys on the
+      # runner image's rustup toolchain -- a compiler we never build with, from a pool that is not
+      # homogeneous, so the key flips between images and rebuilds everything. Two directories because
+      # nixpkgs ships cargo and rustc separately.
       - name: Put the dev shell's toolchain on PATH
         run: |
           dirname "$(command -v rustc)" >> "$GITHUB_PATH"
           dirname "$(command -v cargo)" >> "$GITHUB_PATH"
           echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
-      # `rust-cache` rather than `actions/cache`, matching `eqtylab/integrity`. The difference that
-      # matters is what it saves: it prunes the target directory to dependency artifacts, dropping
-      # `incremental/` and our own crates' output, so the cache holds the part that actually costs
-      # the nine minutes and not the part that is rebuilt every run regardless.
+      # `rust-cache` rather than `actions/cache`: it prunes the target directory to dependency
+      # artifacts, so the cache holds the expensive part and not what is rebuilt every run anyway.
       - name: Rust Cache
         uses: eqtylab-actions/rust-cache@v2
         with:
-          # Two Cargo workspaces, both under `packages/`, each with its own Cargo.lock and target
-          # directory. The default is a workspace at the repository root, which is neither of them.
+          # The default is a single workspace at the repository root, which is neither of these.
           workspaces: |
             packages/eqty-lineage-nemo-relay -> target
             packages/eqty-lineage-nemo-relay/abi-test -> target
@@ -118,9 +107,8 @@ jobs:
           # they would compute one key and race to write it.
           key: ${{ matrix.suite }}
           env-vars: NIX_RUSTC_VERSION
-          # Without this the cache is saved only when the whole job succeeds, so a pull request with
-          # failing clippy recompiles the world on every push -- the loop where a cache is worth
-          # most. A partial target directory is safe to restore; cargo fingerprints what it finds.
+          # Otherwise a PR with failing clippy recompiles the world on every push. A partial target
+          # directory is safe to restore; cargo fingerprints what it finds.
           cache-on-failure: true
       - name: Disk after restore
         shell: bash -e {0}
@@ -133,21 +121,14 @@ jobs:
         run: just lint-rust-${{ matrix.suite }}
       - name: Test
         run: just test-rust-${{ matrix.suite }}
-      # `always()`, because the reading matters most on the run that failed for want of space.
       - name: Disk after build
         if: always()
         shell: bash -e {0}
         run: df -h / | tail -1 | xargs echo "free after build:"
 
-  # One place to read the outcome. Parallel jobs already fail the run on their own -- this exists so
-  # the run summary names which one failed without opening each job. `if: always()` is what makes it
-  # report a failure rather than being skipped by one.
-  #
   # **Named `checks` because the branch ruleset requires a status context of exactly that name.**
-  # It is the one job that gates a merge, so it has to be the one that aggregates: `needs` both
-  # halves and fails when either does. Renaming it, or dropping a job from `needs`, silently makes
-  # the required check pass on a run that did not test everything -- the ruleset only knows this
-  # name.
+  # Renaming it, or dropping a job from `needs`, silently makes the required check pass on a run that
+  # did not test everything -- the ruleset only knows this name.
   checks:
     runs-on: ubuntu-latest
     needs: [python, rust]
