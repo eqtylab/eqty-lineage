@@ -217,7 +217,13 @@ impl Recorder {
             // truncated read seeds that key without touching the base, so `read (truncated)`,
             // `read (full)`, `write (unreconstructable)`, `edit` replayed the edit against the
             // pre-write bytes and signed a version of the file that never existed.
-            Self::move_replay_base(&mut self.last_content, path, data, event.mode);
+            Self::move_replay_base(
+                &mut self.last_content,
+                path,
+                data,
+                event.mode,
+                event.vacated.as_deref(),
+            );
             return Ok(Some(existing));
         }
 
@@ -288,7 +294,13 @@ impl Recorder {
             }
         };
 
-        Self::move_replay_base(&mut self.last_content, path.clone(), data, event.mode);
+        Self::move_replay_base(
+            &mut self.last_content,
+            path.clone(),
+            data,
+            event.mode,
+            event.vacated.as_deref(),
+        );
         self.by_content.insert(key, asset.clone());
         self.count(match event.mode {
             FileMode::Read => "FileRead",
@@ -306,7 +318,14 @@ impl Recorder {
         path: String,
         data: Option<Vec<u8>>,
         mode: FileMode,
+        vacated: Option<&str>,
     ) {
+        // A move empties the source, for the same reason the contentless-write arm below clears its
+        // path: a later hunk replayed against bytes the move took away signs a version of a file
+        // that was not there to have one.
+        if let Some(vacated) = vacated {
+            last_content.remove(vacated);
+        }
         match (data, mode) {
             (Some(bytes), _) => {
                 last_content.insert(path, bytes);

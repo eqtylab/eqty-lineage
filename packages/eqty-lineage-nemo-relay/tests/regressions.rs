@@ -57,6 +57,7 @@ fn seen(path: &str, content: Option<&[u8]>, mode: FileMode) -> FileObserved {
         mode,
         tool_use_id: Some("t1".into()),
         user_modified: false,
+        vacated: None,
         edit: None,
     }
 }
@@ -692,6 +693,86 @@ async fn a_moved_file_is_recorded_at_its_destination() {
     );
 }
 
+#[tokio::test]
+async fn a_move_stops_the_source_replaying_later_hunks() {
+    // The move wrote the post-image to the destination and left the source's bytes cached, so a
+    // later hunk against the source replayed against content the move had taken away and signed a
+    // version of a file that was not there to have one. The same staleness the contentless-write
+    // arm of `move_replay_base` exists to clear, reached one directive over.
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/work/a.txt", Some(b"one\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let moved = file_events_from_patch(
+        "*** Begin Patch\n\
+         *** Update File: /work/a.txt\n\
+         *** Move to: /work/b.txt\n\
+         @@\n\
+         -one\n\
+         +two\n\
+         *** End Patch",
+        Some("c1"),
+    );
+    assert_eq!(moved[0].vacated.as_deref(), Some("/work/a.txt"));
+    rec.observe_file(&moved[0], true, None).await.unwrap();
+
+    let after = file_events_from_patch(&hunk("/work/a.txt", &["-one", "+three"]), Some("c2"));
+    rec.observe_file(&after[0], true, None).await.unwrap();
+
+    let manifest = exported(rec).await;
+    assert_eq!(
+        document_content(&manifest, "/work/b.txt").as_deref(),
+        Some("two\n"),
+        "the move itself still lands"
+    );
+    assert_eq!(
+        document_content(&manifest, "/work/a.txt").as_deref(),
+        None,
+        "but nothing is invented for the path the move emptied"
+    );
+}
+
+#[tokio::test]
+async fn a_rename_with_no_hunks_empties_the_source_too() {
+    // A bare `*** Move to:` takes the identity-only arm, which dropped the move entirely -- so the
+    // arm that carries no replayable edit is also the one that left the stale base behind, and it
+    // is the commoner of the two: renaming a file needs no hunk at all.
+    let renamed = file_events_from_patch(
+        "*** Begin Patch\n\
+         *** Update File: /work/a.txt\n\
+         *** Move to: /work/b.txt\n\
+         *** End Patch",
+        Some("c1"),
+    );
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0].path, "/work/b.txt");
+    assert_eq!(renamed[0].vacated.as_deref(), Some("/work/a.txt"));
+
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/work/a.txt", Some(b"one\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(&renamed[0], true, None).await.unwrap();
+
+    let after = file_events_from_patch(&hunk("/work/a.txt", &["-one", "+three"]), Some("c2"));
+    rec.observe_file(&after[0], true, None).await.unwrap();
+
+    assert_eq!(
+        document_content(&exported(rec).await, "/work/a.txt").as_deref(),
+        None,
+        "the renamed-away path has no content to build a version from"
+    );
+}
+
 // ------------------------------------------------------- inference after an explicit failure
 
 #[test]
@@ -909,7 +990,6 @@ fn a_second_agentless_recording_gets_its_own_manifest() {
         "both still say what they are: {written:?}"
     );
 }
-
 /// Every node states the size of the content behind it, stored or not.
 ///
 /// Without it a `larger-than-ceiling` node cannot tell a reader 8 KiB from 8 GiB, or whether raising

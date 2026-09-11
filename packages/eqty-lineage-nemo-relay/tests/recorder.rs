@@ -45,6 +45,7 @@ fn seen(path: &str, content: Option<&[u8]>, mode: FileMode) -> FileObserved {
         mode,
         tool_use_id: Some("t1".into()),
         user_modified: false,
+        vacated: None,
         edit: None,
     }
 }

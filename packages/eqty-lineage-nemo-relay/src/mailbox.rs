@@ -819,6 +819,7 @@ fn observation_from_arguments(
         },
         tool_use_id: tool_use_id.map(str::to_string),
         user_modified: false,
+        vacated: None,
         edit: None,
     })
 }

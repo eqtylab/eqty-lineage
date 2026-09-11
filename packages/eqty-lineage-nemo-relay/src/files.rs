@@ -78,6 +78,11 @@ pub struct FileObserved {
     pub tool_use_id: Option<String>,
     /// The user edited the file by hand between the agent reading it and writing it.
     pub user_modified: bool,
+    /// A path this observation emptied: the source of a move, whose content now lives at `path`.
+    ///
+    /// Carried so the recorder stops replaying later edits against bytes the move took away. It
+    /// attests nothing on its own -- a vacated path has no content to be a version of.
+    pub vacated: Option<String>,
     pub edit: Option<EditAttempt>,
 }
 
@@ -153,6 +158,7 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
                 mode: FileMode::Wrote,
                 tool_use_id: tool_use_id.map(str::to_string),
                 user_modified: false,
+                vacated: None,
                 edit: None,
             });
         }
@@ -226,9 +232,15 @@ fn flush_update(
     // otherwise.
     let source = update.path;
     let written = update.moved_to.clone().unwrap_or_else(|| source.clone());
+    // A move empties the source. Both arms carry it: a rename with no hunks at all takes the
+    // identity-only one below, and that is the commonest move there is.
+    let vacated = update.moved_to.as_ref().map(|_| source.clone());
     // Nothing to anchor against, so nothing to replay from.
     if update.before.is_empty() || update.before == update.after {
-        events.push(identity_only(&written, FileMode::Wrote, tool_use_id));
+        events.push(FileObserved {
+            vacated,
+            ..identity_only(&written, FileMode::Wrote, tool_use_id)
+        });
         return;
     }
     events.push(FileObserved {
@@ -237,6 +249,7 @@ fn flush_update(
         mode: FileMode::Wrote,
         tool_use_id: tool_use_id.map(str::to_string),
         user_modified: false,
+        vacated,
         edit: Some(EditAttempt {
             old: as_lines(&update.before),
             new: as_lines(&update.after),
@@ -439,6 +452,7 @@ fn identity_only(path: &str, mode: FileMode, tool_use_id: Option<&str>) -> FileO
         mode,
         tool_use_id: tool_use_id.map(str::to_string),
         user_modified: false,
+        vacated: None,
         edit: None,
     }
 }
@@ -523,6 +537,7 @@ fn read_events(
                 mode: FileMode::Read,
                 tool_use_id: tool_use_id.map(str::to_string),
                 user_modified: false,
+                vacated: None,
                 edit: None,
             }],
             None,
@@ -541,6 +556,7 @@ fn read_events(
             mode: FileMode::Read,
             tool_use_id: tool_use_id.map(str::to_string),
             user_modified: false,
+            vacated: None,
             edit: None,
         }],
         None,
@@ -572,6 +588,7 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
             mode: FileMode::Read,
             tool_use_id: tool_use_id.map(str::to_string),
             user_modified,
+            vacated: None,
             edit: None,
         });
     }
@@ -610,6 +627,7 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
         mode: FileMode::Wrote,
         tool_use_id: tool_use_id.map(str::to_string),
         user_modified,
+        vacated: None,
         edit,
     });
 
