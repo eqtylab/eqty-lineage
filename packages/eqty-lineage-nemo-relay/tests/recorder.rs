@@ -702,12 +702,10 @@ async fn a_payload_over_the_ceiling_still_reports_its_size() {
 
 #[tokio::test]
 async fn a_contentless_write_moves_the_replay_base_even_when_its_node_already_exists() {
-    // The deduplication path used to return before the base was invalidated, and the second
-    // contentless observation of a path is what reaches it: both key on `unknown:{path}`.
-    //
-    // A truncated read seeds that key without disturbing the base -- correctly, since a read that
-    // failed changed nothing on disk -- so the write that follows deduplicates against it and used
-    // to leave the pre-write bytes in place for the next edit to replay against.
+    // A truncated read and a contentless write both key on `unknown:{path}`, so the write
+    // deduplicates against the read's node. The read correctly leaves the replay base alone -- it
+    // changed nothing on disk -- but the write must still invalidate it, or the next edit replays
+    // against pre-write bytes.
     let mut rec = recorder();
     rec.observe_file(&seen("/a.py", None, FileMode::Read), true, None)
         .await

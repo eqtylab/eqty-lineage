@@ -1594,9 +1594,8 @@ fn a_second_export_never_overwrites_the_first() {
 
 #[test]
 fn a_manifest_exists_before_the_session_ends() {
-    // The recording used to be all-or-nothing: one write, at the very end. A crash, a kill, or a
-    // machine losing power took the whole session with it, and nothing was visible while the agent
-    // was still working. The first completed unit of work now checkpoints.
+    // The first completed unit of work checkpoints, so a crash or a kill leaves a partial recording
+    // rather than nothing, and a manifest is visible while the agent is still working.
     let into = TempDir::new().expect("a temp dir");
     let events = full_session("01a040aa-0000-0000-0000-000000000095");
     // Everything except the events that close the session, so nothing triggers a final export.
@@ -2410,11 +2409,9 @@ fn a_call_that_was_never_recorded_does_not_consume_the_turn_prompt() {
 
 #[test]
 fn an_event_that_completes_nothing_writes_no_manifest() {
-    // The checkpoint used to run after *every* event, and a snapshot copies the entire recording
-    // rather than the part that changed -- so a long session rewrote its whole manifest hundreds of
-    // times, and a session holding a large file rewrote those bytes with it. Only a completed unit of
-    // work is worth the cost: a manifest written between a tool's start and its end holds the
-    // arguments of a call whose result is still coming, which is a document with no reader.
+    // A snapshot copies the entire recording, so checkpointing per event rewrites the whole manifest
+    // hundreds of times -- and a manifest written between a tool's start and its end holds the
+    // arguments of a call whose result is still coming. Only a completed unit of work is worth it.
     let into = TempDir::new().expect("a temp dir");
     let session = "01a040aa-0000-0000-0000-000000000f91";
     let root = "01a040aa-0000-0000-0000-000000000f92";

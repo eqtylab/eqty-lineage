@@ -114,30 +114,16 @@ fn config(value: serde_json::Value) -> Map<String, serde_json::Value> {
 
 /// Build the plugin's cdylib **once**, into the plugin's **own** target directory.
 ///
-/// Both halves of that matter, and each was learned from a CI failure.
+/// `just test-rust` runs the plugin's `cargo test` immediately before this crate's, so
+/// `../target/debug` already holds every dependency this build needs and only the cdylib has to be
+/// linked. A scratch `TempDir` instead recompiles `integrity`, iroh and ssi from nothing per test,
+/// which is slow enough to matter and large enough to exhaust the runner's disk. A new path every
+/// run also means no cache can ever restore into it.
 ///
-/// *Once*: a fresh scratch directory per test compiled the plugin's entire dependency tree --
-/// `integrity`, and iroh and ssi beneath it -- for every test in this file.
-///
-/// *The plugin's own*: a scratch directory anywhere compiles that tree from nothing even when the
-/// identical artifacts already exist. `just test-rust` runs the plugin's `cargo test` immediately
-/// before this crate's, so `../target/debug` is already full of exactly the dependencies this build
-/// needs and only the cdylib itself has to be linked. A scratch tree was the difference between
-/// reusing that work and doing it again -- and with this crate's own tree beside it, enough to run
-/// the runner out of *space* rather than time:
-///
-/// ```text
-/// error: failed to write .../lib.rmeta: No space left on device (os error 28)
-/// ```
-///
-/// It is also the only version of this that a cache can help: a `TempDir` is a new path every run,
-/// so nothing restored into it is ever found.
-///
-/// **`--target-dir` is still explicit, and must stay that way.** Cargo holds a lock per target
-/// directory. This runs *inside* `cargo test`, which already holds the lock on this crate's own
-/// target directory -- and `CARGO_TARGET_DIR`, which `just linux-check` sets, would otherwise point
-/// both at the same place and make the nested build wait on a lock its own parent is holding. The
-/// flag beats the environment variable, which is what keeps that from happening.
+/// **`--target-dir` is explicit, and must stay that way.** Cargo locks per target directory, and
+/// this runs *inside* `cargo test`. With `CARGO_TARGET_DIR` set -- which `just linux-check` does --
+/// both would point at one directory and the nested build would wait on a lock its own parent
+/// holds. The flag beats the environment variable.
 fn build_cdylib() -> &'static Path {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT.get_or_init(|| {

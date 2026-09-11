@@ -63,10 +63,9 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     # Line tables rather than full debug info: enough for the backtrace a failing test prints, and
-    # 46% less target directory to build, cache, restore and hold. Measured on this tree:
-    # target/debug 9.5 GB -> 5.1 GB, the cdylib 415 MB -> 125 MB, lifecycle.rs 69.8s -> 57.9s.
-    # An environment variable rather than a committed profile, so anyone debugging locally keeps
-    # variable inspection. `rust-cache` hashes CARGO_* into its key, so this rotates the cache once.
+    # roughly half the target directory to build, cache and restore. An environment variable rather
+    # than a committed profile, so anyone debugging locally keeps variable inspection. `rust-cache`
+    # hashes CARGO_* into its key, so changing this rotates the cache once.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
@@ -88,26 +87,16 @@ jobs:
         continue-on-error: true
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
-      # A step here used to delete the android SDK for headroom. Under `line-tables-only` a leg wants
-      # 8 GB of the 14 GB a runner starts with -- run 34290244618 measured 7 GB of nix store and
-      # restored cache, then 1 GB of build -- so it was freeing 11 GB that nothing used. It also cost
-      # between 19s and 217s for the same `rm`, and on that run it was the largest item in the whole
-      # run. The readings below are what makes removing it safe to try: if a leg does run out they
-      # say which phase took the space, and `cache-on-failure` means the run still leaves a cache.
-      #
-      #   sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-      #     "$AGENT_TOOLSDIRECTORY" || true
+      # A leg wants 8 GB of the 14 GB a runner starts with. These readings say which phase took the
+      # space if one ever runs out.
       - name: Disk at start
         shell: bash -e {0}
         run: df -h / | tail -1 | xargs echo "free at start:"
       # `rust-cache` is a node action and does not run through `defaults.run.shell`, so left alone it
-      # keys the cache on the runner image's rustup toolchain -- a compiler we never build with. That
-      # pool is not homogeneous: 1.98.0 and 1.98.1 both appear, the key flipped between them, and a
-      # leg that drew the other image rebuilt everything. Run 34282231592 spent 379s in Lint where
-      # the run before it spent 9s. Two directories because nixpkgs ships cargo and rustc separately.
-      #
-      # `NIX_RUSTC_VERSION` stays as a key input: redundant while the PATH holds, and the thing that
-      # still pins the key to the right compiler if it ever does not.
+      # keys the cache on the runner image's rustup toolchain -- a compiler we never build with, and
+      # not a homogeneous pool, so the key flips between runner images and rebuilds everything. Two
+      # directories because nixpkgs ships cargo and rustc separately. `NIX_RUSTC_VERSION` stays as a
+      # key input: redundant while the PATH holds, and what pins the key if it ever does not.
       - name: Put the dev shell's toolchain on PATH
         run: |
           dirname "$(command -v rustc)" >> "$GITHUB_PATH"
@@ -158,9 +147,7 @@ jobs:
   # It is the one job that gates a merge, so it has to be the one that aggregates: `needs` both
   # halves and fails when either does. Renaming it, or dropping a job from `needs`, silently makes
   # the required check pass on a run that did not test everything -- the ruleset only knows this
-  # name. A single job called `checks` used to run the whole suite; splitting CI by language
-  # replaced it and left the ruleset requiring a context nothing published, which blocks a PR at
-  # "Expected -- Waiting for status to be reported" with no failure to look at.
+  # name.
   checks:
     runs-on: ubuntu-latest
     needs: [python, rust]

@@ -1,33 +1,24 @@
 //! Building an EQTY lineage graph, with no NeMo Relay in sight.
 //!
-//! This module deliberately knows nothing about Relay, ATOF, or coding agents. It is the layer
-//! between `integrity`'s primitives and "a session's worth of lineage": you register assets, record
-//! the computations that connected them, and get a signed manifest. Everything Relay-shaped lives
-//! above it, in [`crate::classify`] and the recorder.
-//!
-//! Keeping that boundary is a bet that this layer wants to exist on its own eventually -- as a
-//! feature of `integrity`, or as an `integrity-rs` beside `integrity-py`. Extraction from working
-//! code is cheap; designing it speculatively is not. So it is written as though it were already
-//! extracted, and nothing here should ever need a Relay type.
+//! The layer between `integrity`'s primitives and "a session's worth of lineage": register assets,
+//! record the computations that connected them, get a signed manifest. Everything Relay-shaped lives
+//! above it, in [`crate::classify`] and the recorder. Nothing here should ever need a Relay type --
+//! this layer is written as though it were already extracted into an `integrity-rs`.
 //!
 //! # What `integrity` gives, and what it does not
 //!
 //! `integrity` has the primitives: statement constructors that compute their own CIDs, VC issuance,
-//! `resolve_blobs`, and `generate_manifest`. What it does not have is the *composition* -- the fact
-//! that "an asset" is three statements in a particular arrangement, and that the arrangement differs
-//! depending on whether the asset has content. That composition is what `integrity-py` contributes
-//! and what this module restates. Getting it wrong produces a manifest that parses, verifies, and
+//! `resolve_blobs`, `generate_manifest`. What it lacks is the *composition* -- that an asset is
+//! three statements in a particular arrangement, and that the arrangement differs depending on
+//! whether the asset has content. Getting it wrong produces a manifest that parses, verifies, and
 //! means something other than what happened.
 //!
 //! # One thing this does not copy from `integrity-py`
 //!
 //! The Python binding reaches its signer and blob store through process-global config (`with_cfg!`,
-//! `active_signer`). That is workable for a script and wrong for us: this plugin is long-lived and
-//! records many sessions at once, so a global active signer is a shared mutable that several
-//! sessions would race over. It is also why `eqty_sdk.init()` is silently ignored on a second call,
-//! and why comparing two recordings in Python needs two processes.
-//!
-//! Here the session owns its signer and its statements, and is passed explicitly.
+//! `active_signer`). This plugin is long-lived and records many sessions at once, so a global active
+//! signer would be a shared mutable several sessions race over. Here the session owns its signer and
+//! its statements, and is passed explicitly.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -354,22 +345,15 @@ impl LineageSession {
 /// JSON-encode every nested metadata value, because the graph explorer displays each value as a
 /// string and renders an object or an array as the literal text `[object Object]`.
 ///
-/// Applied here rather than at each call site because this is the one place every metadata
-/// statement passes through, and doing it per site is how the same bug shipped three times: as
-/// `contentBytes` (a `{stored, denied}` map), then as the coverage counts, then as a model call's
-/// `usage` -- thirteen nodes a session, on a manifest a reader was expected to read.
+/// Applied here rather than at each call site: this is the one place every metadata statement passes
+/// through, and doing it per site is how the same bug shipped three times.
 ///
 /// Only the top level is rewritten. A nested object becomes a JSON string that still contains its
-/// own structure, so nothing is lost and a reader who wants the values parses one string. The
-/// authoritative copy is unaffected either way: the coverage counts are also this node's *content*,
-/// which stays real JSON and keeps the node's identity comparable across runs.
+/// own structure, so nothing is lost. The node's *content* stays real JSON either way, which keeps
+/// its identity comparable across runs. `null` is left alone -- `withheldBecause: null` is a value a
+/// reader acts on, and it renders as itself.
 ///
-/// `null` is left alone. It is a value a reader acts on -- `withheldBecause: null` is "nothing was
-/// withheld" -- and it renders as itself rather than as `[object Object]`.
-///
-/// This is the same treatment `eqty-lineage-langchain` applies before values reach the SDK, and its
-/// README documents the trap: "dicts and lists are JSON-encoded (otherwise they'd display as
-/// `[object Object]`)".
+/// Same treatment `eqty-lineage-langchain` applies before values reach the SDK.
 fn encode_nested_values(metadata: &mut Value) {
     let Some(fields) = metadata.as_object_mut() else {
         return;

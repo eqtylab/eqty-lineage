@@ -10,16 +10,15 @@
 //! Re-recording the selection into a fresh context would mint new statement CIDs -- they carry
 //! `validFrom` -- and produce a *different* attestation that merely resembled the original.
 //!
-//! Defined by what it excludes rather than by what it requires, which is the difference between this
-//! and a file-lineage view. A selector keyed on "has a path" collapses to zero statements on a
-//! session that only talked, and a zero-statement manifest still parses and still verifies: a
-//! document that looks like an attestation and asserts nothing. Excluding the monologue instead
-//! leaves every session with a true record -- small when the session did little, never empty.
+//! Defined by what it excludes rather than by what it requires. A selector keyed on "has a path"
+//! collapses to zero statements on a session that only talked, and a zero-statement manifest still
+//! parses and verifies: a document that looks like an attestation and asserts nothing. Excluding the
+//! monologue instead leaves every session a true record -- small when the session did little, never
+//! empty.
 //!
-//! **A reduction, never a boundary.** It is tempting to read a smaller document as a safer one, and
-//! this is not that: the view keeps a kept activity's tool result, and on Codex every read is a
-//! shell command, so a read's content is in a tool result the view keeps. It reduces what a reader
-//! has to wade through. It does not decide what anyone is allowed to see.
+//! **A reduction, never a boundary.** Not a disclosure control: the view keeps a kept activity's
+//! tool result, and on Codex every read is a shell command, so a read's content is in a tool result
+//! the view keeps.
 
 use std::collections::{HashMap, HashSet};
 

@@ -381,9 +381,9 @@ async fn a_payload_quoting_no_denied_file_is_still_stored() {
 
 #[tokio::test]
 async fn returning_to_an_earlier_version_moves_the_replay_base_back() {
-    // The dedup return skipped the base refresh, so a file that went A -> B -> A left B cached. A
-    // later edit anchored on A was then refused, or -- worse, if its `old` text also occurred in B --
-    // replayed against content the file no longer held.
+    // A file that goes A -> B -> A must not leave B cached as the replay base: a later edit anchored
+    // on A is then refused, or -- worse, if its `old` text also occurs in B -- replayed against
+    // content the file no longer holds.
     let mut rec = recorder();
     for bytes in [&b"x = 1\n"[..], &b"x = 2\n"[..], &b"x = 1\n"[..]] {
         rec.observe_file(&seen("/a.py", Some(bytes), FileMode::Read), true, None)
@@ -487,14 +487,11 @@ fn deleting_a_line_takes_its_newline_with_it() {
 
 #[test]
 fn an_eof_anchored_hunk_cannot_be_answered_by_an_earlier_line() {
-    // Restoring the terminator alone made one case *worse* than before it. It narrows what the anchor
-    // matches, so against the unterminated file `b\nb` the hunk `-b` / `+c` searched for `b\n`,
-    // matched the FIRST line exactly once, passed the uniqueness guard and recorded `c\nb` -- while
-    // the two bare `b`s had previously refused the replay outright. A fix that turns a refusal into a
-    // wrong answer is worse than the bug it fixed.
-    //
-    // The uniqueness of an anchor is only meaningful in the unit the patch speaks in. Matched as runs
-    // of whole lines, `b` occurs twice in `b\nb` and the hunk has not said which one it meant.
+    // An anchor's uniqueness is only meaningful in the unit the patch speaks in. Restoring the line
+    // terminator narrows what the anchor matches, so against the unterminated file `b\nb` the hunk
+    // `-b` / `+c` searches for `b\n` and matches the FIRST line exactly once -- passing the
+    // uniqueness guard and recording `c\nb`. Matched as runs of whole lines, `b` occurs twice and the
+    // hunk has not said which one it meant.
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b", "+c"]), Some("c2"));
     let edit = events[0].edit.as_ref().unwrap();
 
@@ -915,13 +912,12 @@ fn a_second_agentless_recording_gets_its_own_manifest() {
 
 /// Every node states the size of the content behind it, stored or not.
 ///
-/// A `larger-than-ceiling` node used to say only that it was too big. A reader could not tell 8 KiB
-/// from 8 GiB, could not tell whether raising the ceiling would recover the content or bury the
-/// manifest, and could not audit the decision at all -- the one number that justified withholding
-/// was the one number missing. It is `decide`'s own argument, so it was known where it was dropped.
+/// Without it a `larger-than-ceiling` node cannot tell a reader 8 KiB from 8 GiB, or whether raising
+/// the ceiling recovers the content or buries the manifest -- the one number justifying the
+/// withholding would be the one number missing.
 ///
-/// Null only for content never established, which is the single case with no length to state rather
-/// than a length deliberately not stored.
+/// Null only for content never established: the single case with no length to state, rather than a
+/// length deliberately not stored.
 #[tokio::test]
 async fn a_node_states_how_large_its_content_was() {
     let signer = Ed25519Signer::create().expect("a signer");
@@ -988,11 +984,10 @@ async fn a_node_states_how_large_its_content_was() {
 
 /// A compaction node is an `Entity`, because nothing backs the other claim.
 ///
-/// It used to be the only node in the manifest carrying `provType: "Activity"`, and it carried it in
-/// the metadata of a `DataRegistration`. An activity here *is* a `ComputationRegistration` -- that
-/// statement holds the inputs, the outputs and the `performedBy` attribution -- so a consumer
-/// enumerating activities never reached this node, and one trusting `provType` found an activity
-/// with no statement behind it. `record_tool_run` refuses an empty computation for the same reason.
+/// An activity here *is* a `ComputationRegistration`, holding inputs, outputs and `performedBy`.
+/// `provType: "Activity"` on the metadata of a `DataRegistration` would leave a consumer enumerating
+/// activities never reaching this node, and one trusting `provType` finding an activity with no
+/// statement behind it. `record_tool_run` refuses an empty computation for the same reason.
 ///
 /// What is recorded is a marker: an ordinal, a phase and a timestamp. Phase 4's context snapshots
 /// would earn the other type; asserting it without them did not.
@@ -1034,8 +1029,9 @@ async fn a_compaction_is_an_entity_not_an_activity() {
 /// A call that never answered leaves a reason in the graph, not just a counter.
 ///
 /// Its inputs are registered before the response is known and nothing links them afterwards, because
-/// an activity with no output is not one. They used to dangle with the explanation living only in
-/// `ModelCallWithoutResponse` at session level, so a reader inspecting the node saw no reason at all.
+/// an activity with no output is not one. Without a marker they dangle, and the only explanation
+/// lives in `ModelCallWithoutResponse` at session level -- where a reader inspecting the node cannot
+/// see it.
 ///
 /// The reason is on a marker for the call rather than a field on those nodes, because the nodes are
 /// content addressed and shared: one live session had a single `Model` node feeding 31 successful

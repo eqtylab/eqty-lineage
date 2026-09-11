@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # Everything a Linux CI would check, run inside the container by `just linux-check`.
 #
-# Three things here are only knowable on Linux, and all three were wrong at some point:
+# Three things are only knowable on Linux: the test suite catches platform assumptions in the port;
+# `just nemo-relay-package` is a recipe, so no test covers its platform-specific paths; and
+# `abi-test` dlopens the cdylib, because a `.so` that stages correctly and cannot be loaded is still
+# a broken package.
 #
-#   1. The test suite. Cheap to run, and the only way to catch a platform assumption in the port.
-#   2. `just nemo-relay-package`. It hardcoded `.dylib` in two places and the manifest template in
-#      two more, so on Linux it failed *after* a successful release build -- wasting the build and
-#      reporting a name that was never produced. No test covers a recipe, so this is the check.
-#   3. `abi-test`, which dlopens the built cdylib. A `.so` that stages correctly and cannot be
-#      loaded is still a broken package.
-#
-# The digest and signature are re-derived here rather than trusted: Relay verifies a raw Ed25519
-# signature over the ARTIFACT BYTES, and a manifest whose digest names a different build activates
-# and then refuses to start.
+# The digest and signature are re-derived rather than trusted: Relay verifies a raw Ed25519 signature
+# over the ARTIFACT BYTES, and a manifest whose digest names a different build activates and then
+# refuses to start.
 set -uo pipefail
 
 banner() { echo; echo "######## $* ########"; echo; }
@@ -34,16 +30,14 @@ just --version
 
 cd /work
 
-# One target directory per workspace, each a named volume `just linux-check` mounts -- see the
-# recipe for why sharing one is not merely slow but wrong. The plugin's is mounted *at* the path
-# below, which is also the path `build_cdylib` hands to `--target-dir`, so the nested build inside
-# `abi-test` reuses what this suite just compiled instead of starting from nothing.
+# One target directory per workspace -- sharing one is not merely slow but wrong; see the recipe.
+# This path is also what `build_cdylib` hands to `--target-dir`, so the nested build inside
+# `abi-test` reuses what this suite just compiled.
 export CARGO_TARGET_DIR=/work/packages/eqty-lineage-nemo-relay/target
 
 banner "plugin test suite"
-# Result lines are never truncated. An earlier version piped this through `tail`, which swallowed
-# the per-suite counts and left the total looking like a fraction of itself -- a measurement that
-# reported confidently on output it had discarded.
+# Never pipe this through `tail`: it swallows the per-suite counts and leaves the total looking like
+# a fraction of itself.
 cargo test --manifest-path packages/eqty-lineage-nemo-relay/Cargo.toml 2>&1 \
   | grep -E "^(test |test result|error|running)"
 plugin_status=${PIPESTATUS[0]}

@@ -1172,11 +1172,10 @@ fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
 
 /// The first free name in the `{stem}.json`, `{stem}.1.json`, … series.
 ///
-/// Shared with the export path, which is the whole point. `manifest_path` used to run this check
-/// itself against `{id}.json`, but an agentless session is written as `{id}.unattributed.json` and
-/// its `{id}.json` checkpoint is deleted -- so the next recording under the same id found `{id}.json`
-/// free, picked it, and overwrote the earlier export. The guard was testing a filename the code does
-/// not use.
+/// Shared with the export path, which is the whole point: the guard has to test the filename that
+/// will actually be written. An agentless session is written as `{id}.unattributed.json` and its
+/// `{id}.json` checkpoint is deleted, so a guard checking `{id}.json` finds it free and the next
+/// recording under the same id overwrites the earlier export.
 fn unclobbered(dir: &Path, stem: &str) -> PathBuf {
     let mut path = dir.join(format!("{stem}.json"));
     for sequence in 1..1000 {
@@ -1312,13 +1311,10 @@ fn export(
         // to guess which is final -- and the CID of a manifest that is still growing identifies
         // nothing a reader can hold onto.
         //
-        // After the write, and only if it happened: a mark naming a manifest that is not on disk is
-        // worse than no mark, because it is the one claim a consumer would act on without checking.
-        // `path.exists()` used to stand for "it happened" and could not: for an attributed session
-        // this path *is* the checkpoint path, so a failed final write leaves the previous checkpoint
-        // sitting there and the file passes the test while holding older bytes. The mark would then
-        // carry the final manifest's CID over a file that does not hash to it -- the exact question
-        // a mark exists to answer, answered wrongly.
+        // Gated on `written`, not on `path.exists()`: for an attributed session this path *is* the
+        // checkpoint path, so a failed final write leaves the previous checkpoint sitting there and
+        // an existence check passes over older bytes. The mark would carry the final manifest's CID
+        // over a file that does not hash to it -- the exact question a mark exists to answer.
         if written && let Ok(cid) = blake3_cid_raw_binary(&json) {
             on_manifest(&ManifestMark {
                 kind: ManifestKind::Full,

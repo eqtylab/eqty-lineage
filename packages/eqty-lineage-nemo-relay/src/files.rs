@@ -299,12 +299,11 @@ struct Update {
 /// what the tool produced. The uniqueness guard does not catch it, because `b` really does occur
 /// once.
 ///
-/// Restoring the terminator is necessary but **not sufficient**, and on its own it made things worse
-/// in one case: it narrows what `old` matches, which can turn an ambiguous anchor into an apparently
-/// unique one. Against the unterminated file `b\nb`, the hunk `-b` / `+c` searched for `b\n`, matched
-/// the *first* line exactly once, passed the uniqueness guard and recorded `c\nb` -- while the two
-/// bare `b`s had previously refused the replay outright. So the replay of a hunk is line-oriented
-/// rather than a substring replacement; see [`apply_line_edit`].
+/// Restoring the terminator is necessary but **not sufficient**: it narrows what `old` matches,
+/// which can turn an ambiguous anchor into an apparently unique one. Against the unterminated file
+/// `b\nb`, the hunk `-b` / `+c` searches for `b\n`, matches the first line exactly once and passes
+/// the uniqueness guard. So hunk replay is line-oriented rather than substring replacement; see
+/// [`apply_line_edit`].
 fn as_lines(lines: &[String]) -> String {
     if lines.is_empty() {
         return String::new();

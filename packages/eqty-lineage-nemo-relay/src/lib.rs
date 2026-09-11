@@ -8,11 +8,9 @@
 //!
 //! # Why a native plugin
 //!
-//! Relay offers three execution models. Language bindings run inside the *application* process,
-//! which for a coding agent is NVIDIA's prebuilt `nemo-relay` binary -- nothing of ours can be
-//! injected there. A gRPC worker runs out of process, which is the safe choice for a component with
-//! heavy dependencies. A native `rust_dynamic` component runs in the Relay process itself, with no
-//! process hop and no JSON envelope, and it is the only model that can see
+//! Of Relay's three execution models, language bindings run inside the prebuilt `nemo-relay` binary
+//! where nothing of ours can be injected, and a gRPC worker runs out of process. A native
+//! `rust_dynamic` component runs in the Relay process itself and is the only model that can see
 //! [`Event::annotated_request`] -- the typed LLM request object, rather than the serialized `data`
 //! that file consumers get. That fidelity is the reason for the cost.
 //!
@@ -202,28 +200,20 @@ impl NativePlugin for EqtyLineagePlugin {
 
 /// Tell the host where the manifest is, so it is discoverable without knowing our path convention.
 ///
-/// This closes the loop the rest of the plugin opens: a recording of a session that says nothing
-/// *inside* that session leaves a consumer to find `.eqty/manifests/{session}.json` by convention,
-/// and a convention is not an attestation.
+/// Without it a consumer finds `.eqty/manifests/{session}.json` by convention, and a convention is
+/// not an attestation.
 ///
-/// Two things make this more than one call. The scope stack is **thread-local**, and a mark with no
-/// parent is emitted under whatever scope is current -- but a final manifest is written from the
-/// worker thread, which Relay never bound a stack to, and on Codex that write happens at teardown
-/// when the session's scopes are gone regardless. So a stack is created and bound for the call when
-/// there is none, which puts the mark on the stream under a root of its own rather than under the
-/// session's scope. That is a real limitation and the honest version of it: the mark's *data* names
-/// the session's manifest, its position in the scope tree does not.
+/// The scope stack is **thread-local** and the final manifest is written from the worker thread,
+/// which Relay never bound a stack to. So a stack is created for the call, putting the mark under a
+/// root of its own: the mark's *data* names the session's manifest, its position in the scope tree
+/// does not.
 ///
-/// And nothing here may fail loudly. This runs on the worker thread while a session is being torn
-/// down; a panic crossing the ABI takes the gateway with it, and an error is not worth a manifest.
-/// The manifest is already on disk either way -- the mark is how it is *found*, not whether it
-/// exists. So a failure is counted rather than raised, and `unannounced` is where a reader sees it.
+/// Failures are counted rather than raised -- this runs during teardown, a panic crossing the ABI
+/// takes the gateway with it, and the manifest is on disk either way. `unannounced` is where a
+/// reader sees it.
 ///
-/// **Not exercised across the ABI.** `tests/regressions.rs` drives the mark through the seam this
-/// closure sits behind, which pins what is announced and when. It does not prove `emit_mark`
-/// reaches a real host from this thread: `abi-test` activates the plugin but never drives events
-/// through the subscriber, so no export -- and no mark -- happens there. Confirming that needs
-/// either a live session or an `abi-test` that pumps Relay's event pipeline.
+/// **Not exercised across the ABI.** `tests/regressions.rs` pins what is announced and when, but
+/// `abi-test` never drives events through the subscriber, so no mark happens there.
 fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
     let data = json!({
         "cid": mark.cid,

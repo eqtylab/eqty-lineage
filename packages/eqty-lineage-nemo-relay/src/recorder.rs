@@ -1,21 +1,17 @@
 //! Turning observed events into a lineage graph.
 //!
-//! This is the state machine the plan calls the port: it owns what the session has seen so far, and
-//! it is the only place that decides what a file node *means*. Ported faithfully from the existing
-//! Python recorder rather than redesigned -- the semantics below each exist for a measured reason,
-//! and several of them look like over-thinking until the case that motivated them shows up.
+//! Owns what the session has seen so far, and is the only place that decides what a file node
+//! *means*. Ported from the Python recorder.
 //!
 //! # File identity is content. The path is metadata
 //!
 //! Keying on path would make `read → edit → read` either hide every edit or produce a cycle, since
-//! the same node would be both an input and an output of the same activity. So a node is its
-//! content, addressed by the CID of the bytes, and the path travels in the metadata beside it.
+//! the same node would be both an input and an output of one activity. So a node is its content,
+//! addressed by the CID of the bytes, and the path travels in the metadata beside it.
 //!
-//! The consequence is deliberate: one file copied or moved to a second location is **one node with
-//! two things said about it**, not two nodes. Two files that happen to hold identical bytes are also
-//! one node -- which is the same statement, since under content addressing they are the same thing.
-//! `(path, content CID)` is still the in-session dedup key, because a path is how a *version chain*
-//! is followed, but it never reaches the graph as identity.
+//! One file in two locations is therefore one node with two things said about it, and two files
+//! holding identical bytes are also one node. `(path, content CID)` is still the in-session dedup
+//! key, because a path is how a version chain is followed, but it never reaches the graph.
 //!
 //! # There are three ways not to know, and they must not collapse
 //!
@@ -24,10 +20,8 @@
 //! * `deleted:{path}` -- the file is gone.
 //!
 //! Collapsing the last two would let a deletion deduplicate against a failed read of the same path,
-//! and the graph would then assert the file was removed when nobody ever saw it removed.
-//!
-//! The last two are path-derived, and unavoidably so: with no content there is nothing else to be
-//! identical about, and two unread files cannot be shown to be the same file. Only nodes whose
+//! and the graph would assert the file was removed when nobody saw it removed. Both are
+//! path-derived: with no content there is nothing else to be identical about. Only nodes whose
 //! content was established obey the content-identity rule above.
 //!
 //! # Identity is computed before redaction, never after
@@ -423,11 +417,9 @@ impl Recorder {
             "withheldBecause": reason,
             "withheldFor": quoted,
             "content-cid": content_cid,
-            // The size of what was registered, stated whether or not the bytes were kept. A
-            // `larger-than-ceiling` node used to say only that it was too big: a reader could not
-            // tell 8 KiB from 8 GiB, could not tell whether raising the ceiling would recover the
-            // content or bury the manifest, and could not audit the decision at all. The length is
-            // `decide`'s own argument, so it was known at the moment it was discarded.
+            // Stated whether or not the bytes were kept: without it a `larger-than-ceiling` node
+            // cannot tell a reader whether raising the ceiling recovers the content or buries the
+            // manifest.
             "contentBytes": bytes.len(),
         });
         if let (Some(target), Some(extra)) = (metadata.as_object_mut(), extra.as_object()) {
@@ -580,16 +572,14 @@ impl Recorder {
     /// A node rather than a log line, because compaction changes what the agent could possibly have
     /// known: everything before it has left the model's window. A reader tracing why a later step
     /// ignored an earlier one needs to see where the boundary was.
-    /// The ordinal counts compactions, and the name says which half of one this is.
-    ///
-    /// It used to count hook events and name the node after that count, so Claude Code -- which
-    /// fires `PreCompact` and `PostCompact` around a single compaction -- produced `compaction 1`
-    /// and `compaction 2`. Two nodes is right, because the boundary has two edges and each is a real
-    /// observation. Calling the second one a second compaction was not.
+    /// The ordinal counts compactions, not hook events, and the name says which half of one this is:
+    /// Claude Code fires `PreCompact` and `PostCompact` around a *single* compaction. Two nodes is
+    /// right -- the boundary has two edges, each a real observation -- but they are two halves of
+    /// one, not two compactions.
     ///
     /// The ordinal stays in the content as well as the name because these nodes are content
-    /// addressed: two compactions in one session whose descriptors matched would collapse into one
-    /// node, and the graph would then under-report rather than over-report.
+    /// addressed: two compactions whose descriptors matched would collapse into one node, and the
+    /// graph would under-report.
     ///
     /// An `After` with no `Before` ahead of it still opens a new ordinal. A host that emits only the
     /// second hook, or an auto-compaction that skips the first, is better recorded as the half we saw
@@ -623,23 +613,16 @@ impl Recorder {
             ),
         };
         let name = format!("{label} {index}");
-        // An `Entity`, not an `Activity`, and the distinction is structural rather than pedantic.
-        // An activity in this manifest *is* a `ComputationRegistration` -- that statement carries the
-        // inputs, the outputs and the `performedBy` attribution. This is a `DataRegistration`, so a
-        // consumer enumerating activities never reaches it and one trusting `provType` finds an
-        // activity with no statement behind the claim. It was the only node in the manifest making
-        // it.
+        // An `Entity`, not an `Activity`. An activity in this manifest *is* a
+        // `ComputationRegistration`, carrying inputs, outputs and `performedBy`; this is a
+        // `DataRegistration`, so claiming `provType: Activity` would describe graph structure no
+        // statement backs. What is captured is a marker -- an ordinal, a phase, a timestamp -- and
+        // nothing about the compaction was observed beyond its having happened, which is why
+        // `record_tool_run` refuses an empty computation for the same reason
+        // (`ActivityWithoutOutputs`).
         //
-        // What is actually captured is a marker: an ordinal, a phase and a timestamp, recording that
-        // a boundary existed at a moment. That is a thing. The compaction event is genuinely an
-        // activity, but nothing about it was observed beyond its having happened -- no inputs, no
-        // outputs, no performer -- and `record_tool_run` refuses an empty computation for that same
-        // reason (`ActivityWithoutOutputs`). The name and description carry what a reader needs;
-        // `provType` is a claim about graph structure and should be backed by some.
-        //
-        // Phase 4's context snapshots (§8) are what would earn the other type: the pre- and
-        // post-compaction contexts as entities, and one real computation using the first to generate
-        // the second. Until then this node takes the ordinary default and overrides nothing.
+        // Phase 4's context snapshots (§8) would earn the other type: pre- and post-compaction
+        // contexts as entities, and one real computation between them.
         self.register_payload(
             "Dataset",
             &name,
@@ -758,17 +741,11 @@ impl Recorder {
     /// Registered once per session: a tool called forty times is one node with forty edges, not
     /// forty nodes.
     ///
-    /// The descriptor goes through the serializer, never `format!`. `name` is host-supplied -- a tool
-    /// name, an MCP tool name, a model id -- and interpolating it raw makes the node's own content
-    /// forgeable: a tool named `a","kind":"Model` produced the bytes
-    /// `{"kind":"Tool","name":"a","kind":"Model"}`, which parse, and parse to *`kind: Model`* because
-    /// a duplicate key takes the last value. The node then describes itself as something it is not.
-    /// A name holding a bare quote or backslash is the blunter version: content that is not JSON at
-    /// all.
-    ///
-    /// Identity was never at risk -- `kind` is one of our own literals and precedes `name`, so the
-    /// prefix pins the pair and no two `(kind, name)` pairs can produce the same bytes. The claim
-    /// inside the node was.
+    /// The descriptor goes through the serializer, never `format!`. `name` is host-supplied, and
+    /// interpolating it raw makes the node's own content forgeable: a tool named `a","kind":"Model`
+    /// yields `{"kind":"Tool","name":"a","kind":"Model"}`, which parses as *`kind: Model`* because a
+    /// duplicate key takes the last value. Identity is not at risk -- `kind` is our own literal and
+    /// precedes `name` -- but the claim inside the node is.
     pub async fn record_actor(
         &mut self,
         kind: &str,
@@ -869,22 +846,16 @@ impl Recorder {
 /// a JSON envelope rather than a content hash, which is exactly why the node's metadata marks it
 /// `redacted` -- a reader must be able to tell which nodes are content-addressed and which are not.
 ///
-/// Built through the serializer rather than `format!` because `content_cid` is not always a hash:
-/// for an unestablished file it is `unknown:{path}`, and a path is arbitrary bytes from the host. A
-/// path containing a quote closed the string early, so the descriptor for such a file was not valid
-/// JSON -- unreadable content on a node whose entire purpose is to stand in for content nobody can
-/// read. A path shaped like `x","withheld":true}` went further and made the node's own `withheld`
-/// claim say the opposite of the decision that was taken.
+/// Built through the serializer rather than `format!`: `content_cid` is not always a hash -- for an
+/// unestablished file it is `unknown:{path}` -- and a path is arbitrary bytes from the host. A path
+/// shaped like `x","withheld":true}` would otherwise make the node's own `withheld` claim say the
+/// opposite of the decision taken.
 ///
-/// **The path is deliberately not in here.** Identity is content, and the path is metadata, so one
-/// file copied or moved to a second location is one node with two things said about it. Hashing the
-/// path in would split the withheld nodes -- exactly the files, secrets and large artifacts, where
-/// knowing two recordings saw the same bytes is worth the most.
-///
-/// When content was never established the caller passes `unknown:{path}` as `content_cid`, so the
-/// path does still determine identity there. That is unavoidable rather than intended: with no
-/// content there is nothing else to be identical about, and two unread files cannot be shown to be
-/// the same file.
+/// **The path is deliberately not in here.** Identity is content, so hashing the path in would split
+/// the withheld nodes -- exactly the secrets and large artifacts where knowing two recordings saw
+/// the same bytes is worth the most. When content was never established the caller passes
+/// `unknown:{path}`, so the path does determine identity there; that is unavoidable rather than
+/// intended.
 fn canonical_descriptor(content_cid: &str, withheld: bool) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&json!({
         "content-cid": content_cid,

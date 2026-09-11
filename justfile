@@ -18,13 +18,10 @@ build-python:
 # shared library that ships with its own `relay-plugin.toml` and sha256 digest.
 #
 # Kept out of PR CI: it recompiles the whole dependency tree at a profile nothing else on the PR path
-# uses, measured at 107s and still climbing when that step was cancelled.
-#
-# Which leaves the release profile exercised on the PR path by nothing. `release-nemo-relay-plugin.yml`
-# now builds it for every shipped target on a release, so it is covered at the point it matters --
-# but not before, so a release is still the first time a release build runs for a given commit.
-# `release.yml` cannot do this: it resolves a `PACKAGE@X.Y.Z` tag to a `pyproject.toml` and this
-# package has none, which is why the plugin has a workflow of its own rather than a job in that one.
+# uses. `release-nemo-relay-plugin.yml` builds it for every shipped target on a release instead, so a
+# release is the first time a release build runs for a given commit. `release.yml` cannot do this: it
+# resolves a `PACKAGE@X.Y.Z` tag to a `pyproject.toml` and this package has none, which is why the
+# plugin has a workflow of its own rather than a job in that one.
 #
 # Build the Relay cdylib in release
 build-relay:
@@ -173,11 +170,10 @@ nemo-relay-package target="" out="dist/relay-plugin":
     (umask 077 && openssl genpkey -algorithm ed25519 -out "$key")
     echo "generated a NEW dev signing key at $key (private -- do not commit or share)"
   fi
-  # Ask cargo where it put the cdylib rather than assuming. Both halves of the assumption were
-  # wrong: the *name* is per-platform, which broke this recipe on Linux, and the *directory* moves
-  # with CARGO_TARGET_DIR -- which `just linux-check` sets. A hardcoded `target/release` then found
-  # a stale artifact from an earlier build and packaged it with a digest computed over the same
-  # stale bytes, so the check passed while verifying nothing.
+  # Ask cargo where it put the cdylib rather than assuming: the name is per-platform and the
+  # directory moves with CARGO_TARGET_DIR, which `just linux-check` sets. A hardcoded
+  # `target/release` can find a stale artifact and package it with a digest over the same stale
+  # bytes, so the check passes while verifying nothing.
   root="$PWD"
   out="{{out}}"
   export TARGET_TRIPLE="{{target}}"
