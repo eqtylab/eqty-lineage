@@ -9,21 +9,12 @@ description = "EQTY lineage callback handler for LangChain and LangGraph."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "eqty-sdk>=2.3.1rc2",
+    "eqty-sdk>=2.4.0",
     "langchain-core>=0.3",
     "rfc8785>=0.1",
 ]
-
-[[tool.uv.index]]
-name = "eqty"
-url = "https://pypi.eqtylab.io/simple/"
-publish-url = "https://pypi.eqtylab.io/"
-explicit = true
 
 [tool.uv.build-backend]
 # flat layout (module dir at package root, no src/); dotted name = namespace package
 module-root = ""
 module-name = "eqty_lineage.langchain"
-
-[tool.uv.sources]
-eqty-sdk = { index = "eqty" }

@@ -30,12 +30,6 @@ eqty-lineage-langchain = { workspace = true }
 eqty-lineage-deepagents = { workspace = true }
 eqty-lineage-vnim = { workspace = true }
 
-[[tool.uv.index]]
-name = "eqty"
-url = "https://pypi.eqtylab.io/simple/"
-publish-url = "https://pypi.eqtylab.io/"
-explicit = true
-
 [tool.pytest.ini_options]
 # Anchors rootdir at the workspace root, so the shared `sdk` fixture in the root conftest.py stays in
 # scope even when pytest is invoked from inside one package's directory.
