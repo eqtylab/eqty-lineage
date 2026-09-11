@@ -990,6 +990,67 @@ fn a_second_agentless_recording_gets_its_own_manifest() {
         "both still say what they are: {written:?}"
     );
 }
+
+#[test]
+fn the_last_name_in_the_series_is_checked_like_every_other() {
+    // The search tested the *previous* candidate and then assigned the next, so the last name in a
+    // bounded series came back having never been tested for existence -- the one case where the
+    // guard returned an occupied path. A directory that full is not a reason to overwrite a
+    // manifest, and the write that follows is irreversible: it announces a mark and deletes the
+    // checkpoint.
+    let into = TempDir::new().unwrap();
+    let session = "01a040aa-0000-0000-0000-0000000000eb";
+    let root = "01a040aa-0000-0000-0000-0000000000ec";
+
+    let name = |n: usize| {
+        into.path().join(match n {
+            0 => format!("{session}.unattributed.json"),
+            n => format!("{session}.unattributed.{n}.json"),
+        })
+    };
+    for n in 0..1000 {
+        fs::write(name(n), b"{}").unwrap();
+    }
+    fs::write(name(999), b"an earlier recording").unwrap();
+
+    // No `session.start`, so the export resolves `{id}.unattributed` rather than `{id}`.
+    replay(
+        &[
+            tool_scope(
+                session,
+                root,
+                root,
+                "start",
+                "Bash",
+                "toolu_a",
+                serde_json::json!({ "command": "a thousand and first" }),
+                None,
+            ),
+            tool_scope(
+                session,
+                root,
+                root,
+                "end",
+                "Bash",
+                "toolu_a",
+                serde_json::json!("a thousand and first"),
+                None,
+            ),
+        ],
+        &into,
+    );
+
+    assert_eq!(
+        fs::read_to_string(name(999)).unwrap(),
+        "an earlier recording",
+        "the occupied last name is left alone"
+    );
+    assert!(
+        decoded(&on_disk(&name(1000))).contains("a thousand and first"),
+        "and the series continues past it"
+    );
+}
+
 /// Every node states the size of the content behind it, stored or not.
 ///
 /// Without it a `larger-than-ceiling` node cannot tell a reader 8 KiB from 8 GiB, or whether raising

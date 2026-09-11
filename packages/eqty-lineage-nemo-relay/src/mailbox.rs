@@ -1179,11 +1179,12 @@ fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
 /// recording under the same id overwrites the earlier export.
 fn unclobbered(dir: &Path, stem: &str) -> PathBuf {
     let mut path = dir.join(format!("{stem}.json"));
-    for sequence in 1..1000 {
-        if !path.exists() {
-            break;
-        }
+    let mut sequence = 1;
+    // No bound: a counted loop tests the previous candidate and returns the last one untested,
+    // which is the one clobber this guard exists to stop.
+    while path.exists() {
         path = dir.join(format!("{stem}.{sequence}.json"));
+        sequence += 1;
     }
     path
 }
