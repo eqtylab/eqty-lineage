@@ -151,8 +151,14 @@ of the same path, and the graph would assert a removal nobody observed.
 
 A Codex `*** Delete File` constructs `deleted:{path}`. Its node says `contentState: "deleted"` and is
 an *output* of the run that removed it — as an input it would say the tool consumed what it deleted.
-Claude Code has no delete tool at all: deletions go through `Bash`, where no file effect is
-observable in the first place, so nothing there reaches this.
+
+That directive is the only route to it, and in practice neither agent takes it when deleting is the
+task: both reach for `rm`, Claude Code because it has no delete tool and Codex by preference. A shell
+command carries no observable file effect, so the path keeps its last version and the manifest
+disagrees with the disk. Only a deletion riding inside a patch the model was already writing reaches
+`deleted:{path}`. Closing the rest needs a filesystem delta rather than a better reading of tool
+results — a shell command can only be guessed at, and a guessed removal is exactly the claim this
+section refuses to make.
 
 **Identity is computed before redaction, never after.** Two different secrets at one path scrub to
 the same placeholder; hashing what was stored rather than what was seen would merge them into one
