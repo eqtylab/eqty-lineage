@@ -705,6 +705,15 @@ impl Recorder {
     /// siblings in flight the performer cannot be established. The activity is credited to the root
     /// agent and marked ambiguous rather than assigned to whichever sibling started last -- a wrong
     /// specific attribution is worse than an honest general one, because a reader can act on it.
+    /// Count a turn nobody typed, by the kind of thing that opened it.
+    ///
+    /// In coverage rather than left to the nodes, because the nodes are what went unread: every
+    /// harness counted prompts and none opened one, so two live sessions attested instructions
+    /// their user never sent and nothing flagged it.
+    pub fn note_turn_author(&mut self, counter: &'static str) {
+        self.count(counter);
+    }
+
     pub fn note_ambiguous_attribution(&mut self) {
         self.count("AmbiguousSubagentAttribution");
     }

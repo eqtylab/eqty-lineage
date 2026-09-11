@@ -79,12 +79,24 @@ pub enum LineageEvent {
     },
     /// A turn opened with a prompt.
     ///
-    /// `source` is Relay's `turn_source`: `user_prompt` when a person typed it, and something else
-    /// when the host opened the turn itself. Not every turn is a human speaking, and the difference
-    /// is an authorship claim the manifest should not invent.
+    /// Not every turn is a human speaking, and who spoke is an authorship claim the manifest must
+    /// not invent. Three facts decide it, and all three come from the host rather than from the
+    /// text -- measured on live ATOF streams from both agents:
+    ///
+    /// - `source` is Relay's `turn_source`. `user_prompt` for a person typing, `gateway_request`
+    ///   for a turn the gateway raised itself -- a quota check, a guardrail classification.
+    /// - `agent_id` and `agent_kind` appear only when the turn was opened *for* a spawned agent.
+    ///   Codex delegates by opening a sibling turn whose prompt is the instruction the parent model
+    ///   composed; the id is the one `spawn_agent` returned, so it names the performer too.
+    ///
+    /// One case has no signal at all: Claude Code delivers a background task's completion as a turn
+    /// whose every field matches a typed one but `turn_index`. That is handled where the text is,
+    /// because that is the only place it differs.
     PromptSubmitted {
         text: String,
         source: Option<String>,
+        agent_id: Option<String>,
+        agent_kind: Option<String>,
     },
     /// A model call began, carrying the request that opened it.
     ///
@@ -249,7 +261,20 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
             // mistake in the other direction. Recording it puts the basis in the manifest, where a
             // live run on either host reports what the host actually sends.
             let source = string_at(metadata, "turn_source").map(str::to_string);
-            Some(LineageEvent::PromptSubmitted { text, source })
+            // Codex spells these in both metadata and data; Claude Code sends neither. Read from
+            // metadata first because that is where Relay normalises, and fall back to the raw hook
+            // payload so a host that only fills one of them is still understood.
+            let field = |key: &str| {
+                string_at(metadata, key)
+                    .or_else(|| string_at(event.data(), key))
+                    .map(str::to_string)
+            };
+            Some(LineageEvent::PromptSubmitted {
+                text,
+                source,
+                agent_id: field("agent_id"),
+                agent_kind: field("agent_type"),
+            })
         }
 
         // An `agent` scope is either the session itself or a subagent inside it, and `parent_uuid`

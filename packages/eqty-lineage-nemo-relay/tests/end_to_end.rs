@@ -438,6 +438,47 @@ fn llm_scope(
 }
 
 /// A turn scope, which is the hook-path event that names the session the LLM scopes hang from.
+/// A turn scope as a host really sends one: the prompt, and the fields that say who opened it.
+///
+/// `source`, `agent_id` and `agent_kind` are the three the live ATOF streams showed varying --
+/// `turn_source`, and the pair Codex adds when a turn belongs to an agent it spawned.
+fn opened_turn(
+    session: &str,
+    uuid: &str,
+    parent: &str,
+    phase: &str,
+    prompt: &str,
+    source: &str,
+    agent: Option<(&str, &str)>,
+) -> Event {
+    let mut metadata = serde_json::json!({
+        "session_id": session,
+        "agent_kind": "claude-code",
+        "nemo_relay_scope_role": "turn",
+        "turn_source": source,
+    });
+    if let Some((id, kind)) = agent {
+        metadata["agent_id"] = serde_json::json!(id);
+        metadata["agent_type"] = serde_json::json!(kind);
+    }
+    serde_json::from_value(serde_json::json!({
+        "atof_version": "0.1",
+        "kind": "scope",
+        "category": "custom",
+        "scope_category": phase,
+        "name": "claude-code-turn",
+        "uuid": uuid,
+        "parent_uuid": parent,
+        "timestamp": "2026-09-02T12:00:00.000000+00:00",
+        "attributes": [],
+        "data": { "prompt": prompt },
+        "data_schema": null,
+        "category_profile": null,
+        "metadata": metadata
+    }))
+    .expect("a well-formed turn event")
+}
+
 fn turn_scope(session: &str, uuid: &str, parent: &str, phase: &str) -> Event {
     serde_json::from_value(serde_json::json!({
         "atof_version": "0.1",
@@ -3304,5 +3345,163 @@ fn a_rejected_patch_that_deletes_a_denied_file_withholds_the_whole_body() {
         !decoded_blobs(path).contains("deleted-alongside-secret"),
         "a denied path anywhere in a rejected patch withholds the body that carries it:\n{}",
         decoded_blobs(path)
+    );
+}
+
+/// Every kind of turn opener, and what the manifest is allowed to claim about each.
+fn turn_kinds() -> Vec<(
+    &'static str,
+    &'static str,
+    Option<(&'static str, &'static str)>,
+    &'static str,
+    &'static str,
+)> {
+    vec![
+        // (prompt, turn_source, agent, expected node name, expected role)
+        (
+            "count the lines",
+            "user_prompt",
+            None,
+            "user prompt",
+            "user",
+        ),
+        // A real message with a reminder appended is still a real message. The containment test
+        // that would have caught the notification below relabels this one, which is why the rule
+        // is anchored: this case is the majority, and getting it wrong is the worse failure.
+        (
+            "count the lines\n<system-reminder>be concise</system-reminder>",
+            "user_prompt",
+            None,
+            "user prompt",
+            "user",
+        ),
+        (
+            "quota",
+            "gateway_request",
+            None,
+            "gateway prompt",
+            "gateway_request",
+        ),
+        (
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+            "user_prompt",
+            None,
+            "turn notification",
+            "system",
+        ),
+        // Codex reports `user_prompt` here too -- measured, not assumed -- so `agent_id` has to win.
+        (
+            "Read notes.md and report its line count.",
+            "user_prompt",
+            Some(("01a08db9-3578-73b2-a26e-4494f7e161da", "default")),
+            "delegated instruction",
+            "agent",
+        ),
+    ]
+}
+
+#[test]
+fn a_turn_is_attributed_to_whoever_actually_opened_it() {
+    for (prompt, source, agent, name, role) in turn_kinds() {
+        let into = TempDir::new().expect("a temp dir");
+        let session = "01a040aa-0000-0000-0000-000000000b01";
+        let root = "01a040aa-0000-0000-0000-000000000b02";
+        let turn = "01a040aa-0000-0000-0000-000000000b03";
+        let events = vec![
+            mark(
+                session,
+                root,
+                root,
+                "session.start",
+                serde_json::json!({ "model": "opus" }),
+            ),
+            opened_turn(session, turn, root, "start", prompt, source, agent),
+        ];
+        replay(&events, &into);
+
+        let path = &manifests(&into)[0];
+        let found: Vec<String> = blob_objects(path)
+            .into_iter()
+            .filter(|node| node["assetType"] == "Prompt")
+            .filter_map(|node| {
+                Some(format!(
+                    "{}/{}",
+                    node["name"].as_str()?,
+                    node["role"].as_str()?
+                ))
+            })
+            .collect();
+        assert!(
+            found.contains(&format!("{name}/{role}")),
+            "a turn opened by {source:?}{} must be recorded as {name}/{role}, got {found:?}",
+            if agent.is_some() {
+                " for a spawned agent"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn a_delegated_turns_work_is_credited_to_the_agent_it_was_delegated_to() {
+    // The spawned agent's own scope opens and closes inside the *delegating* turn, so by the time
+    // its turn runs there is no live subagent to infer from. Every activity was going to the root
+    // agent, beside an agent node with nothing attributed to it at all.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000b11";
+    let root = "01a040aa-0000-0000-0000-000000000b12";
+    let turn = "01a040aa-0000-0000-0000-000000000b13";
+    let call = "01a040aa-0000-0000-0000-000000000b14";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        opened_turn(
+            session,
+            turn,
+            root,
+            "start",
+            "Read notes.md and report its line count.",
+            "user_prompt",
+            Some(("01a08db9-3578-73b2-a26e-4494f7e161da", "default")),
+        ),
+        tool_scope(
+            session,
+            call,
+            turn,
+            "start",
+            "Bash",
+            "toolu_b1",
+            serde_json::json!({ "command": "wc -l notes.md" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            turn,
+            "end",
+            "Bash",
+            "toolu_b1",
+            serde_json::json!("2 notes.md\n"),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let blobs = decoded_blobs(path);
+    assert!(
+        blobs.contains("\"attribution\":\"delegated-turn\""),
+        "the activity must say the turn was delegated:\n{blobs}"
+    );
+    assert!(
+        blobs.contains("\"TurnDelegatedToAgent\":1"),
+        "and coverage must count it:\n{blobs}"
     );
 }

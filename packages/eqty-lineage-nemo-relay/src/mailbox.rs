@@ -105,6 +105,12 @@ struct SessionState {
     /// did this kind of agent do" a graph question. Two parallel workers of the same kind therefore
     /// share it, and the instance travels on each activity instead.
     live_subagents: Vec<(String, AssetRef)>,
+    /// The agent a delegated turn was opened for, and its id, until the next turn replaces it.
+    ///
+    /// Held per turn rather than pushed onto `live_subagents`, because it is not a live scope: the
+    /// spawned agent's own scope has already closed by the time its turn arrives. This says who the
+    /// turn belongs to, which `live_subagents` cannot answer here.
+    turn_agent: Option<(String, AssetRef)>,
     /// Where this session's manifest is written, resolved once when the session opens.
     ///
     /// Held rather than recomputed so that every write for one session lands on one file. Resolving
@@ -136,6 +142,11 @@ impl SessionState {
     /// produce a specific, checkable, wrong claim -- worse than a general true one, since a reader
     /// would act on it.
     fn actor_name(&self) -> Option<String> {
+        // An explicitly delegated turn outranks inference: the host named the performer, and
+        // `live_subagents` is empty here regardless.
+        if let Some((_, agent)) = &self.turn_agent {
+            return Some(agent.as_str().to_string());
+        }
         match self.live_subagents.as_slice() {
             [(_, only)] => Some(only.as_str().to_string()),
             _ => self.agent.as_ref().map(|asset| asset.as_str().to_string()),
@@ -147,6 +158,9 @@ impl SessionState {
     /// `None` for the root agent -- there is only ever one of it, so an instance would say nothing --
     /// and `None` when siblings are live, where the instance is genuinely not known.
     fn actor_instance(&self) -> Option<String> {
+        if let Some((id, _)) = &self.turn_agent {
+            return Some(id.clone());
+        }
         match self.live_subagents.as_slice() {
             [(id, _)] => Some(id.clone()),
             _ => None,
@@ -159,6 +173,9 @@ impl SessionState {
     /// tell which of four workers did this, so it is filed under the root". Both carry the same
     /// `performedBy`; only this distinguishes them.
     fn attribution_basis(&self) -> &'static str {
+        if self.turn_agent.is_some() {
+            return "delegated-turn";
+        }
         match self.live_subagents.len() {
             0 => "root-agent",
             1 => "sole-live-subagent",
@@ -385,6 +402,7 @@ fn run(
                     turn_prompt: None,
                     turn_prompt_attributed: false,
                     live_subagents: Vec::new(),
+                    turn_agent: None,
                 },
             );
         }
@@ -435,6 +453,99 @@ fn completes_work(event: &LineageEvent) -> bool {
     )
 }
 
+/// Turn openers that a host injected rather than a person typing.
+///
+/// Anchored at the start, never "contains": Claude Code appends `<system-reminder>` blocks to
+/// genuine user messages, so a containment test would relabel real prompts as machine-generated --
+/// turning a false claim about a few nodes into a false claim about most of them.
+///
+/// Text is the last resort and is used for exactly one case. A background task's completion arrives
+/// as a turn whose metadata is identical to a typed turn's in every field but `turn_index`, measured
+/// against a live ATOF stream; there is nothing else to key on.
+const INJECTED: [&str; 4] = [
+    "<task-notification>",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<system-reminder>",
+];
+
+/// Who opened a turn. `role` and `name` are what the manifest will claim, so they are decided once.
+enum TurnAuthor {
+    /// A person typed it.
+    User,
+    /// The gateway raised the turn itself -- a quota check, a guardrail classification.
+    Gateway(String),
+    /// The parent model composed it for an agent it spawned, which also names the performer.
+    Delegated { id: String, kind: Option<String> },
+    /// The host delivered something to the session on the user's turn.
+    Notification,
+}
+
+impl TurnAuthor {
+    fn of(text: &str, source: Option<&str>, agent_id: Option<&str>, kind: Option<&str>) -> Self {
+        // Strongest first. `agent_id` says *which* agent, not merely "not the user", so it outranks
+        // a `turn_source` that reports `user_prompt` for a delegated turn on Codex -- which it does.
+        if let Some(id) = agent_id {
+            return Self::Delegated {
+                id: id.to_string(),
+                kind: kind.map(str::to_string),
+            };
+        }
+        if let Some(source) = source.filter(|source| *source != "user_prompt") {
+            return Self::Gateway(source.to_string());
+        }
+        if INJECTED
+            .iter()
+            .any(|tag| text.trim_start().starts_with(tag))
+        {
+            return Self::Notification;
+        }
+        Self::User
+    }
+
+    /// The node name. Distinct per author because the session view keys its rule on
+    /// `(assetType, name)`, and because a reader scanning names should see the difference.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::User => "user prompt",
+            Self::Gateway(_) => "gateway prompt",
+            Self::Delegated { .. } => "delegated instruction",
+            Self::Notification => "turn notification",
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::User => "The instruction that opened this turn.",
+            Self::Gateway(_) => "A request the gateway raised, not an instruction from the user.",
+            Self::Delegated { .. } => {
+                "The instruction a parent model composed for an agent it spawned."
+            }
+            Self::Notification => "What the host delivered to open this turn.",
+        }
+    }
+
+    fn role(&self) -> &str {
+        match self {
+            Self::User => "user",
+            Self::Gateway(source) => source,
+            Self::Delegated { .. } => "agent",
+            Self::Notification => "system",
+        }
+    }
+
+    /// Counted so a reader sees that a session held turns nobody typed without decoding nodes --
+    /// the gap that let this ship: prompts were counted and never read.
+    fn counter(&self) -> Option<&'static str> {
+        match self {
+            Self::User => None,
+            Self::Gateway(_) => Some("TurnOpenedByGateway"),
+            Self::Delegated { .. } => Some("TurnDelegatedToAgent"),
+            Self::Notification => Some("TurnOpenedByNotification"),
+        }
+    }
+}
+
 /// Apply one event. Returns whether the session ended.
 async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool {
     let at = Some(at.to_string());
@@ -455,21 +566,63 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
                 state.agent = Some(asset);
             }
         }
-        LineageEvent::PromptSubmitted { text, source } => {
+        LineageEvent::PromptSubmitted {
+            text,
+            source,
+            agent_id,
+            agent_kind,
+        } => {
             // The turn's instruction. Everything the agent does afterwards is downstream of it, so
             // it becomes the input the turn's activities hang from -- without it a manifest attests
             // what an agent did and not what it was asked to do.
+            //
+            // Downstream of it whoever opened it: a notification that led to file edits, and an
+            // instruction a model wrote for an agent it spawned, are both real openers. What must
+            // not be invented is *who spoke*, which is the only thing that varies below.
+            let author = TurnAuthor::of(
+                &text,
+                source.as_deref(),
+                agent_id.as_deref(),
+                agent_kind.as_deref(),
+            );
+            if let Some(counter) = author.counter() {
+                state.recorder.note_turn_author(counter);
+            }
+            // A delegated turn names its performer, and nothing else in the stream does: the
+            // subagent scope opens and closes inside the *delegating* turn, so by the time this
+            // turn's work runs there is no live subagent to infer from and every activity was being
+            // credited to the root agent -- beside an agent node with nothing attributed to it.
+            state.turn_agent = match &author {
+                TurnAuthor::Delegated { id, kind } => {
+                    let label = kind.clone().unwrap_or_else(|| "subagent".into());
+                    state
+                        .recorder
+                        .record_actor(
+                            "Agent",
+                            &label,
+                            &format!("The agent '{label}', spawned by this session."),
+                            serde_json::json!({ "role": "subagent" }),
+                            at.clone(),
+                        )
+                        .await
+                        .ok()
+                        .map(|asset| (id.clone(), asset))
+                }
+                _ => None,
+            };
             if let Ok(asset) = state
                 .recorder
                 .register_payload(
                     "Prompt",
-                    "user prompt",
-                    "The instruction that opened this turn.",
+                    author.name(),
+                    author.description(),
                     text.as_bytes(),
-                    // `turnSource` is what Relay said; `role` is still `user` because changing it
-                    // needs the vocabulary a live run will report, and asserting a new label from a
-                    // single observed value would be inventing the answer rather than reading it.
-                    serde_json::json!({ "role": "user", "turnSource": source }),
+                    serde_json::json!({
+                        "role": author.role(),
+                        "turnSource": source,
+                        "agentId": agent_id,
+                        "agentType": agent_kind,
+                    }),
                     at,
                 )
                 .await
