@@ -773,6 +773,86 @@ async fn a_rename_with_no_hunks_empties_the_source_too() {
     );
 }
 
+// ------------------------------------------------------- a removal that read as a failed read
+
+#[tokio::test]
+async fn a_removal_is_not_a_read_that_established_nothing() {
+    // Both are contentless and both are keyed on the path, so a single identity for the pair let a
+    // `*** Delete File` deduplicate into an earlier unestablished read and leave no node of its own.
+    // The manifest then said the content was never established where a file had been removed, which
+    // is a weaker and different claim.
+    let mut rec = recorder();
+    let read = rec
+        .observe_file(&seen("/work/gone.rs", None, FileMode::Read), true, None)
+        .await
+        .unwrap()
+        .expect("a node for the read");
+
+    let events = file_events_from_patch(
+        "*** Begin Patch\n*** Delete File: /work/gone.rs\n*** End Patch",
+        Some("c1"),
+    );
+    assert_eq!(events[0].mode, FileMode::Deleted);
+    let removal = rec
+        .observe_file(&events[0], true, None)
+        .await
+        .unwrap()
+        .expect("a node for the removal");
+
+    assert_ne!(
+        read.to_string(),
+        removal.to_string(),
+        "one node for both would lose the removal entirely"
+    );
+    assert_eq!(rec.stats().get("FileDeleted"), Some(&1));
+    assert_eq!(
+        rec.stats().get("ContentUnknown"),
+        Some(&1),
+        "the read is unknown; the removal has no content to be unknown about"
+    );
+
+    let manifest = exported(rec).await;
+    let node = blobs_of(&manifest)
+        .into_iter()
+        .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .find(|value| value["contentState"] == "deleted")
+        .expect("a node that says the file is gone");
+    assert_eq!(node["content-cid"], "deleted:/work/gone.rs");
+    assert_eq!(
+        node["redacted"], false,
+        "nothing was withheld -- it is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_removal_empties_the_replay_base() {
+    // A removed file holds nothing, so a later hunk against its path has nothing to replay against.
+    // Held bytes would let one "recover" a version of a file that is not there to have one.
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/work/gone.rs", Some(b"one\n"), FileMode::Read),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let events = file_events_from_patch(
+        "*** Begin Patch\n*** Delete File: /work/gone.rs\n*** End Patch",
+        Some("c1"),
+    );
+    rec.observe_file(&events[0], true, None).await.unwrap();
+
+    let after = file_events_from_patch(&hunk("/work/gone.rs", &["-one", "+three"]), Some("c2"));
+    rec.observe_file(&after[0], true, None).await.unwrap();
+
+    assert_eq!(
+        document_content(&exported(rec).await, "/work/gone.rs").as_deref(),
+        None,
+        "nothing is invented for a path the session watched being removed"
+    );
+}
+
 // ------------------------------------------------------- inference after an explicit failure
 
 #[test]

@@ -149,10 +149,10 @@ the bytes. `unknown:{path}` means we saw the path and never established its cont
 means the file is gone. Merging the last two would let a deletion deduplicate against a failed read
 of the same path, and the graph would assert a removal nobody observed.
 
-`deleted:{path}` is **not reachable yet**: `FileMode` has only `Read` and `Wrote`, so nothing
-constructs it. A Codex `Delete File` currently records as a write whose content is unknown, which is
-a weaker and different claim. Claude Code has no delete tool at all — deletions go through `Bash`,
-where no file effect is observable in the first place.
+A Codex `*** Delete File` constructs `deleted:{path}`. Its node says `contentState: "deleted"` and is
+an *output* of the run that removed it — as an input it would say the tool consumed what it deleted.
+Claude Code has no delete tool at all: deletions go through `Bash`, where no file effect is
+observable in the first place, so nothing there reaches this.
 
 **Identity is computed before redaction, never after.** Two different secrets at one path scrub to
 the same placeholder; hashing what was stored rather than what was seen would merge them into one

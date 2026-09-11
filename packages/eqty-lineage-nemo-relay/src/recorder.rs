@@ -196,9 +196,12 @@ impl Recorder {
         }
 
         // Identity, from the original bytes, before any redaction decision.
-        let content_cid = match &data {
-            Some(bytes) => blake3_cid_raw_binary(bytes)?,
-            None => format!("unknown:{path}"),
+        let content_cid = match (&data, event.mode) {
+            (Some(bytes), _) => blake3_cid_raw_binary(bytes)?,
+            // Both are path-derived, and they must stay apart: one identity for both lets a deletion
+            // deduplicate into a failed read of the same path and vanish from the graph.
+            (None, FileMode::Deleted) => format!("deleted:{path}"),
+            (None, _) => format!("unknown:{path}"),
         };
 
         let key = (path.clone(), content_cid.clone());
@@ -247,6 +250,7 @@ impl Recorder {
         let content_state = match (&data, withheld) {
             (Some(_), false) => "stored",
             (Some(_), true) => "withheld",
+            (None, _) if event.mode == FileMode::Deleted => "deleted",
             (None, _) => "unknown",
         };
         if let Some(bytes) = &data {
@@ -284,7 +288,8 @@ impl Recorder {
                         Disposition::Denied => "ContentDenied",
                         _ => "ContentTooLarge",
                     });
-                } else {
+                } else if event.mode != FileMode::Deleted {
+                    // A removed file has no content to be unknown about; `FileDeleted` counts it.
                     self.count("ContentUnknown");
                 }
                 let descriptor = canonical_descriptor(&content_cid, withheld)?;
@@ -305,6 +310,7 @@ impl Recorder {
         self.count(match event.mode {
             FileMode::Read => "FileRead",
             FileMode::Wrote => "FileWritten",
+            FileMode::Deleted => "FileDeleted",
         });
         Ok(Some(asset))
     }
@@ -330,11 +336,12 @@ impl Recorder {
             (Some(bytes), _) => {
                 last_content.insert(path, bytes);
             }
-            // A write we could not reconstruct means what is on disk is no longer what we hold.
-            // Keeping the old bytes lets a later edit "recover" a version built from content that
-            // write replaced -- a fabricated file version, content-addressed and signed. Every Codex
-            // `Update File` whose hunk does not replay lands here, so this is the common path.
-            (None, FileMode::Wrote) => {
+            // A write we could not reconstruct means what is on disk is no longer what we hold, and
+            // a removed file holds nothing at all. Keeping the old bytes lets a later edit "recover"
+            // a version built from content that is gone -- a fabricated file version,
+            // content-addressed and signed. Every Codex `Update File` whose hunk does not replay
+            // lands here, so this is the common path.
+            (None, FileMode::Wrote | FileMode::Deleted) => {
                 last_content.remove(&path);
             }
             // A read we could not establish -- a truncated `Read` -- changed nothing on disk, so
@@ -866,9 +873,9 @@ impl Recorder {
 /// `redacted` -- a reader must be able to tell which nodes are content-addressed and which are not.
 ///
 /// Built through the serializer rather than `format!`: `content_cid` is not always a hash -- for an
-/// unestablished file it is `unknown:{path}` -- and a path is arbitrary bytes from the host. A path
-/// shaped like `x","withheld":true}` would otherwise make the node's own `withheld` claim say the
-/// opposite of the decision taken.
+/// unestablished file it is `unknown:{path}`, for a removed one `deleted:{path}` -- and a path is
+/// arbitrary bytes from the host. A path shaped like `x","withheld":true}` would otherwise make the
+/// node's own `withheld` claim say the opposite of the decision taken.
 ///
 /// **The path is deliberately not in here.** Identity is content, so hashing the path in would split
 /// the withheld nodes -- exactly the secrets and large artifacts where knowing two recordings saw

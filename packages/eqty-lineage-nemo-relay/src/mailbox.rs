@@ -1089,7 +1089,8 @@ async fn record_tool(
         {
             match observation.mode {
                 FileMode::Read => inputs.push(asset),
-                FileMode::Wrote => outputs.push(asset),
+                // A removal is something the run produced, not something it consumed.
+                FileMode::Wrote | FileMode::Deleted => outputs.push(asset),
             }
         }
     }

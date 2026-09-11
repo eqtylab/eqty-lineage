@@ -29,6 +29,11 @@ pub enum FileMode {
     Read,
     /// An output of a tool whose declared purpose was to write.
     Wrote,
+    /// The file is gone.
+    ///
+    /// Distinct from a write whose content could not be established: one says the path holds
+    /// nothing, the other says we do not know what it holds.
+    Deleted,
 }
 
 /// A replacement whose post-image could not be established from this payload alone.
@@ -188,7 +193,7 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
         } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
             flush(&mut adding, &mut events);
             flush_update(&mut updating, &mut events, tool_use_id);
-            events.push(identity_only(path.trim(), FileMode::Wrote, tool_use_id));
+            events.push(identity_only(path.trim(), FileMode::Deleted, tool_use_id));
         } else if line.starts_with("*** End Patch") {
             flush(&mut adding, &mut events);
             flush_update(&mut updating, &mut events, tool_use_id);

@@ -1169,13 +1169,22 @@ fn computations_by_type(path: &std::path::Path) -> Vec<(String, Vec<String>)> {
 
 /// Pull the input CIDs of every computation in a manifest.
 fn computation_inputs(path: &std::path::Path) -> Vec<Vec<String>> {
+    computation_edges(path, "input")
+}
+
+/// Every computation's `output` list, one entry per computation.
+fn computation_outputs(path: &std::path::Path) -> Vec<Vec<String>> {
+    computation_edges(path, "output")
+}
+
+fn computation_edges(path: &std::path::Path, side: &str) -> Vec<Vec<String>> {
     let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     manifest["statements"]
         .as_object()
         .expect("statements")
         .values()
         .filter(|statement| statement["@type"] == "ComputationRegistration")
-        .map(|statement| match &statement["input"] {
+        .map(|statement| match &statement[side] {
             serde_json::Value::String(one) => vec![one.clone()],
             serde_json::Value::Array(many) => many
                 .iter()
@@ -1207,6 +1216,41 @@ fn blob_objects(path: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The urn of the asset node with the given `name`.
+///
+/// Read off the `MetadataRegistration` that carries the node's metadata, because an identity-only
+/// node is addressed on its descriptor rather than on the `content-cid` its metadata states.
+fn asset_urn_named(path: &std::path::Path, name: &str) -> String {
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let blobs: std::collections::HashMap<String, serde_json::Value> = manifest["blobs"]
+        .as_object()
+        .expect("blobs")
+        .iter()
+        .filter_map(|(cid, blob)| {
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(blob.as_str()?)
+                .ok()?;
+            Some((
+                format!("urn:cid:{cid}"),
+                serde_json::from_slice(&bytes).ok()?,
+            ))
+        })
+        .collect();
+    manifest["statements"]
+        .as_object()
+        .expect("statements")
+        .values()
+        .filter(|statement| statement["@type"] == "MetadataRegistration")
+        .find(|statement| {
+            blobs
+                .get(statement["metadata"].as_str().unwrap_or_default())
+                .is_some_and(|metadata| metadata["name"] == name)
+        })
+        .and_then(|statement| statement["subject"].as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("no asset node named {name}"))
+}
+
 /// The content CID of the asset node with the given `name`.
 ///
 /// Keyed on name rather than on `assetType`, because several nodes share a type -- the user's
@@ -1233,6 +1277,62 @@ fn the_tool_is_an_input_to_the_run_it_performed() {
             .iter()
             .any(|inputs| inputs.contains(&tool)),
         "the Tool node should be an input to the run that used it"
+    );
+}
+
+#[test]
+fn a_removed_file_is_an_output_of_the_run_that_removed_it() {
+    // A removal is something the run produced. As an input it would say the tool consumed the file
+    // it deleted, and "what happened to this path" would have no edge to follow.
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-0000000000f1";
+    let root = "01a040aa-0000-0000-0000-0000000000f2";
+    let call = "01a040aa-0000-0000-0000-0000000000f3";
+
+    let events = vec![
+        mark(
+            session,
+            root,
+            root,
+            "session.start",
+            serde_json::json!({ "model": "opus" }),
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "start",
+            "apply_patch",
+            "toolu_d1",
+            serde_json::json!({ "command": "*** Begin Patch\n*** Delete File: /app/gone.rs\n*** End Patch" }),
+            None,
+        ),
+        tool_scope(
+            session,
+            call,
+            root,
+            "end",
+            "apply_patch",
+            "toolu_d1",
+            serde_json::json!("ok"),
+            None,
+        ),
+    ];
+    replay(&events, &into);
+
+    let path = &manifests(&into)[0];
+    let removed = asset_urn_named(path, "/app/gone.rs");
+    assert!(
+        computation_outputs(path)
+            .iter()
+            .any(|outputs| outputs.contains(&removed)),
+        "the removed file should be an output of the patch that removed it"
+    );
+    assert!(
+        !computation_inputs(path)
+            .iter()
+            .any(|inputs| inputs.contains(&removed)),
+        "and never an input"
     );
 }
 
