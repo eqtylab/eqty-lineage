@@ -38,7 +38,9 @@ def main(manifest):
     meta = json.loads(
         subprocess.run(
             ["cargo", "metadata", "--format-version", "1", "--manifest-path", manifest],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
     )
 
