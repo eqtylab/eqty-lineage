@@ -29,7 +29,7 @@
 //! The content CID comes from the original bytes. Hashing post-redaction content would collapse two
 //! different secrets into one version, because both scrub to the same placeholder.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
 use integrity::cid::blake3::blake3_cid_raw_binary;
@@ -40,6 +40,18 @@ use crate::classify::CompactionPhase;
 use crate::files::{FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit};
 use crate::lineage::{AssetRef, LineageSession};
 use crate::redaction::{Disposition, Policy};
+
+/// The `(assetType, name)` pairs that are the model's conversation with itself.
+///
+/// Keyed on both, because `assetType` alone cannot separate them: a human's instruction and the
+/// conversation sent to the model are both `Prompt`, and dropping the type would take the
+/// instruction into the collection with it -- the one thing a record of "what happened" must keep
+/// as a node.
+const MONOLOGUE: [(&str, &str); 3] = [
+    ("Prompt", "prompt"),
+    ("Reasoning", "completion"),
+    ("System_Prompt", "system prompt"),
+];
 
 /// How a version's content was established. Recorded so a reader can weigh it.
 const BASIS_STATED: &str = "stated";
@@ -80,6 +92,40 @@ pub struct Recorder {
     compactions: u64,
     /// Whether the compaction currently counted is still waiting for its second half.
     awaiting_post_compaction: bool,
+    /// The session's monologue in registration order, keyed by asset type, with whether each
+    /// payload was withheld.
+    ///
+    /// The *node* CID, not the content CID: a withheld payload is registered by descriptor, and a
+    /// collection over bytes the manifest does not carry commits to nothing a reader can fetch.
+    monologue: BTreeMap<String, Vec<(String, bool)>>,
+    /// The session's model calls, restated at export against the sealed collections.
+    ///
+    /// A statement cannot be pointed somewhere else after the fact -- rewriting its endpoints mints
+    /// a new CID and voids the credential over it -- and a collection's identity is not known until
+    /// its last member is. So each call is stated twice: once as it happens, against the payloads a
+    /// checkpoint needs, and once at export against the collections that outlive the reduction.
+    calls: Vec<ModelCall>,
+}
+
+/// One model call, held until the collections it should point at exist.
+struct ModelCall {
+    /// What the call consumed that is not monologue: the instruction that caused it, the model.
+    carried: Vec<AssetRef>,
+    instructions: Option<String>,
+    prompt: String,
+    completion: String,
+    describes: Value,
+    /// What the call reported about itself -- finish reason, token usage. Stated on the completion
+    /// node while that node exists, and on the call once the completions are one collection: they
+    /// are facts about the call, and a collection of thirty of them cannot carry thirty of each.
+    details: Value,
+    /// When the call happened, carried so the statement made at export is stamped with it.
+    ///
+    /// Two calls that point at the same collections have the same inputs, the same output and the
+    /// same registrant, so the timestamp is the only field left that differs -- and a statement is
+    /// addressed by its fields. Stamping them all at export instead collapses the session's calls
+    /// into one statement and leaves every description of the others hanging off it.
+    at: Option<String>,
 }
 
 impl Recorder {
@@ -97,6 +143,8 @@ impl Recorder {
             bytes: BTreeMap::new(),
             compactions: 0,
             awaiting_post_compaction: false,
+            monologue: BTreeMap::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -468,6 +516,42 @@ impl Recorder {
         self.lineage.register_content(bytes, metadata, at).await
     }
 
+    /// Store one of the model's own utterances, as a collection member rather than as a node.
+    ///
+    /// Nothing is stated about it here. The conversation is most of a recording -- two thirds of the
+    /// asset nodes on real sessions -- and a node per utterance buries the work it produced under
+    /// the reasoning that produced it. What it gets instead is a place in the collection its type is
+    /// sealed into at export, addressed and attested there.
+    ///
+    /// Buffered in the order it arrives, because by export that order is gone: statements are keyed
+    /// by CID and sort by it.
+    ///
+    /// Policy still applies. A denied payload is staged as its descriptor exactly as a node would
+    /// be, so the deny list reaches the conversation whether or not the conversation is nodes.
+    fn stage_payload(&mut self, kind: &str, name: &str, bytes: &[u8]) -> Result<AssetRef> {
+        let content_cid = blake3_cid_raw_binary(bytes)?;
+        let disposition = self.policy.decide(name, bytes.len());
+        let withheld = disposition != Disposition::Store;
+        self.note_bytes(disposition, bytes.len());
+
+        let asset = if withheld {
+            self.count(match disposition {
+                Disposition::Denied => "PayloadDenied",
+                _ => "PayloadTooLarge",
+            });
+            self.lineage
+                .stage_content(&canonical_descriptor(&content_cid, true)?)?
+        } else {
+            self.lineage.stage_content(bytes)?
+        };
+
+        self.monologue
+            .entry(kind.to_string())
+            .or_default()
+            .push((asset.as_str().to_string(), withheld));
+        Ok(asset)
+    }
+
     /// Record one completed model call.
     ///
     /// The computation's inputs are everything that determined the answer -- the model itself, the
@@ -488,7 +572,6 @@ impl Recorder {
         caused_by: Option<AssetRef>,
         details: Value,
         describes: Value,
-        observed: bool,
         at: Option<String>,
     ) -> Result<bool> {
         let mut inputs = Vec::new();
@@ -511,40 +594,21 @@ impl Recorder {
             );
         }
 
-        // The system prompt is a separate node from the conversation because it changes on a
-        // different cadence: one system prompt governs many turns, and keeping them apart lets a
+        // The system prompt is sealed apart from the conversation because it changes on a different
+        // cadence: one system prompt governs many turns, and keeping the collections apart lets a
         // reader see that a run's instructions were unchanged while its messages were not.
-        if let Some(instructions) = instructions {
-            inputs.push(
-                self.register_payload(
-                    "System_Prompt",
-                    "system prompt",
-                    "Provider-level instructions sent alongside the conversation.",
-                    instructions,
-                    json!({ "model": model, "observed": observed }),
-                    at.clone(),
-                )
-                .await?,
-            );
-        }
-
-        inputs.push(
-            self.register_payload(
-                "Prompt",
-                "prompt",
-                "The normalized conversation sent to the model.",
-                prompt,
-                json!({ "model": model, "observed": observed }),
-                at.clone(),
-            )
-            .await?,
-        );
+        let instructions = instructions
+            .map(|instructions| self.stage_payload("System_Prompt", "system prompt", instructions))
+            .transpose()?;
+        let prompt = self.stage_payload("Prompt", "prompt", prompt)?;
 
         let Some(completion) = completion else {
             self.count("ModelCallWithoutResponse");
-            // The inputs above are already registered and nothing will link them, because an
-            // activity needs an output and there is none. Left alone they are nodes a reader finds
-            // dangling with no reason on them, and the only explanation is a session-level counter.
+            // The nodes above are the model and the instruction, and nothing will link them, because
+            // an activity needs an output and there is none. Left alone they are nodes a reader
+            // finds dangling with no reason on them, and the only explanation is a session-level
+            // counter. What this call said is staged either way -- it happened, and a collection
+            // missing it would under-report the conversation.
             //
             // The reason goes on a marker for the call rather than as a field on those nodes,
             // because the nodes are content addressed and shared. One live session had a single
@@ -567,7 +631,16 @@ impl Recorder {
                 &serde_json::to_vec(&json!({ "unansweredCall": index }))?,
                 json!({
                     "unlinkedBecause": "model-call-had-no-response",
-                    "unlinkedInputs": inputs.iter().map(AssetRef::as_str).collect::<Vec<_>>(),
+                    // The staged payloads are named here as well as the nodes. They are not edges --
+                    // nothing links them -- but they are what the call consumed, and the marker is
+                    // the only place a reader can find which member of the collection went into a
+                    // call that was never answered.
+                    "unlinkedInputs": inputs
+                        .iter()
+                        .chain(instructions.iter())
+                        .chain(std::iter::once(&prompt))
+                        .map(AssetRef::as_str)
+                        .collect::<Vec<_>>(),
                 }),
                 at,
             )
@@ -575,20 +648,20 @@ impl Recorder {
             return Ok(false);
         };
 
-        let output = self
-            .register_payload(
-                "Reasoning",
-                "completion",
-                "The model's response, including any tool calls it requested.",
-                completion,
-                details,
-                at.clone(),
-            )
-            .await?;
+        let output = self.stage_payload("Reasoning", "completion", completion)?;
 
-        self.lineage
-            .record_computation_described(&inputs, &[output], describes, at)
-            .await?;
+        // Stated at export, not here. A collection's identity is not known until its last member is,
+        // and a statement cannot be pointed at it afterwards -- rewriting an endpoint mints a new
+        // CID and voids the credential over it.
+        self.calls.push(ModelCall {
+            carried: inputs,
+            instructions: instructions.map(|asset| asset.as_str().to_string()),
+            prompt: prompt.as_str().to_string(),
+            completion: output.as_str().to_string(),
+            describes,
+            details,
+            at,
+        });
         self.count("ModelCall");
         Ok(true)
     }
@@ -814,7 +887,137 @@ impl Recorder {
         self.lineage.statement_count()
     }
 
+    /// Seal the session's conversation into one signed collection per type, and state the calls
+    /// that produced it.
+    ///
+    /// A call is stated here rather than where it happened because its endpoints do not exist until
+    /// now: a collection is addressed by a hashseq over every member, so the node a call points at
+    /// is unknown until the session's last utterance. Each call names the member it used, so "the
+    /// conversation behind call seven" stays a question the manifest answers.
+    ///
+    /// Runs before the coverage node so its counters are inside the graph rather than one statement
+    /// behind it.
+    async fn seal_monologue(&mut self, at: Option<String>) -> Result<()> {
+        let mut sealed: HashMap<String, AssetRef> = HashMap::new();
+        // Node CID to the name it holds inside its collection, which is the only order a collection
+        // carries and the only handle a restated call has on one member of it.
+        let mut ordinals: HashMap<String, String> = HashMap::new();
+
+        for (kind, payloads) in std::mem::take(&mut self.monologue) {
+            let Some((_, singular)) = MONOLOGUE
+                .iter()
+                .find(|(monologue_kind, _)| *monologue_kind == kind)
+            else {
+                continue;
+            };
+
+            // The same bytes registered twice are one node, so they are one member. A system prompt
+            // repeats on every call and would otherwise fill the collection with itself.
+            let mut seen = HashSet::new();
+            let members: Vec<(String, bool)> = payloads
+                .into_iter()
+                .filter(|(cid, _)| seen.insert(cid.clone()))
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+
+            // A collection sorts its members by name, so the ordinal has to be padded to the width
+            // of the largest one or the order it carries is lexicographic rather than chronological.
+            let width = members.len().to_string().len().max(4);
+            let named: HashMap<String, String> = members
+                .iter()
+                .enumerate()
+                .map(|(index, (cid, _))| {
+                    let ordinal = format!("{:0width$}", index + 1, width = width);
+                    ordinals.insert(cid.clone(), ordinal.clone());
+                    (ordinal, cid.clone())
+                })
+                .collect();
+
+            let withheld = members.iter().filter(|(_, withheld)| *withheld).count();
+            let metadata = json!({
+                "name": format!("{singular}s"),
+                "assetType": kind,
+                "description": format!(
+                    "Every {singular} of this session, as an iroh collection of {} members.",
+                    members.len()
+                ),
+                "provType": "Entity",
+                "collection": "iroh",
+                "collectionCount": members.len(),
+                // A denied payload is in here as its descriptor, and a reader counting members
+                // against what the session said it did has no other way to learn that.
+                "withheldMembers": withheld,
+            });
+
+            let asset = self
+                .lineage
+                .register_collection(&named, metadata, at.clone())
+                .await?;
+            sealed.insert(kind, asset);
+            self.count("Collection");
+        }
+
+        // No completions means no call was answered, so there is nothing for an activity to output.
+        // The collections above are registered all the same: a staged payload reaches the manifest
+        // only because a collection names it, so bailing before them would drop the prompts of a
+        // session whose calls all failed -- the recording that most needs to show what was asked.
+        let Some(completions) = sealed.get("Reasoning").cloned() else {
+            return Ok(());
+        };
+
+        for call in std::mem::take(&mut self.calls) {
+            let mut inputs = call.carried;
+            if let Some(prompts) = sealed.get("Prompt") {
+                inputs.push(prompts.clone());
+            }
+            if call.instructions.is_some()
+                && let Some(system_prompts) = sealed.get("System_Prompt")
+            {
+                inputs.push(system_prompts.clone());
+            }
+
+            let mut describes = call.describes;
+            if let Some(fields) = describes.as_object_mut() {
+                if let Some(details) = call.details.as_object() {
+                    for (key, value) in details {
+                        fields.insert(key.clone(), value.clone());
+                    }
+                }
+                for (key, cid) in [
+                    ("promptMember", Some(&call.prompt)),
+                    ("completionMember", Some(&call.completion)),
+                    ("systemPromptMember", call.instructions.as_ref()),
+                ] {
+                    if let Some(ordinal) = cid.and_then(|cid| ordinals.get(cid)) {
+                        fields.insert(key.into(), Value::String(ordinal.clone()));
+                    }
+                }
+            }
+
+            self.lineage
+                .record_computation_described(
+                    &inputs,
+                    std::slice::from_ref(&completions),
+                    describes,
+                    call.at,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
+        // Counted rather than raised. The recording is complete without the collections -- the view
+        // keeps every monologue payload in the file whether or not anything indexes them -- and
+        // refusing to export a session because its index failed would trade the whole graph for a
+        // convenience.
+        if self.seal_monologue(at.clone()).await.is_err() {
+            self.count("MonologueNotSealed");
+        }
+
         // Stated even when it is zero, unlike every other counter. For the rest, absent means none
         // happened and a reader loses nothing by inferring it. This one answers "is this graph
         // complete?", and a reader who has to know that absence means zero cannot distinguish an

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use integrity::blob_store::{BlobStore, InMemoryStore};
 use integrity::cid::blake3::blake3_cid_raw_binary;
+use integrity::cid::iroh::compute_iroh_collection_cid;
 use integrity::lineage::models::manifest::{Manifest, generate_manifest, resolve_blobs};
 use integrity::lineage::models::statements::{
     ComputationStatement, DataStatement, EntityStatement, MetadataStatement, Statement,
@@ -167,6 +168,51 @@ impl LineageSession {
         self.push_metadata(content_cid.clone(), metadata, at)
             .await?;
 
+        Ok(AssetRef(content_cid))
+    }
+
+    /// Register an asset that *is* an iroh collection over content already in this session.
+    ///
+    /// Identity is the hashseq over the members' hashes under the collection multicodec, so it is
+    /// the hash of no bytes stored here: `register_content` would address the hashseq blob as raw
+    /// binary and the node would not be the collection it names.
+    ///
+    /// Both of the collection's own blobs are stored, and nothing needs to name them afterwards:
+    /// `resolve_blobs` recognises the hashseq codec and pulls the meta blob and every member into
+    /// the manifest from the CID on the `DataRegistration` alone.
+    pub async fn register_collection(
+        &mut self,
+        members: &HashMap<String, String>,
+        metadata: Value,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
+        let built = compute_iroh_collection_cid(members).await?;
+        let collection_cid = built.collection.cid.clone();
+        self.put_blob(collection_cid.clone(), built.collection.blob.to_vec());
+        self.put_blob(built.meta.cid.clone(), built.meta.blob.to_vec());
+
+        if self.registered_content.insert(collection_cid.clone()) {
+            let data = Statement::DataRegistration(
+                DataStatement::create(vec![collection_cid.clone()], self.did.clone(), at.clone())
+                    .await?,
+            );
+            self.push_with_proof(data, at.clone()).await?;
+        }
+
+        self.push_metadata(collection_cid.clone(), metadata, at)
+            .await?;
+
+        Ok(AssetRef(collection_cid))
+    }
+
+    /// Store content without stating anything about it.
+    ///
+    /// For a payload that will be a member of a collection rather than a node of its own. The bytes
+    /// have to be in the session for the collection to resolve, and a `DataRegistration` for each of
+    /// them is the graph a collection exists to remove.
+    pub fn stage_content(&mut self, content: &[u8]) -> Result<AssetRef> {
+        let content_cid = blake3_cid_raw_binary(content)?;
+        self.put_blob(content_cid.clone(), content.to_vec());
         Ok(AssetRef(content_cid))
     }
 

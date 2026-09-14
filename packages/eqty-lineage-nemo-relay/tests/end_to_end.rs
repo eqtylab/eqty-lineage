@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
-    LineageSession, Mailbox, ManifestAnnounced, ManifestKind, ManifestMark, Policy,
+    LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy,
     SessionFinished, SessionRouter, SignerFactory, classify,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
@@ -103,32 +103,11 @@ fn forget_with(router: &Arc<Mutex<SessionRouter>>) -> SessionFinished {
     })
 }
 
-/// The manifests a session wrote, excluding the session views beside them.
-///
-/// A directory listing is not a session count: an export writes `{id}.json` and, when there is
-/// anything to show, `{id}.view.json`. Globbing `*.json` doubles every count -- the same trap
-/// `{id}.unattributed.json` set for the harvester in `docs/live-session-script.md`.
+/// The manifests a session wrote. One per session, and nothing beside it.
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = written_json(dir)
-        .into_iter()
-        .filter(|path| !is_view(path))
-        .collect();
+    let mut found: Vec<PathBuf> = written_json(dir);
     found.sort();
     found
-}
-
-/// The session views a session wrote.
-fn views(dir: &TempDir) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = written_json(dir)
-        .into_iter()
-        .filter(|path| is_view(path))
-        .collect();
-    found.sort();
-    found
-}
-
-fn is_view(path: &std::path::Path) -> bool {
-    path.to_string_lossy().ends_with(".view.json")
 }
 
 fn written_json(dir: &TempDir) -> Vec<PathBuf> {
@@ -619,36 +598,58 @@ fn a_model_call_becomes_a_prompt_and_a_completion() {
         &into,
     );
 
-    let decoded = decoded_blobs(&manifests(&into)[0]);
+    let manifest = &manifests(&into)[0];
+    let decoded = decoded_blobs(manifest);
     assert!(
         decoded.contains("what is lineage?"),
-        "the prompt should be a node"
+        "the prompt's bytes are in the document"
     );
     assert!(
         decoded.contains("provenance you can verify"),
-        "and so should the completion"
+        "and so are the completion's"
     );
-    assert!(decoded.contains("\"assetType\":\"Prompt\""), "{decoded}");
-    assert!(decoded.contains("\"assetType\":\"Reasoning\""), "{decoded}");
-    let completion = metadata_nodes(&manifests(&into)[0])
+
+    // As collection members rather than as nodes of their own. The node is the collection, which is
+    // why the type is unchanged and the name is plural.
+    let named: Vec<(String, String)> = metadata_nodes(manifest)
         .into_iter()
-        .find(|node| node["assetType"] == "Reasoning")
-        .expect("the completion's metadata");
+        .filter_map(|node| {
+            Some((
+                node["assetType"].as_str()?.to_string(),
+                node["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    for expected in [("Prompt", "prompts"), ("Reasoning", "completions")] {
+        let expected = (expected.0.to_string(), expected.1.to_string());
+        assert!(named.contains(&expected), "{expected:?} not in {named:?}");
+    }
+
+    // The finish reason and the usage ride on the call. They were always facts about the call
+    // rather than about the bytes, and one collection cannot carry one of each per member.
+    let call = metadata_nodes(manifest)
+        .into_iter()
+        .find(|node| node["computation_type"] == "model_call")
+        .expect("the call's metadata");
     assert_eq!(
-        completion["finishReason"], "complete",
-        "the finish reason travels with the completion: {completion}"
+        call["finishReason"], "complete",
+        "the finish reason travels with the call: {call}"
     );
     // Carried as a JSON string, not as a nested object -- see `encode_nested_values`. Parsed here
     // rather than substring-matched, so the assertion is about the value and not about escaping.
     let usage: serde_json::Value = serde_json::from_str(
-        completion["usage"]
+        call["usage"]
             .as_str()
             .expect("usage is a JSON string, so the explorer can render it"),
     )
     .expect("and it parses back");
     assert_eq!(usage["total_tokens"], 14, "and so does the usage: {usage}");
-}
 
+    // Which member it used, so "the conversation behind this call" stays a question the document
+    // answers once the payloads are inside a collection.
+    assert_eq!(call["promptMember"], "0001", "{call}");
+    assert_eq!(call["completionMember"], "0001", "{call}");
+}
 #[test]
 fn the_same_conversation_through_two_providers_is_one_prompt() {
     // The claim that justifies reaching for `annotated_request` rather than the serialized `data`:
@@ -768,20 +769,12 @@ fn a_prompt_produces_a_completion_and_not_the_reverse() {
         &into,
     );
 
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifests(&into)[0]).unwrap()).unwrap();
-    let decoded = decoded_blobs(&manifests(&into)[0]);
+    let path = &manifests(&into)[0];
+    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
 
-    // Pull each payload's content CID out of the metadata blob that names it.
-    let cid_of = |asset_type: &str| -> String {
-        let at = decoded
-            .find(&format!("\"assetType\":\"{asset_type}\""))
-            .unwrap_or_else(|| panic!("no {asset_type} node in {decoded}"));
-        let key = "\"content-cid\":\"";
-        let start = decoded[at..].find(key).expect("a content CID") + key.len();
-        decoded[at + start..].split('"').next().unwrap().to_string()
-    };
-    let (prompt, completion) = (cid_of("Prompt"), cid_of("Reasoning"));
+    // The collections the call was restated against -- the endpoints the document actually holds.
+    let prompt = asset_urn_named(path, "prompts");
+    let completion = asset_urn_named(path, "completions");
 
     let computation = manifest["statements"]
         .as_object()
@@ -805,20 +798,19 @@ fn a_prompt_produces_a_completion_and_not_the_reverse() {
     let outputs = cids("output");
 
     assert!(
-        inputs.contains(&format!("urn:cid:{prompt}")),
-        "the prompt must be an input: inputs={inputs:?} prompt={prompt}"
+        inputs.contains(&prompt),
+        "the prompts must be an input: inputs={inputs:?} prompt={prompt}"
     );
     assert_eq!(
         outputs,
-        vec![format!("urn:cid:{completion}")],
-        "the completion must be the sole output"
+        vec![completion],
+        "the completions must be the sole output"
     );
     assert!(
-        !outputs.contains(&format!("urn:cid:{prompt}")),
+        !outputs.contains(&prompt),
         "the prompt must never be an output -- that edge reads as the answer producing the question"
     );
 }
-
 #[test]
 fn the_real_capture_records_its_model_calls() {
     // The reference Codex session made four model calls and touched no files through a structured
@@ -1102,7 +1094,7 @@ fn an_edit_links_the_version_read_to_the_version_written() {
 /// Both hosts, because the question "does this also work on Codex?" has been asked of every graph
 /// change so far and the answer is never obvious from the code: the recorder is host-agnostic, but
 /// what a host *emits* is not. Claude Code comes from a synthetic session, Codex from the committed
-/// capture, and each writes its manifest and -- when there is a conversation to drop -- its view.
+/// capture.
 ///
 ///     cargo test --test end_to_end dump_a_full_manifest -- --ignored
 #[test]
@@ -1111,16 +1103,10 @@ fn dump_a_full_manifest() {
     let into = TempDir::new().expect("a temp dir");
     replay(&full_session("01a040aa-0000-0000-0000-000000000099"), &into);
     fs::copy(&manifests(&into)[0], "/tmp/relay-manifest.json").expect("copied");
-    if let Some(view) = views(&into).first() {
-        fs::copy(view, "/tmp/relay-view.json").expect("copied");
-    }
 
     let codex = TempDir::new().expect("a temp dir");
     replay(&fixture(), &codex);
     fs::copy(&manifests(&codex)[0], "/tmp/codex-manifest.json").expect("copied");
-    if let Some(view) = views(&codex).first() {
-        fs::copy(view, "/tmp/codex-view.json").expect("copied");
-    }
 }
 
 /// Every computation's `computation_type` paired with its input CIDs.
@@ -2606,69 +2592,47 @@ fn an_event_that_completes_nothing_writes_no_manifest() {
     );
 }
 
-// ------------------------------------------------------- the session view
+// ------------------------------------------------------- the sealed conversation
 
 #[test]
-fn the_session_view_is_written_beside_the_manifest_and_announced_as_itself() {
-    // Written at export rather than on demand, so a consumer never waits for a second pass or
-    // discovers one never ran -- and announced under its own mark name, because a mark's name is
-    // what a consumer filters on.
+fn one_document_is_written_and_announced_under_one_name() {
+    // A session writes its manifest and nothing beside it. The conversation it would have held is
+    // sealed into a collection per type, so there is no second document for a consumer to fetch and
+    // no second mark name to subscribe to.
     let into = TempDir::new().unwrap();
     let marks = replay(&full_session("01a040aa-0000-0000-0000-000000000fc5"), &into);
 
-    let manifest = &manifests(&into)[0];
-    let view = &views(&into)[0];
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "one session, one document: {written:?}");
+    assert_eq!(marks.len(), 1, "announced once: {marks:#?}");
+
+    let announced = &marks[0];
     assert_eq!(
-        view,
-        &manifest.with_extension("view.json"),
-        "the view sits beside the manifest it reduces"
+        MANIFEST_MARK, "eqty.manifest",
+        "one document, one mark name"
     );
-
-    let kinds: Vec<ManifestKind> = marks.iter().map(|mark| mark.kind).collect();
-    assert!(
-        kinds.contains(&ManifestKind::Full) && kinds.contains(&ManifestKind::SessionView),
-        "both documents are announced: {marks:#?}"
-    );
-    // Different mark *names*, not one name with a field: a mark's name is what a consumer filters
-    // on, so a consumer wanting the reduced document should not have to receive every announcement
-    // and read its data to find out which it got.
-    assert_ne!(
-        ManifestKind::Full.mark_name(),
-        ManifestKind::SessionView.mark_name(),
-        "two documents, two mark names"
-    );
-
-    let announced = marks
-        .iter()
-        .find(|mark| mark.kind == ManifestKind::SessionView)
-        .expect("a mark for the view");
-    assert_eq!(&announced.path, view);
+    assert_eq!(&announced.path, &written[0]);
     assert_eq!(
         announced.cid,
-        blake3_cid_raw_binary(&fs::read(view).unwrap()).unwrap(),
-        "the announced CID is over the view's own bytes, not the manifest's"
+        blake3_cid_raw_binary(&fs::read(&written[0]).unwrap()).unwrap(),
+        "the announced CID is over the bytes that were written"
     );
 }
-
 #[test]
-fn the_view_drops_the_conversation_and_keeps_what_happened() {
+fn the_document_drops_the_conversation_and_keeps_what_happened() {
     let into = TempDir::new().unwrap();
     replay(&full_session("01a040aa-0000-0000-0000-000000000fc6"), &into);
+    let path = &manifests(&into)[0];
 
-    let named = |path: &std::path::Path| -> Vec<(String, String)> {
-        blob_objects(path)
-            .into_iter()
-            .filter_map(|node| {
-                Some((
-                    node["assetType"].as_str()?.to_string(),
-                    node["name"].as_str()?.to_string(),
-                ))
-            })
-            .collect()
-    };
-
-    let full = named(&manifests(&into)[0]);
-    let view = named(&views(&into)[0]);
+    let named: Vec<(String, String)> = blob_objects(path)
+        .into_iter()
+        .filter_map(|node| {
+            Some((
+                node["assetType"].as_str()?.to_string(),
+                node["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect();
 
     for gone in [
         ("Prompt", "prompt"),
@@ -2676,18 +2640,28 @@ fn the_view_drops_the_conversation_and_keeps_what_happened() {
         ("System_Prompt", "system prompt"),
     ] {
         let gone = (gone.0.to_string(), gone.1.to_string());
-        assert!(full.contains(&gone), "the fixture produces {gone:?}");
-        assert!(!view.contains(&gone), "the view drops {gone:?}");
+        assert!(
+            !named.contains(&gone),
+            "the conversation is not nodes: {gone:?}"
+        );
+    }
+    for sealed in [
+        ("Prompt", "prompts"),
+        ("Reasoning", "completions"),
+        ("System_Prompt", "system prompts"),
+    ] {
+        let sealed = (sealed.0.to_string(), sealed.1.to_string());
+        assert!(named.contains(&sealed), "it is a collection: {sealed:?}");
     }
 
     // The instruction is not the monologue, and it shares `Prompt` with the conversation -- which is
     // why the rule is keyed on the name as well as the type.
     //
-    // Asserted against the view's `DataRegistration`s rather than its surviving blobs: a kept tool
-    // call still names the instruction in its inputs, so the blob is retained either way and a
+    // Asserted against the document's `DataRegistration`s rather than its surviving blobs: a kept
+    // tool call still names the instruction in its inputs, so the blob is retained either way and a
     // blob-level check passes even when the node was dropped.
-    let registered = registered_nodes(&views(&into)[0]);
-    let instruction = blob_objects(&manifests(&into)[0])
+    let registered = registered_nodes(path);
+    let instruction = blob_objects(path)
         .into_iter()
         .find(|node| node["name"] == "user prompt")
         .and_then(|node| node["content-cid"].as_str().map(str::to_string))
@@ -2697,37 +2671,27 @@ fn the_view_drops_the_conversation_and_keeps_what_happened() {
         "the human's instruction is still a node, not just a retained blob"
     );
     assert!(
-        view.iter().any(|(kind, _)| kind == "Tool"),
+        named.iter().any(|(kind, _)| kind == "Tool"),
         "and so do the tools that ran"
     );
 }
-
 #[test]
-fn a_view_that_would_repeat_the_manifest_is_not_written() {
-    // A session with no model calls has no conversation to drop, so a view would be the manifest
-    // under a second name and a second mark: a document a reader must open to learn it says the
-    // same thing.
+fn a_session_with_no_conversation_keeps_the_manifest_as_it_is() {
+    // No model calls, so nothing to seal and nothing to reduce. Projecting anyway would rewrite the
+    // document into a copy of itself under a shape that claims a reduction happened.
     let into = TempDir::new().unwrap();
     // A tool call and no model call: `only_a_tool` opens a session and runs one `Write`.
     let marks = replay(&only_a_tool("01a040aa-0000-0000-0000-000000000fc7"), &into);
 
-    assert!(
-        views(&into).is_empty(),
-        "no conversation, no view: {:?}",
-        views(&into)
-    );
-    assert_eq!(marks.len(), 1, "and only the manifest is announced");
-    assert_eq!(marks[0].kind, ManifestKind::Full);
+    assert_eq!(marks.len(), 1, "one document is announced: {marks:#?}");
 }
-
 #[test]
-fn the_view_still_verifies_as_a_manifest() {
+fn the_reduced_document_still_verifies_as_a_manifest() {
     // The point of a subset rather than a re-recording: every kept statement carries its original
-    // CID and its original credential, so the view is an attestation and not a summary of one.
+    // CID and its original credential, so what ships is an attestation and not a summary of one.
     let into = TempDir::new().unwrap();
     replay(&full_session("01a040aa-0000-0000-0000-000000000fc9"), &into);
-    let view = &views(&into)[0];
-
+    let view = &manifests(&into)[0];
     let parsed: Manifest = serde_json::from_slice(&fs::read(view).unwrap())
         .expect("the view round-trips through Manifest");
     assert!(
@@ -2823,37 +2787,42 @@ fn collect(value: &serde_json::Value, found: &mut Vec<String>) {
 }
 
 #[test]
-fn a_session_that_only_talked_gets_no_view() {
+fn a_session_that_only_talked_still_records_what_it_said() {
     // Codex issues an ancillary call to title the conversation, which exports as an agentless
-    // fragment whose entire content is one model call -- the reason the fragment is written at all.
-    // A view drops model calls, so its view held two nodes, no edges, and nothing that happened,
-    // while doubling the file count of every Codex session.
+    // fragment whose entire content is one model call. Reducing that used to leave two nodes and no
+    // edges, because a view that drops model calls drops the fragment's only reason to exist.
     //
-    // Asserted on the absence of activities rather than on the fragment, because an agentless
-    // recording *can* hold real tool calls and one that does has a view worth having.
+    // Sealing is what makes it a record again: the conversation is a node, and the call that
+    // produced it is restated against that node instead of disappearing with its completion.
     let into = TempDir::new().expect("a temp dir");
     let marks = replay(
         &only_a_model_call("01a040aa-0000-0000-0000-000000000fd1"),
         &into,
     );
 
-    let manifest = &manifests(&into)[0];
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "one session, one document: {written:?}");
+    assert_eq!(marks.len(), 1, "announced once: {marks:#?}");
+
+    let names: Vec<String> = blob_objects(&written[0])
+        .into_iter()
+        .filter_map(|node| node["name"].as_str().map(str::to_string))
+        .collect();
     assert!(
-        decoded_blobs(manifest).contains("\"completion\""),
-        "the fixture records a model call"
+        names.iter().any(|name| name == "completions"),
+        "what it said is a node: {names:?}"
     );
     assert!(
-        views(&into).is_empty(),
-        "a view of nothing but conversation is not a view: {:?}",
-        views(&into)
+        !names.iter().any(|name| name == "completion"),
+        "and not one node per utterance: {names:?}"
     );
-    assert_eq!(
-        marks.len(),
-        1,
-        "and only the manifest is announced: {marks:#?}"
+    assert!(
+        blob_objects(&written[0])
+            .iter()
+            .any(|node| node["computation_type"] == "model_call"),
+        "the call that produced it survives the reduction: {names:?}"
     );
 }
-
 /// A session whose only work is one model call: no tools, no files.
 fn only_a_model_call(session: &str) -> Vec<Event> {
     let root = "01a040aa-0000-0000-0000-0000000000d8";
@@ -2897,10 +2866,9 @@ fn only_a_model_call(session: &str) -> Vec<Event> {
 }
 
 #[test]
-fn an_agentless_recording_that_did_work_still_gets_a_view() {
-    // The other half of the guard above, and the reason it is keyed on activities rather than on
-    // the fragment: a recording with no `session.start` registers no agent, but it can still run
-    // tools -- and one that did has a view worth having.
+fn an_agentless_recording_that_did_work_is_still_reduced() {
+    // A recording with no `session.start` registers no agent, but it can still run tools -- and the
+    // reduction is keyed on what happened, never on the filename.
     let into = TempDir::new().expect("a temp dir");
     let marks = replay(
         &agentless_but_busy("01a040aa-0000-0000-0000-000000000fd2"),
@@ -2912,13 +2880,8 @@ fn an_agentless_recording_that_did_work_still_gets_a_view() {
         manifest.to_string_lossy().ends_with(".unattributed.json"),
         "no agent was registered: {manifest:?}"
     );
-    let view = views(&into)
-        .first()
-        .cloned()
-        .unwrap_or_else(|| panic!("a fragment that ran a tool gets a view"));
-    assert!(view.to_string_lossy().ends_with(".unattributed.view.json"));
 
-    let names = blob_objects(&view)
+    let names = blob_objects(manifest)
         .into_iter()
         .filter_map(|node| node["name"].as_str().map(str::to_string))
         .collect::<Vec<_>>();
@@ -2928,16 +2891,14 @@ fn an_agentless_recording_that_did_work_still_gets_a_view() {
     );
     assert!(
         !names.iter().any(|name| name == "completion"),
-        "and still without the conversation: {names:?}"
+        "and still without the conversation as nodes: {names:?}"
     );
-    assert!(
-        marks
-            .iter()
-            .any(|mark| mark.kind == ManifestKind::SessionView),
-        "announced like any other view: {marks:#?}"
+    assert_eq!(
+        marks.len(),
+        1,
+        "announced like any other session: {marks:#?}"
     );
 }
-
 /// No `session.start`, so no agent -- but a model call and a tool call all the same.
 fn agentless_but_busy(session: &str) -> Vec<Event> {
     let root = "01a040aa-0000-0000-0000-0000000000da";
@@ -3115,7 +3076,7 @@ fn a_manifest_that_could_not_be_written_is_not_announced() {
         "the failed write must have left the checkpoint untouched"
     );
     assert!(
-        !marks.iter().any(|mark| mark.kind == ManifestKind::Full),
+        marks.is_empty(),
         "a manifest that never landed must not be announced: {marks:#?}"
     );
 }
@@ -3274,12 +3235,7 @@ fn no_view_is_announced_for_a_manifest_that_could_not_be_written() {
 
     assert!(
         marks.is_empty(),
-        "neither document landed, so neither may be announced: {marks:#?}"
-    );
-    assert!(
-        views(&into).is_empty(),
-        "and no view may be written beside a manifest that is not there: {:?}",
-        views(&into)
+        "the document did not land, so it may not be announced: {marks:#?}"
     );
 }
 

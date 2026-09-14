@@ -33,8 +33,6 @@ mod mailbox;
 mod recorder;
 mod redaction;
 mod session;
-pub mod view;
-
 pub use classify::{CompactionPhase, Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{
@@ -43,12 +41,11 @@ pub use files::{
 };
 pub use lineage::{AssetRef, LineageSession};
 pub use mailbox::{
-    Mailbox, ManifestAnnounced, ManifestKind, ManifestMark, SessionFinished, SignerFactory,
+    MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, SessionFinished, SignerFactory,
 };
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
-pub use view::{SessionView, session_view};
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,11 +222,11 @@ fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
     });
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         if runtime.scope_stack_active() {
-            return runtime.emit_mark(mark.kind.mark_name(), Some(&data), None);
+            return runtime.emit_mark(MANIFEST_MARK, Some(&data), None);
         }
         let stack = runtime.create_scope_stack()?;
         let _bound = runtime.bind_scope_stack_thread(&stack)?;
-        runtime.emit_mark(mark.kind.mark_name(), Some(&data), None)
+        runtime.emit_mark(MANIFEST_MARK, Some(&data), None)
     }));
     // A panic and an `Err` are the same outcome for a reader -- the manifest is on disk and nothing
     // on the stream points at it -- so they share a counter rather than pretending to differ.

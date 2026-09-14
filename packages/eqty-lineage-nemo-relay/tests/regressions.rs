@@ -118,13 +118,9 @@ fn replay(events: &[Event], into: &TempDir) -> Vec<ManifestMark> {
         .expect("the marks lock")
 }
 
-/// The manifests a session wrote, excluding the session views beside them. A directory listing is
-/// not a session count -- see the note on the same helper in `end_to_end.rs`.
+/// The manifests a session wrote. One per session, and nothing beside it.
 fn manifests(dir: &TempDir) -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = written_json(dir)
-        .into_iter()
-        .filter(|p| !p.to_string_lossy().ends_with(".view.json"))
-        .collect();
+    let mut found: Vec<PathBuf> = written_json(dir);
     found.sort();
     found
 }
@@ -1269,7 +1265,6 @@ async fn an_unanswered_model_call_says_why_its_inputs_dangle() {
             None,
             serde_json::json!({}),
             serde_json::json!({}),
-            true,
             None,
         )
         .await
@@ -1288,21 +1283,139 @@ async fn an_unanswered_model_call_says_why_its_inputs_dangle() {
         .unwrap_or_else(|| panic!("a marker naming the reason: {nodes:#?}"));
     assert_eq!(marker["provType"], "Entity", "a marker is a thing");
 
-    // The prompt is reachable through the marker, which is the point of recording it.
-    let prompt = nodes
-        .iter()
-        .find(|n| n["assetType"] == "Prompt")
-        .expect("the prompt was registered before the response was known");
+    // The prompt is not a node of its own -- it is a member of the prompts collection -- but it is
+    // in the manifest, because the collection that names it is what carries it there.
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["assetType"] == "Prompt" && n["name"] == "prompts"),
+        "the conversation is sealed even when no call was answered: {nodes:#?}"
+    );
+    let prompt_cid = blobs_of(&manifest)
+        .into_iter()
+        .find(|(_, bytes)| bytes.as_slice() == b"[{\"role\":\"user\",\"content\":\"quota\"}]")
+        .map(|(cid, _)| cid)
+        .expect("the prompt's bytes are staged even though it is not a node");
+
+    // And it is reachable through the marker, which is the point of recording it.
     let inputs = nested(marker, "unlinkedInputs");
     let listed = inputs
         .as_array()
         .expect("the inputs it could not link")
         .iter()
         .filter_map(|v| v.as_str())
-        .any(|cid| cid == prompt["content-cid"].as_str().unwrap_or_default());
+        .any(|cid| cid.trim_start_matches("urn:cid:") == prompt_cid);
     assert!(
         listed,
         "the marker names the prompt it could not link: {marker}"
+    );
+}
+
+/// Sealing the conversation gave every model call the same inputs and the same output, and a
+/// statement is addressed by its fields: the timestamp is the only one left that tells two calls
+/// apart. Stamped at export instead of at the call, they collapsed into one statement -- a live
+/// session recorded 25 calls as 8, with seventeen descriptions hanging off the survivors and
+/// seventeen credentials over subjects the manifest no longer contained.
+#[tokio::test]
+async fn model_calls_that_share_their_endpoints_stay_separate_statements() {
+    let times = [
+        "2026-09-14T20:35:08.322945+00:00",
+        "2026-09-14T20:35:14.115067+00:00",
+        "2026-09-14T20:35:23.882778+00:00",
+    ];
+    let mut rec = recorder();
+    for (index, at) in times.iter().enumerate() {
+        // No `caused_by`, so nothing but the model and the collections reaches the inputs -- which
+        // is the majority of a real session's calls and exactly the shape that collapsed.
+        let recorded = rec
+            .record_model_call(
+                Some("some-model"),
+                Some(b"you are careful"),
+                format!("[{{\"role\":\"user\",\"content\":\"q{index}\"}}]").as_bytes(),
+                Some(format!("answer {index}").as_bytes()),
+                None,
+                serde_json::json!({}),
+                serde_json::json!({ "computation_type": "model_call" }),
+                Some((*at).to_string()),
+            )
+            .await
+            .expect("the call is recorded");
+        assert!(recorded, "a call with a response is an activity");
+    }
+
+    let manifest = exported(rec).await;
+    let statements = manifest["statements"].as_object().expect("statements");
+
+    let activities: Vec<&serde_json::Value> = statements
+        .values()
+        .filter(|s| s["@type"] == "ComputationRegistration")
+        .collect();
+    assert_eq!(
+        activities.len(),
+        times.len(),
+        "three calls are three activities, not one: {activities:#?}"
+    );
+    let stamps: std::collections::HashSet<&str> = activities
+        .iter()
+        .filter_map(|s| s["timestamp"].as_str())
+        .collect();
+    assert_eq!(
+        stamps.len(),
+        times.len(),
+        "each is stamped when it happened, not when the session ended: {stamps:?}"
+    );
+
+    // And each description belongs to the call it describes. Collapsed, they all pointed at the one
+    // survivor and claimed different members of the same collection at the same time.
+    let blobs: std::collections::HashMap<String, Vec<u8>> =
+        blobs_of(&manifest).into_iter().collect();
+    let described: std::collections::HashSet<&str> = statements
+        .values()
+        .filter(|s| s["@type"] == "MetadataRegistration")
+        .filter(|s| {
+            let cid = s["metadata"]
+                .as_str()
+                .unwrap_or_default()
+                .replace("urn:cid:", "");
+            blobs
+                .get(&cid)
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                .is_some_and(|node| node["computation_type"] == "model_call")
+        })
+        .filter_map(|s| s["subject"].as_str())
+        .collect();
+    assert_eq!(
+        described.len(),
+        times.len(),
+        "each call carries its own description: {described:?}"
+    );
+
+    // The invariant underneath all of it: one credential is issued per statement, so the counts have
+    // to agree. Asserted on the counts and not on whether each subject resolves, because statements
+    // that collapse merge into an *identical* survivor -- its id is still there, and every merged
+    // statement's credential piles onto it. A live manifest carrying the defect had 154 credentials
+    // over 139 subjects and every one of them resolved.
+    let credentials: Vec<&serde_json::Value> = statements
+        .values()
+        .filter(|s| s["@type"] == "CredentialRegistration")
+        .collect();
+    let subjects: std::collections::HashSet<&str> = credentials
+        .iter()
+        .map(|c| {
+            c["credential"]["credentialSubject"]["id"]
+                .as_str()
+                .expect("a credential names its subject")
+        })
+        .collect();
+    assert_eq!(
+        credentials.len(),
+        subjects.len(),
+        "two credentials over one subject means a statement was merged away after it was signed"
+    );
+    assert_eq!(
+        credentials.len(),
+        statements.len() - credentials.len(),
+        "every statement is signed exactly once"
     );
 }
 

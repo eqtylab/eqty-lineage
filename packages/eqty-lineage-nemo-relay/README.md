@@ -46,8 +46,8 @@ here verifies exactly as one produced by the Python SDK today.
 Phases 2 through 4 of the design plan, which is tracked outside this repository; workspace
 snapshots are what remains. The plugin loads, validates its configuration, classifies a real event
 stream, and writes a signed manifest whose statement and asset types match the shipped DeepAgents
-and deep-research manifests -- plus a session view beside it, and a mark for each on Relay's own
-event stream.
+and deep-research manifests -- one document per session, with the model's own conversation sealed
+into an iroh collection per type, and a mark for it on Relay's own event stream.
 
 | | |
 |---|---|
@@ -64,8 +64,8 @@ event stream.
 | model calls recorded from typed payloads | yes — `tests/end_to_end.rs` |
 | prompts, subagents, compaction, `apply_patch` | yes |
 | same document shape as the shipped integrations | yes — see below |
-| writes a session view beside the manifest | yes — `tests/end_to_end.rs`, `src/view.rs` |
-| announces each document as a mark | yes — `tests/end_to_end.rs` |
+| seals the conversation into iroh collections | yes — `tests/end_to_end.rs`, `src/recorder.rs` |
+| announces the document as a mark | yes — `tests/end_to_end.rs` |
 | a live session writes a manifest | yes — Claude Code and Codex |
 | a live session writes **file** lineage | yes on Claude Code — `FileRead: 5`, `FileWritten: 3` |
 | the same, on Codex | `apply_patch` only — every read is a shell command, so `FileRead: 0` |
@@ -117,8 +117,7 @@ Relay subscriber (sync, must return promptly)
        └─ bounded queue (4096)
             └─ worker thread, current-thread runtime
                  └─ one Recorder per session
-                      └─ SessionEnded *or* Drop → generate_manifest → {session_id}.json
-                                                                      └→ {session_id}.view.json
+                      └─ SessionEnded *or* Drop → seal + generate_manifest → {session_id}.json
 ```
 
 Three constraints decide that shape. The subscriber is synchronous and must return, so it classifies

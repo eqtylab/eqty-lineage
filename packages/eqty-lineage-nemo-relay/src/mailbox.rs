@@ -314,28 +314,12 @@ pub type SignerFactory = Box<dyn Fn() -> Option<LineageSession> + Send>;
 /// capture -- so the map grows fastest in the process least able to afford it.
 pub type SessionFinished = Box<dyn Fn(&str) + Send>;
 
-/// Which of a session's two documents a mark is about.
+/// The name every manifest is announced under.
 ///
-/// A session writes the full manifest and, when there is anything to show, the session view beside
-/// it. They are announced under different mark names rather than one name with a field, because a
-/// mark's *name* is what a consumer filters on -- a consumer wanting the reduced document should not
-/// have to receive every announcement and read its data to find out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManifestKind {
-    /// Everything the session recorded.
-    Full,
-    /// The same graph without the model's conversation. See [`crate::view`].
-    SessionView,
-}
-
-impl ManifestKind {
-    pub fn mark_name(self) -> &'static str {
-        match self {
-            Self::Full => "eqty.manifest",
-            Self::SessionView => "eqty.manifest.view",
-        }
-    }
-}
+/// A session writes one document and announces it once. There is no second name to subscribe to:
+/// the conversation a reduced view would have dropped is inside this manifest, sealed into a
+/// collection per type.
+pub const MANIFEST_MARK: &str = "eqty.manifest";
 
 /// What a finished recording says about itself.
 ///
@@ -344,7 +328,6 @@ impl ManifestKind {
 /// file that was announced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestMark {
-    pub kind: ManifestKind,
     pub cid: String,
     pub path: PathBuf,
     pub statements: usize,
@@ -503,7 +486,7 @@ impl TurnAuthor {
         Self::User
     }
 
-    /// The node name. Distinct per author because the session view keys its rule on
+    /// The node name. Distinct per author because sealing keys its rule on
     /// `(assetType, name)`, and because a reader scanning names should see the difference.
     fn name(&self) -> &'static str {
         match self {
@@ -905,7 +888,6 @@ async fn record_model_call(
             caused_by,
             details,
             describes,
-            observed,
             at,
         )
         .await;
@@ -1299,67 +1281,34 @@ fn export(
     let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
         return;
     };
-    if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-        let written = write_atomically(&path, &json);
-        // The checkpoints went to the session-shaped name before we knew this was a fragment.
-        //
-        // Gated on the write: this is the only copy of the session once it runs, so removing it
-        // after a failed replacement trades a stale recording for none at all -- the worst outcome
-        // available here, and the one the unconditional version produced.
-        if written && path != checkpoint {
-            let _ = std::fs::remove_file(&checkpoint);
-        }
-        // Announced only here, never from `checkpoint`. A checkpoint is superseded by the next one,
-        // so announcing each would put a mark on the stream per unit of work and leave a consumer
-        // to guess which is final -- and the CID of a manifest that is still growing identifies
-        // nothing a reader can hold onto.
-        //
-        // Gated on `written`, not on `path.exists()`: for an attributed session this path *is* the
-        // checkpoint path, so a failed final write leaves the previous checkpoint sitting there and
-        // an existence check passes over older bytes. The mark would carry the final manifest's CID
-        // over a file that does not hash to it -- the exact question a mark exists to answer.
-        if written && let Ok(cid) = blake3_cid_raw_binary(&json) {
-            on_manifest(&ManifestMark {
-                kind: ManifestKind::Full,
-                cid,
-                path: path.clone(),
-                statements: manifest.statements.len(),
-                unattributed,
-            });
-        }
+    let Ok(json) = serde_json::to_vec_pretty(&manifest) else {
+        return;
+    };
 
-        // Written beside the manifest and at the same time, so a consumer never has to wait for a
-        // second pass or discover that one never ran. Built from the serialized manifest rather than
-        // from recorder state, because the view has to be a subset of the *signed* document -- the
-        // statements it keeps carry their original CIDs and credentials.
-        //
-        // A failure here costs the view and not the manifest: the recording is already on disk, and
-        // an export that refused to finish because a reduction failed would trade the whole session
-        // for a convenience.
-        //
-        // Which is exactly why it is gated on `written`. That sentence assumes a manifest on disk,
-        // and when the write failed there is none -- the file at `path` is an older checkpoint, or
-        // for a renamed fragment nothing at all. Writing the view anyway publishes a reduction of a
-        // document nobody has, announced under its own mark with no manifest mark beside it to say
-        // otherwise: a subset whose statements are absent from the manifest it claims to subset.
-        if written
-            && let Ok(value) = serde_json::from_slice::<Json>(&json)
-            && let Some(view) = crate::view::session_view(&value)
-        {
-            let view_path = path.with_extension("view.json");
-            // Same rule as the manifest above, and for the same reason: a view left over from an
-            // earlier export satisfies `exists()` while holding different bytes.
-            if write_atomically(&view_path, &view.bytes)
-                && let Ok(cid) = blake3_cid_raw_binary(&view.bytes)
-            {
-                on_manifest(&ManifestMark {
-                    kind: ManifestKind::SessionView,
-                    cid,
-                    path: view_path,
-                    statements: view.statements,
-                    unattributed,
-                });
-            }
-        }
+    let written = write_atomically(&path, &json);
+    // The checkpoints went to the session-shaped name before we knew this was a fragment.
+    //
+    // Gated on the write: this is the only copy of the session once it runs, so removing it after a
+    // failed replacement trades a stale recording for none at all -- the worst outcome available
+    // here, and the one the unconditional version produced.
+    if written && path != checkpoint {
+        let _ = std::fs::remove_file(&checkpoint);
+    }
+    // Announced only here, never from `checkpoint`. A checkpoint is superseded by the next one, so
+    // announcing each would put a mark on the stream per unit of work and leave a consumer to guess
+    // which is final -- and the CID of a manifest that is still growing identifies nothing a reader
+    // can hold onto.
+    //
+    // Gated on `written`, not on `path.exists()`: for an attributed session this path *is* the
+    // checkpoint path, so a failed final write leaves the previous checkpoint sitting there and an
+    // existence check passes over older bytes. The mark would carry the final manifest's CID over a
+    // file that does not hash to it -- the exact question a mark exists to answer.
+    if written && let Ok(cid) = blake3_cid_raw_binary(&json) {
+        on_manifest(&ManifestMark {
+            cid,
+            path: path.clone(),
+            statements: manifest.statements.len(),
+            unattributed,
+        });
     }
 }
