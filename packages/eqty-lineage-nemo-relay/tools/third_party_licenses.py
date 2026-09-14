@@ -24,7 +24,15 @@ def texts(crate_dir, license_file=None):
         declared = Path(license_file)
         if not declared.is_absolute():
             declared = crate_dir / declared
-        paths.add(declared.resolve(strict=True))
+        # A published crate need not ship the path its manifest declares -- `license-file` is often
+        # a repository path excluded from the tarball. The walk below still finds a conventional
+        # notice, and a crate with neither is reported as missing, so the packaging run should not
+        # fail over one manifest field. Strictness is kept where a silent gap would matter: the walk
+        # names files it just listed, and a text that cannot be read there is a real failure.
+        try:
+            paths.add(declared.resolve(strict=True))
+        except OSError:
+            pass
 
     def scan_error(error):
         raise error
