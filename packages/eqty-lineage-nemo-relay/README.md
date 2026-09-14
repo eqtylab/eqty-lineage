@@ -186,7 +186,7 @@ and so is the conversation that read carried.
 
 ## Running it against a live session
 
-`docs/live-session-script.md` is a twelve-turn script that drives every path this recorder can record
+`docs/live-session-script.md` is an eleven-turn script that drives every path this recorder can record
 today — file versions and the replay chain, partial reads, subagents, redaction, the size ceiling,
 non-UTF-8 content, a failing tool, and compaction — plus a verification block that prints `YES` or
 `MISSING` per capability.
@@ -272,9 +272,21 @@ rather than at the real cause.
 
 ## Building
 
+From this package directory, run the main suite and the separate C ABI suite:
+
 ```bash
-cargo test                       # 19 tests, including a real load through the C ABI
-cargo build --release            # target/release/libeqty_lineage_nemo_relay.dylib
+cargo test --locked
+cargo test --locked --manifest-path abi-test/Cargo.toml
+```
+
+The main suite contains 168 tests: 167 run by default and one diagnostic test is ignored. The
+separate ABI suite contains two tests covering library activation and invalid configuration.
+From the repository root, `just test-rust` runs both suites.
+
+Build and hash the library (macOS shown; Linux produces `libeqty_lineage_nemo_relay.so`):
+
+```bash
+cargo build --locked --release
 shasum -a 256 target/release/libeqty_lineage_nemo_relay.dylib
 ```
 
@@ -285,7 +297,7 @@ library before loading it regardless of attestation policy. `just nemo-relay-pac
 by a user.
 
 `just nemo-relay-package [target] [out]` takes an optional target triple and staging directory, which
-is how one release builds four bundles. Release CI ships:
+is how one release builds three bundles. Release CI ships:
 
 | target | notes |
 | --- | --- |
