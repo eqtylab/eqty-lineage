@@ -178,10 +178,14 @@ nemo-relay-package target="" out="dist/relay-plugin":
   out="{{out}}"
   export TARGET_TRIPLE="{{target}}"
   cd packages/eqty-lineage-nemo-relay
+  if [ -z "$TARGET_TRIPLE" ]; then
+    TARGET_TRIPLE="${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+  fi
+  test -n "$TARGET_TRIPLE"
   # `--target` moves the artifact under `target/<triple>/release`, which is exactly why the path is
   # read from cargo's own output rather than assembled here.
-  artifact=$(cargo build --release --lib --message-format=json-render-diagnostics \
-    ${TARGET_TRIPLE:+--target "$TARGET_TRIPLE"} \
+  artifact=$(cargo build --locked --release --lib --message-format=json-render-diagnostics \
+    --target "$TARGET_TRIPLE" \
     | python3 -c '
   import json, sys
   for line in sys.stdin:
@@ -212,7 +216,7 @@ nemo-relay-package target="" out="dist/relay-plugin":
   # Generated per bundle rather than committed: it has to describe the tree this artifact was built
   # from, and a stale copy would attribute code the binary does not contain.
   python3 packages/eqty-lineage-nemo-relay/tools/third_party_licenses.py \
-    packages/eqty-lineage-nemo-relay/Cargo.toml > "$out/THIRD-PARTY-LICENSES.md"
+    packages/eqty-lineage-nemo-relay/Cargo.toml --target "$TARGET_TRIPLE" > "$out/THIRD-PARTY-LICENSES.md"
   cd "$out"
   # `shasum` is not everywhere; `sha256sum` is the GNU coreutils spelling.
   if command -v shasum >/dev/null 2>&1; then

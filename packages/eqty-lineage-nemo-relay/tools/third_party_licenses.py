@@ -1,20 +1,13 @@
-"""Collect the license text of every crate linked into the plugin.
+"""Collect available notices from the plugin's target-filtered normal dependencies.
 
-The cdylib statically links its whole dependency tree, so the bundle a user installs carries
-those crates' code and owes their notices. MPL-2.0 and BSD terms make that an obligation rather
-than a courtesy.
-
-Only normal dependencies are walked. Dev-dependencies build the tests and build-dependencies
-run at compile time; neither reaches the cdylib, and attributing them would claim the artifact
-carries code it does not.
-
-Texts come from the crate sources cargo already unpacked, so this needs no network and no
-extra tool. Identical texts are emitted once: Apache-2.0 is byte-identical everywhere, while
-each MIT notice carries its own copyright line and stays distinct.
+Cargo's dependency graph is a conservative inventory, not a binary contents audit.
+Nested notices may cover vendored code; identical texts are emitted once.
 """
 
+import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -23,18 +16,28 @@ LICENSE_FILES = ("LICENSE", "LICENCE", "COPYING", "NOTICE", "UNLICENSE")
 OURS = {"eqty-lineage-nemo-relay", "eqty-lineage-nemo-relay-abi-test"}
 
 
-def texts(crate_dir):
-    """Every license-ish file in a crate's source root, longest first."""
+def texts(crate_dir, license_file=None):
+    """Include declared license paths as well as conventional nested notices."""
+    crate_dir = crate_dir.resolve(strict=True)
+    paths = set()
+    if license_file:
+        declared = Path(license_file)
+        if not declared.is_absolute():
+            declared = crate_dir / declared
+        paths.add(declared.resolve(strict=True))
+
+    def scan_error(error):
+        raise error
+
+    for directory, dirs, files in os.walk(crate_dir, onerror=scan_error):
+        dirs[:] = sorted(d for d in dirs if d not in {".git", "target"})
+        for name in files:
+            if name.upper().startswith(LICENSE_FILES):
+                paths.add((Path(directory) / name).resolve(strict=True))
     found = []
-    for path in sorted(crate_dir.iterdir()) if crate_dir.is_dir() else []:
-        if not path.is_file():
-            continue
-        stem = path.name.upper()
-        if any(stem.startswith(p) for p in LICENSE_FILES):
-            try:
-                found.append((path.name, path.read_text(encoding="utf-8", errors="replace")))
-            except OSError:
-                pass
+    for path in sorted(paths):
+        name = os.path.relpath(path, crate_dir)
+        found.append((name, path.read_text(encoding="utf-8")))
     return found
 
 
@@ -56,10 +59,21 @@ def linked(meta):
     return seen
 
 
-def main(manifest):
+def main(manifest, target):
     meta = json.loads(
         subprocess.run(
-            ["cargo", "metadata", "--format-version", "1", "--manifest-path", manifest],
+            [
+                "cargo",
+                "metadata",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                target,
+                "--manifest-path",
+                manifest,
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -72,19 +86,21 @@ def main(manifest):
         if pkg["name"] in OURS or pkg["id"] not in reachable:
             continue
         crates.append(pkg)
-        found = texts(Path(pkg["manifest_path"]).parent)
+        found = texts(Path(pkg["manifest_path"]).parent, pkg.get("license_file"))
         if not found:
             missing.append(pkg)
         for filename, body in found:
-            bodies.setdefault(hashlib.sha256(body.encode()).hexdigest(), (body, filename, []))[2].append(pkg["name"])
+            bodies.setdefault(hashlib.sha256(body.encode()).hexdigest(), (body, filename, []))[2].append(
+                f"{pkg['name']} {pkg['version']} ({filename})"
+            )
 
     out = [
         "# Third-party licenses",
         "",
-        "`libeqty_lineage_nemo_relay` statically links the crates below. Their licenses and",
-        "notices are reproduced here; each applies to that crate's code, not to this project.",
+        "Available license texts and notices from the plugin's normal dependency graph.",
+        "This is a conservative source inventory, not an exact inventory of linked code.",
         "",
-        "Normal dependencies only -- test and build-time crates do not reach the library.",
+        f"Build target: `{target}`. Test and build dependency edges are excluded.",
         "",
         f"{len(crates)} crates, {len(bodies)} distinct notices.",
         "",
@@ -102,9 +118,10 @@ def main(manifest):
     if missing:
         out += [
             "",
-            "## Crates shipping no license file",
+            "## Crates with no collected license text",
             "",
-            "Their declared terms are in the table above; the text was not in the published crate.",
+            "No conventional notice or declared license file was found in these crate sources.",
+            "Their declared terms are listed above; this report does not resolve missing texts.",
             "",
         ]
         out += [f"- {p['name']} {p['version']} — {p.get('license') or '(not declared)'}" for p in missing]
@@ -118,4 +135,8 @@ def main(manifest):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("manifest")
+    parser.add_argument("--target", required=True, help="The target triple used to build the plugin")
+    args = parser.parse_args()
+    main(args.manifest, args.target)
