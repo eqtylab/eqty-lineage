@@ -7,7 +7,7 @@ name: Release Relay plugin
 # One bundle per platform, because the digest is over one artifact: each target gets its own
 # manifest, digest and signature. A bundle is also a clean runtime closure -- Relay copies the whole
 # directory holding `relay-plugin.toml` into an activation snapshot against a 512 MiB budget, so it
-# holds the library, its signature and the config schema and nothing else.
+# holds the library, its signature, the config schema and the license notices and nothing else.
 
 on:
   release:

@@ -207,6 +207,12 @@ nemo-relay-package target="" out="dist/relay-plugin":
   cp "$artifact" "$out/"
   cp packages/eqty-lineage-nemo-relay/config.schema.json "$out/"
   cp packages/eqty-lineage-nemo-relay/relay-plugin.toml "$out/"
+  cp LICENSE "$out/"
+  # The cdylib links its whole tree in, so the bundle carries those crates and owes their notices.
+  # Generated per bundle rather than committed: it has to describe the tree this artifact was built
+  # from, and a stale copy would attribute code the binary does not contain.
+  python3 packages/eqty-lineage-nemo-relay/tools/third_party_licenses.py \
+    packages/eqty-lineage-nemo-relay/Cargo.toml > "$out/THIRD-PARTY-LICENSES.md"
   cd "$out"
   # `shasum` is not everywhere; `sha256sum` is the GNU coreutils spelling.
   if command -v shasum >/dev/null 2>&1; then

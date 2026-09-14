@@ -320,7 +320,8 @@ Note that `[integrity] sha256` is **NVIDIA's** artifact digest and has nothing t
 ## Installing a release
 
 Download the bundle for your platform from the repository's releases and register it. Each bundle
-holds the library, its signature, `config.schema.json`, and a `relay-plugin.toml` whose
+holds the library, its signature, `config.schema.json`, `LICENSE`, `THIRD-PARTY-LICENSES.md`,
+and a `relay-plugin.toml` whose
 `[integrity] sha256` is already stamped for that artifact.
 
 ```bash
@@ -372,7 +373,8 @@ nemo-relay plugins enable  eqty.lineage
 containing `relay-plugin.toml` into an activation snapshot against a 512 MiB budget; from the package
 root that closure is `src/` + `tests/` + `target/` + `abi-test/target/`, and the gateway refuses to
 start citing an unrelated file. `just nemo-relay-package` stages a directory holding only the dylib,
-its signature and the config schema, and stamps the digest into the staged copy.
+its signature, the config schema and the two license files, and stamps the digest into the staged
+copy.
 
 **It also signs, and that is not optional.** `plugins add` evaluates trust with attestation
 defaulting to `integrity_only`, but every activation path hardens it to `signature_required` first —
