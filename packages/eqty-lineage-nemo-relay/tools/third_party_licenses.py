@@ -4,6 +4,10 @@ The cdylib statically links its whole dependency tree, so the bundle a user inst
 those crates' code and owes their notices. MPL-2.0 and BSD terms make that an obligation rather
 than a courtesy.
 
+Only normal dependencies are walked. Dev-dependencies build the tests and build-dependencies
+run at compile time; neither reaches the cdylib, and attributing them would claim the artifact
+carries code it does not.
+
 Texts come from the crate sources cargo already unpacked, so this needs no network and no
 extra tool. Identical texts are emitted once: Apache-2.0 is byte-identical everywhere, while
 each MIT notice carries its own copyright line and stays distinct.
@@ -34,6 +38,24 @@ def texts(crate_dir):
     return found
 
 
+def linked(meta):
+    """Package ids reachable from the root crate through normal dependency edges."""
+    nodes = {node["id"]: node for node in meta["resolve"]["nodes"]}
+    seen, queue = set(), [meta["resolve"]["root"]]
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        for dep in nodes[current]["deps"]:
+            # A missing `dep_kinds` predates cargo reporting them; treat it as normal rather
+            # than dropping the crate from a notice that has to be complete.
+            kinds = dep.get("dep_kinds")
+            if not kinds or any(kind.get("kind") is None for kind in kinds):
+                queue.append(dep["pkg"])
+    return seen
+
+
 def main(manifest):
     meta = json.loads(
         subprocess.run(
@@ -44,9 +66,10 @@ def main(manifest):
         ).stdout
     )
 
+    reachable = linked(meta)
     crates, bodies, missing = [], {}, []
     for pkg in sorted(meta["packages"], key=lambda p: (p["name"], p["version"])):
-        if pkg["name"] in OURS:
+        if pkg["name"] in OURS or pkg["id"] not in reachable:
             continue
         crates.append(pkg)
         found = texts(Path(pkg["manifest_path"]).parent)
@@ -60,6 +83,8 @@ def main(manifest):
         "",
         "`libeqty_lineage_nemo_relay` statically links the crates below. Their licenses and",
         "notices are reproduced here; each applies to that crate's code, not to this project.",
+        "",
+        "Normal dependencies only -- test and build-time crates do not reach the library.",
         "",
         f"{len(crates)} crates, {len(bodies)} distinct notices.",
         "",
