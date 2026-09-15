@@ -129,11 +129,6 @@ impl LineageSession {
         self.blob_bytes
     }
 
-    /// The DID every statement in this session is registered by.
-    pub fn did(&self) -> &str {
-        &self.did
-    }
-
     /// How many statements have been accumulated. For tests and coverage reporting.
     pub fn statement_count(&self) -> usize {
         self.statements.len()

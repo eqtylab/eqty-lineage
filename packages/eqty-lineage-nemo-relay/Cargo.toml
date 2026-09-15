@@ -25,14 +25,8 @@ nemo-relay-plugin = "0.8.3"
 # is a build requirement, not a preference. See README.
 integrity = { git = "https://github.com/eqtylab/integrity", rev = "0d85ae5b9f7204812771c4f8e4985c671b831b0a", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
 anyhow = "1"
-chrono = "0.4"
 tokio = { version = "1", features = ["rt", "sync"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Metadata blobs in a manifest are base64, and tests have to read `assetType` and `name`
-# out of them to tell a node from the conversation. Already in the tree; named here because the
-# library now depends on it and not only the tests.
-base64 = "0.22"
 uuid = "1"
 
 [dev-dependencies]

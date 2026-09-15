@@ -494,7 +494,6 @@ fn identity_only(path: &str, mode: FileMode, tool_use_id: Option<&str>) -> FileO
 pub fn file_events_from_result(
     result: &Json,
     tool_use_id: Option<&str>,
-    include_partial_reads: bool,
 ) -> (Vec<FileObserved>, Option<String>) {
     let Some(object) = result.as_object() else {
         return (Vec::new(), None);
@@ -502,7 +501,7 @@ pub fn file_events_from_result(
 
     let file_info = object.get("file").and_then(Json::as_object);
     if let Some(file_info) = file_info.filter(|info| info.contains_key("filePath")) {
-        return read_events(file_info, tool_use_id, include_partial_reads);
+        return read_events(file_info, tool_use_id);
     }
 
     let is_edit = object.contains_key("filePath")
@@ -519,7 +518,6 @@ pub fn file_events_from_result(
 fn read_events(
     file_info: &serde_json::Map<String, Json>,
     tool_use_id: Option<&str>,
-    include_partial_reads: bool,
 ) -> (Vec<FileObserved>, Option<String>) {
     let Some(path) = file_info
         .get("filePath")
@@ -553,9 +551,6 @@ fn read_events(
         .unwrap_or(false);
 
     if starts_past_the_top || fewer_lines_than_the_file || cut_short {
-        if !include_partial_reads {
-            return (Vec::new(), None);
-        }
         return (
             vec![FileObserved {
                 path: path.to_string(),

@@ -924,7 +924,7 @@ async fn record_tool(
     state.recorder.note_tool_outcome(is_error);
 
     let (mut observations, _attributed) = match &result {
-        Some(result) => file_events_from_result(result, tool_use_id, true),
+        Some(result) => file_events_from_result(result, tool_use_id),
         None => {
             // A tool end carrying no payload at all. The arguments may still name a path, so the
             // call is recorded from what is known rather than abandoned -- and returning here also

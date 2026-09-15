@@ -15,7 +15,6 @@ fn a_whole_read_carries_its_content() {
             "filePath": "/report.md", "content": "# Report\n", "numLines": 1, "totalLines": 1, "startLine": 1
         }}),
         Some("t1"),
-        true,
     );
 
     assert_eq!(events.len(), 1);
@@ -36,7 +35,7 @@ fn a_sliced_read_establishes_the_path_but_not_the_content() {
         json!({"filePath": "/big.md", "content": "line 40\n", "startLine": 40, "numLines": 1, "totalLines": 900}),
         json!({"filePath": "/big.md", "content": "head\n", "startLine": 1, "numLines": 10, "totalLines": 900}),
     ] {
-        let (events, _) = file_events_from_result(&json!({ "file": slice }), Some("t1"), true);
+        let (events, _) = file_events_from_result(&json!({ "file": slice }), Some("t1"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].path, "/big.md");
         assert_eq!(
@@ -54,7 +53,6 @@ fn an_edit_records_both_the_version_read_and_the_version_written() {
             "oldString": "x = 1", "newString": "x = 2", "replaceAll": false
         }),
         Some("t2"),
-        true,
     );
 
     assert_eq!(events.len(), 2, "an edit is a read and a write: {events:?}");
@@ -77,7 +75,6 @@ fn an_edit_without_its_pre_image_hands_on_the_replacement() {
     let (events, _) = file_events_from_result(
         &json!({"filePath": "/a.py", "oldString": "x = 1", "newString": "x = 2", "structuredPatch": []}),
         Some("t3"),
-        true,
     );
 
     assert_eq!(events.len(), 1, "no pre-image means no read event");
@@ -96,7 +93,6 @@ fn a_write_gives_the_post_state_directly() {
     let (events, _) = file_events_from_result(
         &json!({"filePath": "/new.md", "content": "created\n", "type": "create"}),
         Some("t4"),
-        true,
     );
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].mode, FileMode::Wrote);
@@ -132,7 +128,7 @@ fn a_bash_result_yields_nothing() {
     // Every Bash result in the reference capture is a bare string. A shell command that writes a
     // file is not attributable from its result alone, and inventing an attribution would be worse
     // than the gap.
-    let (events, attributed) = file_events_from_result(&json!("/Users/b/Dev\n"), Some("t5"), true);
+    let (events, attributed) = file_events_from_result(&json!("/Users/b/Dev\n"), Some("t5"));
     assert!(events.is_empty());
     assert_eq!(attributed, None);
 }
@@ -208,7 +204,7 @@ fn a_read_cut_off_mid_line_is_a_fragment() {
         },
         "type": "text"
     });
-    let (events, _) = file_events_from_result(&result, Some("toolu_1"), true);
+    let (events, _) = file_events_from_result(&result, Some("toolu_1"));
     assert_eq!(events.len(), 1, "the path must still be recorded");
     assert_eq!(
         events[0].content, None,
@@ -231,7 +227,7 @@ fn an_untruncated_read_still_carries_its_content() {
         },
         "type": "text"
     });
-    let (events, _) = file_events_from_result(&result, Some("toolu_2"), true);
+    let (events, _) = file_events_from_result(&result, Some("toolu_2"));
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].content.as_deref(), Some(&b"hello\n"[..]));
 }
