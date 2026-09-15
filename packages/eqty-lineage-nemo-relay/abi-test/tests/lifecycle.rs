@@ -168,44 +168,50 @@ fn build_cdylib() -> &'static Path {
     })
 }
 
-/// Write a manifest carrying the artifact's real digest.
+/// Stage the *shipped* manifest, substituting only what a temporary directory must change.
 ///
-/// Relay always verifies `[integrity] sha256` against the library it is about to load, regardless of
-/// attestation policy. Computing it here rather than hardcoding it is the same thing release CI must
-/// do -- a stale digest is an install Relay refuses.
+/// Derived rather than retyped. A hand-written copy drifts, and the fields that drift first are the
+/// ones a hand-written copy cannot notice: `[capabilities]` decides whether Relay reads the config
+/// schema at all, and `[config_schema] path` decides which file it reads. A suite carrying its own
+/// manifest proves `register` refuses a bad config while proving nothing about whether the schema is
+/// wired up -- so a `config.schema.json` that rejects a legal key would pass here and refuse every
+/// real install.
+///
+/// Only two lines are rewritten. Relay always verifies `[integrity] sha256` against the library it
+/// is about to load, regardless of attestation policy, so the digest is computed here exactly as
+/// release CI must compute it; and `[load] library` has to name the artifact this test just built.
 fn write_manifest(directory: &Path, library: &Path) -> PathBuf {
+    let package = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("abi-test sits inside the package");
+    let shipped = std::fs::read_to_string(package.join("relay-plugin.toml"))
+        .expect("the shipped manifest should read");
+
+    // The schema the manifest points at has to sit beside it, or Relay resolves `path` to nothing.
+    std::fs::copy(
+        package.join("config.schema.json"),
+        directory.join("config.schema.json"),
+    )
+    .expect("the shipped schema should copy");
+
     let digest = digest(library);
     let quoted = format!("{:?}", library.to_string_lossy());
+    let staged: String = shipped
+        .lines()
+        .map(|line| {
+            if line.starts_with("sha256 = ") {
+                format!("sha256 = \"{digest}\"")
+            } else if line.starts_with("library = ") {
+                format!("library = {quoted}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
     let manifest = directory.join("relay-plugin.toml");
-    std::fs::write(
-        &manifest,
-        format!(
-            r#"manifest_version = 1
-
-[plugin]
-id = "{PLUGIN_ID}"
-kind = "rust_dynamic"
-
-[compat]
-relay = ">=0.8.0,<1.0"
-native_api = "1"
-
-[defaults]
-enabled = false
-
-[capabilities]
-items = ["plugin_native"]
-
-[integrity]
-sha256 = "{digest}"
-
-[load]
-library = {quoted}
-symbol = "nemo_relay_register_plugin"
-"#,
-        ),
-    )
-    .expect("manifest should write");
+    std::fs::write(&manifest, staged).expect("manifest should write");
     manifest
 }
 
