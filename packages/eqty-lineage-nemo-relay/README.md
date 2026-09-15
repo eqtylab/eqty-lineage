@@ -336,7 +336,7 @@ Then pin EQTY's release key in `~/.config/nemo-relay/plugins.toml`, beside the
 ```toml
 [plugins.policy.overrides."eqty.lineage"]
 attestation = "signature_required"
-trusted_public_keys = ["ed25519:EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4="]
+trusted_public_keys = ["ed25519:kHMtfiQL4mOOBP+apTlOGRFkSR/B/Flth5EOVsgCd9g="]
 ```
 
 **Pinning this key is the point, and it is not the same as leaving the default alone.** Relay
@@ -353,7 +353,7 @@ library bytes, base64-encoded:
 cd eqty-lineage-nemo-relay-<version>-<target>
 shasum -a 256 libeqty_lineage_nemo_relay.dylib     # must match [integrity] sha256
 python3 -c "import base64,sys; sys.stdout.buffer.write(base64.b64decode(open('libeqty_lineage_nemo_relay.dylib.sig').read()))" > sig.raw
-python3 -c "import base64,sys; sys.stdout.buffer.write(bytes.fromhex('302a300506032b6570032100')+base64.b64decode('EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4='))" > key.der
+python3 -c "import base64,sys; sys.stdout.buffer.write(bytes.fromhex('302a300506032b6570032100')+base64.b64decode('kHMtfiQL4mOOBP+apTlOGRFkSR/B/Flth5EOVsgCd9g='))" > key.der
 openssl pkey -pubin -inform DER -in key.der -out key.pem
 openssl pkeyutl -verify -rawin -pubin -inkey key.pem -in libeqty_lineage_nemo_relay.dylib -sigfile sig.raw
 ```
