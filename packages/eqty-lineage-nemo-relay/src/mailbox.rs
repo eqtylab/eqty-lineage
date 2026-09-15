@@ -1232,11 +1232,7 @@ async fn checkpoint(state: &mut SessionState) {
             return;
         }
     }
-    // Charged before the work, not after it, because the work is what has to be paced. Snapshotting
-    // signs the whole recording and serializing copies it, and both fail for reasons that do not
-    // clear up -- a signer that errors keeps erroring. Advancing only on the far side of them left
-    // the interval below unengaged for the entire session, which is the same hot loop this watermark
-    // exists to prevent, reached through a different failure than the one it was fixed for.
+    // Pace failed snapshot attempts too, so repeated failures cannot trigger a rewrite per event.
     state.attempted_at = count;
     let Ok(manifest) = state.recorder.snapshot().await else {
         return;

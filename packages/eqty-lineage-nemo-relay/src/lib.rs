@@ -66,9 +66,6 @@ const PLUGIN_KIND: &str = "eqty.lineage";
 const SUBSCRIBER_NAME: &str = "eqty_lineage";
 
 /// Counts of what the subscriber has seen, shared with every registered component.
-///
-/// This is the Phase 2 stand-in for the recorder: it proves the event stream arrives, that
-/// classification runs against real events, and that neither panics -- without yet building a graph.
 #[derive(Debug, Default)]
 pub struct Tally {
     /// Events delivered to the subscriber.
@@ -97,13 +94,8 @@ pub struct Tally {
 #[derive(Default)]
 pub struct EqtyLineagePlugin {
     tally: Arc<Tally>,
-    /// One of the handles keeping the mailbox alive; the subscriber closure Relay owns holds another.
-    ///
-    /// So dropping the plugin does *not* by itself flush anything -- the flush happens when the last
-    /// `Arc` goes, which is whenever Relay releases the subscriber. Relay has no explicit teardown
-    /// hook, and on Codex that release is the only thing that ever writes a manifest. Held here so
-    /// the mailbox survives at least as long as the plugin, not because this handle is the one that
-    /// ends it.
+    /// The subscriber also owns a handle, so final export waits for the last `Arc` to drop.
+    /// Open sessions can already have checkpoints on disk.
     mailbox: Option<Arc<Mailbox>>,
 }
 

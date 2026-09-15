@@ -64,11 +64,6 @@ impl std::fmt::Display for AssetRef {
 }
 
 /// One session's worth of lineage, accumulated in memory.
-///
-/// Statements are appended as they are made and the whole vector goes to `generate_manifest` at the
-/// end. There is no database: `integrity-py` keeps statements in SQLite because it must serve
-/// queries across many graphs, and the export ceiling people hit at roughly 10.9k statements is a
-/// property of that retrieval, not of the manifest format. Recording one session needs none of it.
 pub struct LineageSession {
     signer: SignerType,
     did: String,
@@ -76,12 +71,7 @@ pub struct LineageSession {
     /// CID to bytes, for every blob a statement references. `generate_manifest` inlines these, so a
     /// metadata statement whose bytes are missing here becomes a CID nobody can resolve.
     blobs: HashMap<String, Vec<u8>>,
-    /// Content CIDs that already carry a `DataRegistration`.
-    ///
-    /// Under content addressing a second registration of identical bytes asserts nothing the first
-    /// did not: same CID, same node, same edges. On a real session the system prompt repeats on
-    /// every call, and re-registering it made 22 of 77 data statements redundant -- each dragging a
-    /// credential and a metadata statement with it.
+    /// Repeated content shares a registration to avoid duplicating statements and credentials.
     registered_content: HashSet<String>,
     /// `(subject, metadata CID)` pairs that already carry a `MetadataRegistration`.
     ///
@@ -314,17 +304,8 @@ impl LineageSession {
         Ok(())
     }
 
-    /// Append a metadata statement, the bytes it commits to, and a credential over it.
-    ///
-    /// `create_from_json` stores only a CID of the canonicalized metadata. Storing the matching
-    /// bytes is not optional bookkeeping: without them the manifest carries a reference that
-    /// resolves to nothing, and a reader cannot see what was claimed.
-    ///
-    /// The credential is not optional either. A metadata statement carries the claims a reader
-    /// actually acts on -- a file's path, an activity's `performedBy` -- and without a VC over it
-    /// those claims are unattributed: the manifest still verifies with them altered or added. The
-    /// shipped manifests credential every statement; an earlier version of this method credentialed
-    /// none of its own.
+    /// Keep canonical metadata bytes so their CID resolves in the manifest.
+    /// Sign the metadata statement so its claims are attributable to the session's signer.
     async fn push_metadata(
         &mut self,
         subject: String,
@@ -347,17 +328,8 @@ impl LineageSession {
         self.push_with_proof(statement, at).await
     }
 
-    /// Build a manifest from what has been recorded so far, without consuming the session.
-    ///
-    /// Uses the same `generate_manifest` the Python SDK reaches through `Context.export()`, over the
-    /// same `Statement` type, so the result verifies identically.
-    ///
-    /// **This is not cheap and the caller must treat it as expensive.** Every call deep-copies all
-    /// statements and every blob, re-resolves them and re-serializes the whole manifest, so the cost
-    /// is the size of the recording so far -- not the size of what changed. A session holding a
-    /// 20 MB file pays 20 MB per call. `integrity`'s `InMemoryStore` takes its map by value, so the
-    /// copy cannot be avoided from here; bounding *how often* this is called is the caller's job, and
-    /// [`Self::blob_bytes`] exists so it can be bounded by size rather than by guesswork.
+    /// Snapshot without consuming the session; existing statements retain their credentials.
+    /// Copies all statements and blobs, so callers must pace snapshots by recording size.
     pub async fn snapshot(&self) -> Result<Manifest> {
         Self::build(self.statements.clone(), self.blobs.clone()).await
     }

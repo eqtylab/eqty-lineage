@@ -294,20 +294,8 @@ impl Recorder {
 
         let key = (path.clone(), content_cid.clone());
         if let Some(existing) = self.by_content.get(&key).cloned() {
-            // The node already exists, but the replay base must still move -- by exactly the rule
-            // the new-node path uses below, because the base is a fact about the file and not about
-            // whether we happened to have seen this version before.
-            //
-            // A file that went from A to B and back to A leaves B cached otherwise, and the next
-            // edit anchored on A is either refused or -- if its `old` text happens to occur in B as
-            // well -- replayed against content the file no longer holds.
-            //
-            // The contentless-write arm is the one that was missing, and it is reachable: an
-            // unreconstructable write keys on `unknown:{path}`, so the *second* such observation for
-            // a path deduplicates against the first and returned here without clearing the base. A
-            // truncated read seeds that key without touching the base, so `read (truncated)`,
-            // `read (full)`, `write (unreconstructable)`, `edit` replayed the edit against the
-            // pre-write bytes and signed a version of the file that never existed.
+            // Deduplication must still refresh or invalidate the replay base.
+            // A contentless write invalidates it even when its unknown-content node already exists.
             Self::move_replay_base(
                 &mut self.last_content,
                 path,
@@ -755,16 +743,8 @@ impl Recorder {
             ),
         };
         let name = format!("{label} {index}");
-        // An `Entity`, not an `Activity`. An activity in this manifest *is* a
-        // `ComputationRegistration`, carrying inputs, outputs and `performedBy`; this is a
-        // `DataRegistration`, so claiming `provType: Activity` would describe graph structure no
-        // statement backs. What is captured is a marker -- an ordinal, a phase, a timestamp -- and
-        // nothing about the compaction was observed beyond its having happened, which is why
-        // `record_tool_run` refuses an empty computation for the same reason
-        // (`ActivityWithoutOutputs`).
-        //
-        // Phase 4's context snapshots (§8) would earn the other type: pre- and post-compaction
-        // contexts as entities, and one real computation between them.
+        // Only the compaction boundary was observed, so record an entity marker.
+        // A computation would require observed input and output contexts.
         self.register_payload(
             "Dataset",
             &name,

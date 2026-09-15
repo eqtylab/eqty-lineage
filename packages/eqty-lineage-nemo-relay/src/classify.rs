@@ -172,10 +172,7 @@ pub enum CompactionPhase {
 }
 
 /// Classify one Relay event, or `None` when it carries no lineage.
-///
-/// The overwhelming majority of a real session is `llm.chunk` marks -- 428 of the 445 events in the
-/// reference Codex capture -- and they are streaming detail already summarized by the enclosing LLM
-/// scope. Dropping them here keeps the rest of the plugin from ever seeing them.
+/// Streaming chunks are omitted because the enclosing LLM scope supplies the completed response.
 pub fn classify(event: &Event) -> Option<LineageEvent> {
     let metadata = event.metadata();
     match event.kind() {
@@ -277,18 +274,8 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
             })
         }
 
-        // An `agent` scope is either the session itself or a subagent inside it, and `parent_uuid`
-        // separates them: the root is self-parented, a subagent is not.
-        //
-        // Relay does not forward `SubagentStart` as a mark. It consumes the hook and synthesizes a
-        // scope -- `push_scope(name: subagent_name, scope_type: ScopeType::Agent, parent:
-        // parent_scope)` in its session manager -- so the subagent *is* the scope, and the
-        // hook-name arm in `classify_mark` never fires on Claude Code. Verified two ways: a hook
-        // probe against Claude Code 2.1.236 shows SubagentStart and SubagentStop firing, and no
-        // mark carrying either name ever reaches a subscriber.
-        //
-        // Reading the end of one of these as the session ending truncated a nine-turn live session
-        // to its last three turns.
+        // Relay converts Claude Code subagent hooks into agent scopes rather than marks.
+        // A subagent's scope end must not end the enclosing session.
         ("agent", false) if is_subagent_scope(event, metadata) => {
             Some(LineageEvent::SubagentStarted {
                 subagent_id: event.uuid().to_string(),
