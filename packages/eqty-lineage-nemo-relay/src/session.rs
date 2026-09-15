@@ -28,9 +28,10 @@ use crate::classify::string_at;
 
 /// Maps Relay's scope tree onto session identifiers.
 ///
-/// Not concurrency-safe by design: one router belongs to one subscriber, which Relay invokes from
-/// its own queue. Sharing it across threads would need a lock, and a lock on the hot path of an
-/// event stream is the thing the enqueue-and-return contract exists to avoid.
+/// Not internally synchronised. The plugin shares one router between the subscriber and the
+/// mailbox's `on_finished` closure, which runs on the worker thread, so it is held behind a mutex
+/// and locked once per event -- see `register` in `lib.rs`. Keep that lock uncontended: it sits on
+/// the hot path of an event stream, which is what the enqueue-and-return contract exists to protect.
 #[derive(Debug, Default)]
 pub struct SessionRouter {
     /// Scope UUID to the session it belongs to.
@@ -59,8 +60,15 @@ impl SessionRouter {
             None => self.scopes.get(&parent?)?.clone(),
         };
 
-        self.scopes.insert(event.uuid(), session.clone());
-        // `session.start` is self-parented at the agent root, which is what every turn hangs from.
+        // Only a scope can be a parent, so only a scope is worth remembering. Marks are the bulk of
+        // a stream -- 325 of the 361 events in a live capture, almost all `llm.chunk` -- and an entry
+        // per mark is an entry nothing ever looks up, held until the session exports. On Codex no
+        // `SessionEnded` arrives, so `forget` may never run at all.
+        if event.kind() == "scope" {
+            self.scopes.insert(event.uuid(), session.clone());
+        }
+        // The parent is remembered whatever this event is: `session.start` is a mark, and the scope
+        // it names is the agent root every turn hangs from.
         if let Some(parent) = parent {
             self.scopes.entry(parent).or_insert_with(|| session.clone());
         }
