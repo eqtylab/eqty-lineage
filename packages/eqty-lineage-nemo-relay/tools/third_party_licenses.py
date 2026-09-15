@@ -45,7 +45,10 @@ def texts(crate_dir, license_file=None):
     found = []
     for path in sorted(paths):
         name = os.path.relpath(path, crate_dir)
-        found.append((name, path.read_text(encoding="utf-8")))
+        # Replace rather than raise. A notice is reproduced for a reader, not parsed, and a latin-1
+        # copyright line is common enough that failing on it would block a release over a byte in
+        # someone's name. The walk found the file, so the notice is present either way.
+        found.append((name, path.read_text(encoding="utf-8", errors="replace")))
     return found
 
 
