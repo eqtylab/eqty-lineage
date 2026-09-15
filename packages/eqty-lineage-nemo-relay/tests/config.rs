@@ -77,6 +77,24 @@ fn a_rejected_field_keeps_its_default_rather_than_a_broken_value() {
 }
 
 #[test]
+fn an_empty_deny_list_is_accepted_and_says_so() {
+    // Legal, and the one setting whose failure mode is a leak rather than a crash: an empty array
+    // turns every default off at once, and a templating bug produces it as readily as an operator
+    // does. It must still parse -- a diagnostic that cost the session its manifest would be worse
+    // than the thing it warns about -- so the warning is the whole protection.
+    let (config, codes) = parse(json!({ "deny_globs": [] }));
+    assert!(
+        config.deny_globs.is_empty(),
+        "the operator's list is honoured, not silently replaced: {:?}",
+        config.deny_globs
+    );
+    assert!(
+        codes.contains(&"deny_globs.empty".to_string()),
+        "an empty deny list is not a silent one: {codes:?}"
+    );
+}
+
+#[test]
 fn deny_globs_must_be_strings() {
     let (config, codes) = parse(json!({"deny_globs": [".env*", 7]}));
     assert_eq!(codes, vec!["deny_globs.invalid".to_string()]);

@@ -23,7 +23,7 @@
         "*/.ssh/*",
         "*credentials*"
       ],
-      "description": "Paths whose contents are withheld. A matching file still becomes a graph node carrying its path and its true content CID, computed before redaction; only the bytes are withheld. Provenance does not require publication."
+      "description": "Paths whose bytes are withheld from the file node and from the tool payloads named against them, and nothing further: a shell command naming no path is outside it, and so is the model conversation that a read's result travelled into. A matching file still becomes a graph node carrying its path and its true content CID, computed before redaction. Provenance does not require publication; treat this as a floor, not a guarantee."
     },
     "max_content_bytes": {
       "type": "integer",

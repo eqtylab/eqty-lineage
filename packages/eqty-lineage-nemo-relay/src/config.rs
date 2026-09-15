@@ -23,7 +23,12 @@ const DEFAULT_MANIFEST_DIR: &str = ".eqty/manifests";
 /// into the manifest as base64, so a stored payload costs about 4/3 of its own length on disk.
 const DEFAULT_MAX_CONTENT_BYTES: u64 = 104_857_600;
 
-/// Paths whose *contents* never enter a manifest.
+/// Paths whose bytes are withheld from the file node and from the tool payloads named against them.
+///
+/// That is the whole reach, and it is a floor rather than a guarantee. A payload is matched on its
+/// own name and on the paths it quotes, so a shell command that names no path is outside it -- and
+/// so is the conversation, whose prompts are named `prompt` and quote nothing. Bytes a denied read
+/// carried into the next model call are stored.
 ///
 /// Provenance does not require publication: a denied file still becomes a graph node carrying its
 /// path and its true content CID, computed from the bytes before redaction. Only the bytes are
@@ -77,6 +82,19 @@ impl Config {
         if let Some(value) = raw.get("deny_globs") {
             match value.as_array() {
                 Some(globs) if globs.iter().all(Json::is_string) => {
+                    // An empty list is legal and turns every default off at once. It is also what a
+                    // templating bug produces, and the failure mode is a leak rather than a crash,
+                    // so it says so. A warning and not an error: recording a tree with nothing to
+                    // withhold is a real choice, and a diagnostic must not cost a session its
+                    // manifest.
+                    if globs.is_empty() {
+                        diagnostics.push(warning(
+                            "deny_globs.empty",
+                            "deny_globs",
+                            "deny_globs is empty, so nothing is withheld -- the defaults \
+                             (.env*, *.pem, id_rsa*, */.ssh/*, *credentials*) do not apply",
+                        ));
+                    }
                     config.deny_globs = globs
                         .iter()
                         .filter_map(|glob| glob.as_str().map(str::to_string))
@@ -105,13 +123,14 @@ impl Config {
     }
 }
 
-/// Every diagnostic this config can produce is an error, since `triples` -- the one setting that was
-/// understood but did not do what its name suggested -- is gone. `register` still refuses only on
-/// errors rather than on any diagnostic, which is deliberate and currently unexercised: a warning
-/// must not cost a session its manifest, and the next reserved field should not have to rediscover
-/// that. The level stays an explicit argument for the same reason.
+/// `register` refuses on errors alone, never on any diagnostic. That is what lets `deny_globs.empty`
+/// say a dangerous-but-legal thing is dangerous without costing the session its manifest.
 fn error(code: &str, field: &str, message: &str) -> ConfigDiagnostic {
     diagnostic(DiagnosticLevel::Error, code, field, message)
+}
+
+fn warning(code: &str, field: &str, message: &str) -> ConfigDiagnostic {
+    diagnostic(DiagnosticLevel::Warning, code, field, message)
 }
 
 fn diagnostic(level: DiagnosticLevel, code: &str, field: &str, message: &str) -> ConfigDiagnostic {
