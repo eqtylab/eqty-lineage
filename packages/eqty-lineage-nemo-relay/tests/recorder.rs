@@ -7,7 +7,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use eqty_lineage_nemo_relay::{
-    EditAttempt, FileMode, FileObserved, LineageSession, Policy, Recorder,
+    EditAttempt, FileMode, FileObserved, Hunk, LineageSession, Policy, Recorder,
 };
 use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 
@@ -152,10 +152,11 @@ async fn an_edit_is_replayed_against_what_the_session_already_knows() {
 
     let mut edit = seen("/a.py", None, FileMode::Wrote);
     edit.edit = Some(EditAttempt {
-        old: "x = 1".into(),
-        new: "x = 2".into(),
+        hunks: vec![Hunk {
+            old: "x = 1".into(),
+            new: "x = 2".into(),
+        }],
         replace_all: false,
-        unique_only: false,
         line_oriented: false,
         replay_from: None,
     });
@@ -183,10 +184,11 @@ async fn a_replay_against_the_wrong_pre_image_is_refused() {
 
     let mut edit = seen("/a.py", None, FileMode::Wrote);
     edit.edit = Some(EditAttempt {
-        old: "x = 1".into(),
-        new: "x = 2".into(),
+        hunks: vec![Hunk {
+            old: "x = 1".into(),
+            new: "x = 2".into(),
+        }],
         replace_all: false,
-        unique_only: false,
         line_oriented: false,
         replay_from: None,
     });
@@ -504,6 +506,10 @@ async fn an_ambiguous_patch_hunk_is_refused_rather_than_guessed() {
     // Codex emits `apply_patch` hunks with no context lines -- the patch that prompted this was
     // `-two` / `+TWO` and nothing else. Replaying that against a file containing "two" twice would
     // rewrite the first occurrence and content-address a version the file never had.
+    //
+    // The refusal comes from the line-oriented replay, which searches for the removed lines as a run
+    // and reports `Ambiguous` when more than one place matches. That is the shape `flush_update`
+    // emits for every patch, so this is the path a real Codex hunk takes.
     let mut rec = recorder();
     rec.observe_file(
         &seen("/work/report.md", Some(b"two\none\ntwo\n"), FileMode::Wrote),
@@ -515,11 +521,12 @@ async fn an_ambiguous_patch_hunk_is_refused_rather_than_guessed() {
 
     let mut update = seen("/work/report.md", None, FileMode::Wrote);
     update.edit = Some(EditAttempt {
-        old: "two".into(),
-        new: "TWO".into(),
+        hunks: vec![Hunk {
+            old: "two\n".into(),
+            new: "TWO\n".into(),
+        }],
         replace_all: false,
-        unique_only: true,
-        line_oriented: false,
+        line_oriented: true,
         replay_from: None,
     });
     rec.observe_file(&update, true, None).await.unwrap();
@@ -538,7 +545,7 @@ async fn an_ambiguous_patch_hunk_is_refused_rather_than_guessed() {
 
 #[tokio::test]
 async fn an_unambiguous_patch_hunk_is_replayed() {
-    // The guard is uniqueness, not patches. When the removed text occurs once the replay is exact,
+    // The guard is uniqueness, not patches. When the removed lines occur once the replay is exact,
     // which is the case that makes Codex's edits recordable at all.
     let mut rec = recorder();
     rec.observe_file(
@@ -555,11 +562,12 @@ async fn an_unambiguous_patch_hunk_is_replayed() {
 
     let mut update = seen("/work/report.md", None, FileMode::Wrote);
     update.edit = Some(EditAttempt {
-        old: "two".into(),
-        new: "TWO".into(),
+        hunks: vec![Hunk {
+            old: "two\n".into(),
+            new: "TWO\n".into(),
+        }],
         replace_all: false,
-        unique_only: true,
-        line_oriented: false,
+        line_oriented: true,
         replay_from: None,
     });
     rec.observe_file(&update, true, None).await.unwrap();
@@ -720,10 +728,11 @@ async fn a_contentless_write_moves_the_replay_base_even_when_its_node_already_ex
 
     let mut edit = seen("/a.py", None, FileMode::Wrote);
     edit.edit = Some(EditAttempt {
-        old: "x = 1".into(),
-        new: "x = 2".into(),
+        hunks: vec![Hunk {
+            old: "x = 1".into(),
+            new: "x = 2".into(),
+        }],
         replace_all: false,
-        unique_only: false,
         line_oriented: false,
         replay_from: None,
     });
@@ -752,10 +761,11 @@ async fn a_truncated_read_still_leaves_the_replay_base_standing() {
 
     let mut edit = seen("/a.py", None, FileMode::Wrote);
     edit.edit = Some(EditAttempt {
-        old: "x = 1".into(),
-        new: "x = 2".into(),
+        hunks: vec![Hunk {
+            old: "x = 1".into(),
+            new: "x = 2".into(),
+        }],
         replace_all: false,
-        unique_only: false,
         line_oriented: false,
         replay_from: None,
     });

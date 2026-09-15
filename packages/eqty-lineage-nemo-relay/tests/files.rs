@@ -86,8 +86,9 @@ fn an_edit_without_its_pre_image_hands_on_the_replacement() {
         .edit
         .as_ref()
         .expect("the replacement is carried forward");
-    assert_eq!(attempt.old, "x = 1");
-    assert_eq!(attempt.new, "x = 2");
+    assert_eq!(attempt.hunks.len(), 1, "a literal Edit is one hunk");
+    assert_eq!(attempt.hunks[0].old, "x = 1");
+    assert_eq!(attempt.hunks[0].new, "x = 2");
 }
 
 #[test]
@@ -258,20 +259,23 @@ fn an_update_hunk_becomes_a_replayable_edit() {
         "the post-image is still not stated"
     );
     assert!(
-        edit.old.contains("two") && edit.new.contains("TWO"),
+        edit.hunks
+            .iter()
+            .any(|hunk| hunk.old.contains("two") && hunk.new.contains("TWO")),
         "the halves carry the change: {edit:?}"
     );
 
     assert!(
-        edit.unique_only,
-        "a patch hunk carries no promise of uniqueness, so the replay must demand one"
+        edit.line_oriented,
+        "a patch hunk carries no promise of uniqueness, so it replays over whole lines, which \
+         enforces one itself"
     );
 
     // Against a pre-image where the removed text occurs once, the replay is exact.
     let replayed = apply_edit(
         Some("one\ntwo\nthree\n"),
-        Some(&edit.old),
-        Some(&edit.new),
+        Some(&edit.hunks[0].old),
+        Some(&edit.hunks[0].new),
         edit.replace_all,
     );
     assert_eq!(replayed.as_deref(), Some("one\nTWO\nthree\n"));

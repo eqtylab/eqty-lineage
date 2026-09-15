@@ -36,26 +36,26 @@ pub enum FileMode {
     Deleted,
 }
 
+/// One hunk's before and after text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub old: String,
+    pub new: String,
+}
+
 /// A replacement whose post-image could not be established from this payload alone.
 ///
 /// Handed on rather than dropped: `originalFile` is null on most `Edit` results, so this is the
 /// common case, and the recorder can usually replay it against content the session already knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditAttempt {
-    pub old: String,
-    pub new: String,
+    /// Applied in order, each against the result of the one before it.
+    ///
+    /// A Claude Code `Edit` is one hunk. A patch block is one per `@@`, because a block's hunks
+    /// describe separate regions of the file: concatenating them yields an anchor that can only
+    /// match where those regions happen to be adjacent, which in a real file they are not.
+    pub hunks: Vec<Hunk>,
     pub replace_all: bool,
-    /// Refuse the replay unless `old` occurs exactly once.
-    ///
-    /// Claude Code's `Edit` guarantees its own uniqueness -- the tool errors when `old_string`
-    /// matches more than once and `replace_all` is unset -- so a first-occurrence replacement there
-    /// is the edit that happened. A Codex `apply_patch` hunk carries no such promise: the real patch
-    /// that prompted this was `-two` / `+TWO` with no context lines at all, and replacing the first
-    /// `two` in a file containing several would content-address a version the file never had.
-    ///
-    /// Only consulted for a literal replay. A line-oriented one enforces uniqueness itself, over
-    /// runs of whole lines, which is the check this flag was reaching for and could not express.
-    pub unique_only: bool,
     /// Replay by replacing whole lines rather than a substring.
     ///
     /// True for a patch hunk, because a patch describes lines. A substring replay lets a line
@@ -180,6 +180,7 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
             updating = Some(Update {
                 path: path.trim().to_string(),
                 moved_to: None,
+                hunks: Vec::new(),
                 before: Vec::new(),
                 after: Vec::new(),
             });
@@ -202,8 +203,11 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
         {
             lines.push(added.to_string());
         } else if let Some(update) = updating.as_mut() {
-            // `@@` headers carry no content. Everything else is a context, removed or added line.
-            if let Some(removed) = line.strip_prefix('-') {
+            // A `@@` header carries no content, but it does carry a boundary: the lines after it
+            // describe a different region of the file than the lines before.
+            if line.starts_with("@@") {
+                update.close_hunk();
+            } else if let Some(removed) = line.strip_prefix('-') {
                 update.before.push(removed.to_string());
             } else if let Some(added) = line.strip_prefix('+') {
                 update.after.push(added.to_string());
@@ -230,9 +234,10 @@ fn flush_update(
     events: &mut Vec<FileObserved>,
     tool_use_id: Option<&str>,
 ) {
-    let Some(update) = updating.take() else {
+    let Some(mut update) = updating.take() else {
         return;
     };
+    update.close_hunk();
     // The post-image lands at the destination when the patch moves the file, and at the source
     // otherwise.
     let source = update.path;
@@ -241,7 +246,7 @@ fn flush_update(
     // identity-only one below, and that is the commonest move there is.
     let vacated = update.moved_to.as_ref().map(|_| source.clone());
     // Nothing to anchor against, so nothing to replay from.
-    if update.before.is_empty() || update.before == update.after {
+    if update.hunks.is_empty() {
         events.push(FileObserved {
             vacated,
             ..identity_only(&written, FileMode::Wrote, tool_use_id)
@@ -256,10 +261,8 @@ fn flush_update(
         user_modified: false,
         vacated,
         edit: Some(EditAttempt {
-            old: as_lines(&update.before),
-            new: as_lines(&update.after),
+            hunks: update.hunks,
             replace_all: false,
-            unique_only: true,
             line_oriented: true,
             // Only meaningful for a move; `None` when the file stayed put.
             replay_from: update.moved_to.map(|_| source),
@@ -305,8 +308,26 @@ struct Update {
     path: String,
     /// The destination of an accompanying `*** Move to:`, when there is one.
     moved_to: Option<String>,
+    /// Hunks closed by a `@@` header or by the end of the block.
+    hunks: Vec<Hunk>,
+    /// The hunk still being read.
     before: Vec<String>,
     after: Vec<String>,
+}
+
+impl Update {
+    /// Close the hunk being read, dropping one that changes nothing.
+    fn close_hunk(&mut self) {
+        let before = std::mem::take(&mut self.before);
+        let after = std::mem::take(&mut self.after);
+        if before.is_empty() || before == after {
+            return;
+        }
+        self.hunks.push(Hunk {
+            old: as_lines(&before),
+            new: as_lines(&after),
+        });
+    }
 }
 
 /// Join hunk lines back into text, restoring the terminator each one had in the file.
@@ -613,11 +634,11 @@ fn edit_events(result: &Json, tool_use_id: Option<&str>) -> (Vec<FileObserved>, 
 
     let edit = match (&updated, old, new) {
         (None, Some(old), Some(new)) => Some(EditAttempt {
-            old: old.to_string(),
-            new: new.to_string(),
+            hunks: vec![Hunk {
+                old: old.to_string(),
+                new: new.to_string(),
+            }],
             replace_all,
-            // The tool guarantees its own uniqueness; see `EditAttempt::unique_only`.
-            unique_only: false,
             // `old_string` is a literal span that need not align to line boundaries.
             line_oriented: false,
             // An `Edit` acts in place.

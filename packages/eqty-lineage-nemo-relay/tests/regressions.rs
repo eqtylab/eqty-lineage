@@ -8,9 +8,9 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use eqty_lineage_nemo_relay::{
-    CompactionPhase, EditAttempt, FileMode, FileObserved, LineageSession, Mailbox, ManifestMark,
-    Policy, Recorder, ReplayRefusal, SessionFinished, SessionRouter, SignerFactory, apply_edit,
-    apply_line_edit, classify, file_events_from_patch,
+    CompactionPhase, EditAttempt, FileMode, FileObserved, Hunk, LineageSession, Mailbox,
+    ManifestMark, Policy, Recorder, ReplayRefusal, SessionFinished, SessionRouter, SignerFactory,
+    apply_edit, apply_line_edit, classify, file_events_from_patch,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
@@ -72,10 +72,11 @@ fn hunk(path: &str, lines: &[&str]) -> String {
 
 fn anchored(old: &str, new: &str) -> Option<EditAttempt> {
     Some(EditAttempt {
-        old: old.into(),
-        new: new.into(),
+        hunks: vec![Hunk {
+            old: old.into(),
+            new: new.into(),
+        }],
         replace_all: false,
-        unique_only: false,
         line_oriented: false,
         replay_from: None,
     })
@@ -468,15 +469,18 @@ fn deleting_a_line_takes_its_newline_with_it() {
     // patch never created.
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c1"));
     let edit = events[0].edit.as_ref().expect("a replayable edit");
-    assert_eq!(edit.old, "b\n", "the removed line keeps its terminator");
-    assert_eq!(edit.new, "");
+    assert_eq!(
+        edit.hunks[0].old, "b\n",
+        "the removed line keeps its terminator"
+    );
+    assert_eq!(edit.hunks[0].new, "");
     assert!(
         edit.line_oriented,
         "and a hunk replays in lines, not substrings"
     );
 
     assert_eq!(
-        apply_line_edit("a\nb\nc\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("a\nb\nc\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("a\nc\n"),
         "which is what the patch does to the file"
     );
@@ -493,13 +497,19 @@ fn an_eof_anchored_hunk_cannot_be_answered_by_an_earlier_line() {
     let edit = events[0].edit.as_ref().unwrap();
 
     assert_eq!(
-        apply_line_edit("b\nb", &edit.old, &edit.new),
+        apply_line_edit("b\nb", &edit.hunks[0].old, &edit.hunks[0].new),
         Err(ReplayRefusal::Ambiguous),
         "two candidate lines, so no reconstruction"
     );
     // The substring replay it replaced would have answered `c\nb`, at the wrong end of the file.
     assert_eq!(
-        apply_edit(Some("b\nb"), Some(&edit.old), Some(&edit.new), false).as_deref(),
+        apply_edit(
+            Some("b\nb"),
+            Some(&edit.hunks[0].old),
+            Some(&edit.hunks[0].new),
+            false
+        )
+        .as_deref(),
         Some("c\nb")
     );
 }
@@ -529,7 +539,7 @@ fn a_substitution_hunk_still_replays_exactly() {
     );
     let edit = events[0].edit.as_ref().expect("a replayable edit");
     assert_eq!(
-        apply_line_edit("one\ntwo\nthree\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("one\ntwo\nthree\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("one\nTWO\nthree\n")
     );
 }
@@ -542,12 +552,12 @@ fn a_hunk_touching_an_unterminated_final_line_is_refused() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c5"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("a\nb", &edit.old, &edit.new),
+        apply_line_edit("a\nb", &edit.hunks[0].old, &edit.hunks[0].new),
         Err(ReplayRefusal::UnterminatedAtEof)
     );
     // The same hunk against the terminated file is fine.
     assert_eq!(
-        apply_line_edit("a\nb\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("a\nb\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("a\n")
     );
 }
@@ -560,7 +570,7 @@ fn an_unterminated_file_edited_above_its_last_line_stays_unterminated() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c7"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("a\nb\nc", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("a\nb\nc", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("a\nc")
     );
 }
@@ -570,7 +580,7 @@ fn deleting_every_line_leaves_an_empty_file_not_a_blank_one() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-only"]), Some("c8"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("only\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("only\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok(""),
         "an emptied file is empty, not a single newline"
     );
@@ -589,7 +599,7 @@ fn a_crlf_file_is_not_silently_rewritten_to_lf() {
     let edit = events[0].edit.as_ref().unwrap();
 
     assert_eq!(
-        apply_line_edit("a\r\nb\r\nc\r\n", &edit.old, &edit.new),
+        apply_line_edit("a\r\nb\r\nc\r\n", &edit.hunks[0].old, &edit.hunks[0].new),
         Err(ReplayRefusal::TerminatorsNotEstablished),
         "a line the patch introduces has no terminator in the patch or in the pre-image"
     );
@@ -603,7 +613,7 @@ fn deleting_a_line_from_a_crlf_file_is_exact() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c10"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("a\r\nb\r\nc\r\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("a\r\nb\r\nc\r\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("a\r\nc\r\n")
     );
 }
@@ -615,7 +625,7 @@ fn an_untouched_line_keeps_its_own_bytes() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-b"]), Some("c11"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("a\r\nb\nc\r\nd\n", &edit.old, &edit.new).as_deref(),
+        apply_line_edit("a\r\nb\nc\r\nd\n", &edit.hunks[0].old, &edit.hunks[0].new).as_deref(),
         Ok("a\r\nc\r\nd\n")
     );
 }
@@ -642,7 +652,7 @@ fn a_hunk_written_against_content_we_do_not_hold_is_refused() {
     let events = file_events_from_patch(&hunk("/work/x.txt", &["-zzz", "+q"]), Some("c6"));
     let edit = events[0].edit.as_ref().unwrap();
     assert_eq!(
-        apply_line_edit("a\nb\n", &edit.old, &edit.new),
+        apply_line_edit("a\nb\n", &edit.hunks[0].old, &edit.hunks[0].new),
         Err(ReplayRefusal::NotFound)
     );
 }
@@ -1416,6 +1426,60 @@ async fn model_calls_that_share_their_endpoints_stay_separate_statements() {
         credentials.len(),
         statements.len() - credentials.len(),
         "every statement is signed exactly once"
+    );
+}
+
+/// A patch block's hunks describe separate regions, and every one of them was appended to a single
+/// before/after pair. The anchor that produced could only match where those regions happened to be
+/// adjacent, so in any real file the replay was refused -- and counted as
+/// `EditDidNotMatchHeldContent`, whose meaning is "what we hold is not what the patch was written
+/// against". Every multi-hunk edit lost its recoverable post-image and wrote a false claim about the
+/// recording into the signed coverage node.
+#[tokio::test]
+async fn every_hunk_in_a_patch_block_replays_in_turn() {
+    let patch = "*** Begin Patch\n*** Update File: /work/report.md\n\
+                 @@\n-one\n+ONE\n@@\n-three\n+THREE\n*** End Patch";
+    let events = file_events_from_patch(patch, Some("p1"));
+    assert_eq!(events.len(), 1, "one block is one observation: {events:?}");
+    let edit = events[0].edit.as_ref().expect("the block anchors a replay");
+    assert_eq!(
+        edit.hunks.len(),
+        2,
+        "two `@@` headers are two hunks: {edit:?}"
+    );
+
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen(
+            "/work/report.md",
+            Some(b"one\ntwo\nthree\n"),
+            FileMode::Wrote,
+        ),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(&events[0], true, None).await.unwrap();
+
+    let stats = rec.stats();
+    assert_eq!(
+        stats.get("ContentRecovered"),
+        Some(&1),
+        "both hunks apply, so the post-image is recoverable: {stats:?}"
+    );
+    assert!(
+        !stats.contains_key("EditDidNotMatchHeldContent"),
+        "and nothing may claim the pre-image was stale: {stats:?}"
+    );
+
+    // Each hunk applied to the result of the one before it, in file order.
+    let manifest = exported(rec).await;
+    assert!(
+        blobs_of(&manifest)
+            .into_iter()
+            .any(|(_, bytes)| bytes == b"ONE\ntwo\nTHREE\n"),
+        "the replayed version is what the patch describes"
     );
 }
 

@@ -208,38 +208,78 @@ impl Recorder {
                 .last_content
                 .get(edit.replay_from.as_deref().unwrap_or(path.as_str()))
         {
-            let previous = String::from_utf8_lossy(previous).into_owned();
-            if edit.line_oriented {
-                // A patch hunk. Matched as runs of whole lines, which is the unit the patch speaks
-                // in -- and which is what makes its uniqueness check mean anything. Matched as a
-                // substring, a line terminator decides uniqueness instead, and `b\n` occurring once
-                // in `b\nb` where `b` occurs twice let the replacement land at the wrong end.
-                match apply_line_edit(&previous, &edit.old, &edit.new) {
-                    Ok(replayed) => {
-                        data = Some(replayed.into_bytes());
-                        basis = Some(BASIS_REPLAYED);
-                        self.count("ContentRecovered");
-                    }
-                    Err(ReplayRefusal::Ambiguous) => self.count("EditTooAmbiguousToReplay"),
-                    Err(ReplayRefusal::NotFound) => self.count("EditDidNotMatchHeldContent"),
-                    Err(ReplayRefusal::UnterminatedAtEof) => self.count("EditAtUnterminatedEof"),
-                    Err(ReplayRefusal::TerminatorsNotEstablished) => {
-                        self.count("EditTerminatorsNotEstablished")
+            // Refused rather than converted. A lossy conversion substitutes U+FFFD for every
+            // invalid byte, and the replay would content-address that substitution as the file's own
+            // bytes and sign it `replayed-from-session` -- a version the file never held, which is
+            // the one thing this module must not produce.
+            //
+            // Owned because the borrow of `last_content` cannot outlive the counters below, not
+            // because the bytes need owning.
+            match std::str::from_utf8(previous).map(str::to_owned) {
+                Err(_) => self.count("EditBaseNotText"),
+                Ok(previous) => {
+                    if edit.line_oriented {
+                        // A patch block. Matched as runs of whole lines, which is the unit the patch
+                        // speaks in -- and which is what makes its uniqueness check mean anything.
+                        // Matched as a substring, a line terminator decides uniqueness instead, and
+                        // `b\n` occurring once in `b\nb` where `b` occurs twice let the replacement
+                        // land at the wrong end.
+                        //
+                        // Each hunk applies to the result of the one before it, because a block's
+                        // hunks describe separate regions in file order. The first refusal stops the
+                        // block: a partial application is a version the file never held.
+                        let mut text = previous;
+                        let mut refused = None;
+                        for hunk in &edit.hunks {
+                            match apply_line_edit(&text, &hunk.old, &hunk.new) {
+                                Ok(replayed) => text = replayed,
+                                Err(refusal) => {
+                                    refused = Some(refusal);
+                                    break;
+                                }
+                            }
+                        }
+                        match refused {
+                            None => {
+                                data = Some(text.into_bytes());
+                                basis = Some(BASIS_REPLAYED);
+                                self.count("ContentRecovered");
+                            }
+                            Some(ReplayRefusal::Ambiguous) => {
+                                self.count("EditTooAmbiguousToReplay")
+                            }
+                            Some(ReplayRefusal::NotFound) => {
+                                self.count("EditDidNotMatchHeldContent")
+                            }
+                            Some(ReplayRefusal::UnterminatedAtEof) => {
+                                self.count("EditAtUnterminatedEof")
+                            }
+                            Some(ReplayRefusal::TerminatorsNotEstablished) => {
+                                self.count("EditTerminatorsNotEstablished")
+                            }
+                        }
+                    } else {
+                        // A literal `Edit`, which is always one hunk: the tool guarantees its own
+                        // uniqueness, erroring when `old_string` matches more than once without
+                        // `replace_all`.
+                        let mut text = Some(previous);
+                        for hunk in &edit.hunks {
+                            text = text.as_deref().and_then(|current| {
+                                apply_edit(
+                                    Some(current),
+                                    Some(&hunk.old),
+                                    Some(&hunk.new),
+                                    edit.replace_all,
+                                )
+                            });
+                        }
+                        if let Some(replayed) = text {
+                            data = Some(replayed.into_bytes());
+                            basis = Some(BASIS_REPLAYED);
+                            self.count("ContentRecovered");
+                        }
                     }
                 }
-            } else if edit.unique_only && previous.matches(&edit.old).count() != 1 {
-                // A literal edit that cannot promise its own uniqueness must find exactly one match,
-                // or the replay is a guess about which occurrence the tool meant.
-                self.count("EditTooAmbiguousToReplay");
-            } else if let Some(replayed) = apply_edit(
-                Some(&previous),
-                Some(&edit.old),
-                Some(&edit.new),
-                edit.replace_all,
-            ) {
-                data = Some(replayed.into_bytes());
-                basis = Some(BASIS_REPLAYED);
-                self.count("ContentRecovered");
             }
         }
 
