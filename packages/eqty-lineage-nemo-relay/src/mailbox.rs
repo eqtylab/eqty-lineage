@@ -1145,15 +1145,18 @@ fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
     // Escaped, not replaced. Mapping every unsafe character to `_` is many-to-one: `a/b` and `a_b`
     // both become `a_b`, and `unclobbered` cannot separate them because it resolves at session open
     // and only asks whether the file exists -- two sessions starting together both find the name
-    // free, and the second then overwrites the first's checkpoints and export. Since `_` introduces
-    // an escape it can never appear on its own, so distinct ids cannot collide. A UUID contains
+    // free, and the second then overwrites the first's checkpoints and export.
+    //
+    // Fixed width, because a variable-width escape absorbs the hex digits that follow it: `a/b` and
+    // `a\u{2fb}` both render as `a_2fb`. Six digits hold the largest `char` there is, so every
+    // escape is exactly seven bytes and no literal can be mistaken for part of one. A UUID contains
     // nothing escapable and comes through unchanged.
     let mut safe = String::with_capacity(session_id.len());
     for character in session_id.chars() {
         if character.is_ascii_alphanumeric() || character == '-' {
             safe.push(character);
         } else {
-            safe.push_str(&format!("_{:x}", character as u32));
+            safe.push_str(&format!("_{:06x}", character as u32));
         }
     }
     unclobbered(manifest_dir, &safe)
