@@ -27,7 +27,7 @@ env:
   # pin. Kept here rather than in a repository variable on purpose: a bundle is verified against the
   # key users are told to trust, so rotating that key has to be a reviewed commit that changes both
   # this line and the README, not a settings edit nobody sees.
-  PUBLISHED_KEY: "ed25519:EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4="
+  PUBLISHED_KEY: "ed25519:kHMtfiQL4mOOBP+apTlOGRFkSR/B/Flth5EOVsgCd9g="
 
 concurrency:
   group: release-nemo-relay-plugin-${{ github.event.release.id || inputs.release_tag }}
