@@ -1483,6 +1483,44 @@ async fn every_hunk_in_a_patch_block_replays_in_turn() {
     );
 }
 
+/// Sanitizing a session id was many-to-one: every character outside `[A-Za-z0-9_-]` became `_`, so
+/// `a/b` and `a_b` shared the stem `a_b`. `unclobbered` could not separate them either -- it resolves
+/// at session open and only asks whether the file exists, so two sessions starting together both
+/// found the name free and the second overwrote the first. The survivor reads as a complete short
+/// session rather than as one recording sitting on top of another.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_ids_that_sanitize_alike_still_get_their_own_manifest() {
+    let into = TempDir::new().expect("a temp dir");
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        Box::new(|_mark: &ManifestMark| {}),
+    );
+
+    // Both sessions open before either writes anything, which is the ordering that collided.
+    for session in ["a/b", "a_b"] {
+        mailbox.send(
+            session,
+            "2026-01-01T00:00:00Z".to_string(),
+            eqty_lineage_nemo_relay::LineageEvent::SessionStarted {
+                agent: Some("claude-code".into()),
+                model: Some("opus".into()),
+            },
+        );
+    }
+    drop(mailbox);
+
+    let written = manifests(&into);
+    assert_eq!(
+        written.len(),
+        2,
+        "two sessions are two manifests: {written:?}"
+    );
+}
+
 /// Coverage states how many bytes were behind the nodes, split by what was done with them.
 ///
 /// The counters answer "how many times", never "how much", and putting a size into that flat map

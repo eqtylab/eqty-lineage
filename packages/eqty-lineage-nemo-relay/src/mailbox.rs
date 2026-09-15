@@ -722,16 +722,16 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
 /// Codex edits files by handing a patch to the shell, so the paths it touches appear nowhere else --
 /// not in the result, and not under any of the path keys below.
 fn patch_in_arguments(open: Option<&OpenTool>) -> Option<&str> {
-    let patch = open?
-        .input
-        .as_ref()
-        .and_then(|input| {
-            ["command", "patch", "input"]
-                .iter()
-                .find_map(|key| input.get(*key))
-        })
-        .and_then(Json::as_str)?;
-    patch.contains("*** Begin Patch").then_some(patch)
+    let input = open?.input.as_ref()?;
+    // The first key holding a patch *document*, not the first key that exists. Codex's native
+    // `shell` schema spells the invocation as `command: ["bash", "-lc", ...]` and puts the document
+    // in a sibling `patch`, so stopping at whichever key came first loses every file effect of that
+    // call -- and `paths_named_in_arguments` loses them with it, which is what keeps the deny list
+    // over the paths a patch body quotes.
+    ["command", "patch", "input"].iter().find_map(|key| {
+        let value = input.get(*key)?.as_str()?;
+        value.contains("*** Begin Patch").then_some(value)
+    })
 }
 
 /// Every path a call names in its own arguments, for deciding whose policy its payloads inherit.
@@ -1139,18 +1139,23 @@ async fn record_tool(
 /// A subagent scope end caused exactly that before it was fixed, and the next cause will not
 /// announce itself either.
 fn manifest_path(manifest_dir: &Path, session_id: &str) -> PathBuf {
-    // Session ids come from the agent and end up in a path, so anything separator-shaped is
-    // replaced rather than trusted.
-    let safe: String = session_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    // Session ids come from the agent and end up in a path, so anything separator-shaped is escaped
+    // rather than trusted.
+    //
+    // Escaped, not replaced. Mapping every unsafe character to `_` is many-to-one: `a/b` and `a_b`
+    // both become `a_b`, and `unclobbered` cannot separate them because it resolves at session open
+    // and only asks whether the file exists -- two sessions starting together both find the name
+    // free, and the second then overwrites the first's checkpoints and export. Since `_` introduces
+    // an escape it can never appear on its own, so distinct ids cannot collide. A UUID contains
+    // nothing escapable and comes through unchanged.
+    let mut safe = String::with_capacity(session_id.len());
+    for character in session_id.chars() {
+        if character.is_ascii_alphanumeric() || character == '-' {
+            safe.push(character);
+        } else {
+            safe.push_str(&format!("_{:x}", character as u32));
+        }
+    }
     unclobbered(manifest_dir, &safe)
 }
 
