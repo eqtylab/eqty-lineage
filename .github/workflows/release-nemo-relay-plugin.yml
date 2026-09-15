@@ -114,15 +114,38 @@ jobs:
 
       # The dev shell's toolchain, for the same reason CI uses it: the compiler that built the
       # tested artifact is the compiler that builds the released one.
+      # The lock is rewritten with the manifest. `just nemo-relay-package` builds `--locked`, and the
+      # lock pins this crate's own version, so bumping one without the other aborts the build.
+      #
+      # Python rather than sed: BSD sed does not implement the `0,/re/` address, so the macOS runner
+      # exited 0 and substituted nothing -- a darwin bundle built at the old version while the Linux
+      # ones carried the tag, and a non-asserting `grep` caught neither half.
       - name: Set the crate version from the tag
         shell: nix develop --command bash -e {0}
         env:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           cd packages/eqty-lineage-nemo-relay
-          sed -i.bak -E "0,/^version = \"[^\"]*\"$/s//version = \"$VERSION\"/" Cargo.toml
-          rm -f Cargo.toml.bak
-          grep -m1 '^version' Cargo.toml
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+
+          version = sys.argv[1]
+          manifest = open("Cargo.toml").read()
+          rewritten, count = re.subn(
+              r'(?m)^version = "[^"]*"$', f'version = "{version}"', manifest, count=1
+          )
+          if count != 1:
+              raise SystemExit(f"expected one version line to rewrite, matched {count}")
+          open("Cargo.toml", "w").write(rewritten)
+          PY
+          # Offline: the version is the only thing that may move. A resolver change here would ship a
+          # dependency tree nothing tested.
+          cargo update --workspace --offline
+          # Asserted, not printed. A step that printed without checking is how a no-op rewrite
+          # would reach three release bundles, and `--locked` here fails exactly when the lock
+          # and the manifest have drifted -- the failure this step exists to prevent.
+          grep -qx "version = \"$VERSION\"" Cargo.toml
+          cargo metadata --locked --offline --format-version 1 --no-deps >/dev/null
 
       - name: Build, sign and stage the bundle
         shell: nix develop --command bash -e {0}
