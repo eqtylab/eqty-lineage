@@ -126,6 +126,10 @@ jobs:
           VERSION: ${{ needs.gate.outputs.version }}
         run: |
           cd packages/eqty-lineage-nemo-relay
+          # Populated while the lock still matches the manifest, so the two commands below can run
+          # `--offline`. A clean runner has no git checkout of `integrity` and no registry cache, and
+          # `--offline` cannot create one -- it fails on the git dependency before reaching the lock.
+          cargo fetch --locked
           python3 - "$VERSION" <<'PY'
           import re, sys
 
@@ -138,8 +142,8 @@ jobs:
               raise SystemExit(f"expected one version line to rewrite, matched {count}")
           open("Cargo.toml", "w").write(rewritten)
           PY
-          # Offline: the version is the only thing that may move. A resolver change here would ship a
-          # dependency tree nothing tested.
+          # Offline and workspace-only: this crate's own version is the one thing that may move. A
+          # resolver reaching the network here would ship a dependency tree nothing tested.
           cargo update --workspace --offline
           # Asserted, not printed. A step that printed without checking is how a no-op rewrite
           # would reach three release bundles, and `--locked` here fails exactly when the lock
