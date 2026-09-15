@@ -31,7 +31,9 @@ def sdk(tmp_path_factory):
     try:
         ctx = eqty_sdk.Context.new("eqty-lineage tests")
         eqty_sdk.init(default_context=ctx).set_store_all_blobs(True)
-        eqty_sdk.set_active_signer(eqty_sdk.Signer.new(name="eqty-lineage-tests", _load_if_exists=True))
+        # `Signer.new(_load_if_exists=True)` is deprecated as of 2.3.1rc1, which says so at import
+        # time; `load_or_create` is the same behaviour under a name that is not private.
+        eqty_sdk.set_active_signer(eqty_sdk.Signer.load_or_create(name="eqty-lineage-tests"))
         yield ctx
     finally:
         os.chdir(previous)

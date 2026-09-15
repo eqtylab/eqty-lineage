@@ -1,0 +1,734 @@
+# Live session script
+
+Drives every path the recorder can record today, and reports `YES` / `MISSING` per capability.
+
+It exists because the first two live sessions reached for `Bash` almost exclusively and so exercised
+about a third of the recorder: no `Document` nodes, no subagents, and none of the file counters.
+Fixtures cover those; a real session had not.
+
+Everything below has been run. The results quoted are from a real session, not expectations.
+
+---
+
+## What a human has to do
+
+Four things. Everything else is automated by the driver in Path B.
+
+1. **Turn Claude Code's auto mode OFF** (interactive runs only — Path A).
+2. **Lower the content ceiling** in `plugins.toml`, and put it back afterwards.
+3. **Build, stage and register the plugin** — `just nemo-relay-package`, then `plugins add`.
+4. **Read the verification output**, starting with the captured-prompt count.
+
+### 1. Auto mode off
+
+Auto mode routes work through `Bash` in preference to `Read`, `Write` and `Edit` — exactly the path
+with no observable file effects. With it on, this script cannot exercise file lineage however the
+turns are phrased: measured, a full run under auto mode produced two files on disk and not one write
+in the graph.
+
+Path B does not need this: `--disallowedTools Bash` forbids the escape route outright, which is a
+stronger lever than prompt phrasing.
+
+Auto mode is worth recording *later*, once the declarative path is proven — it is a faithful picture
+of the executive-tool gap. It is useless for proving the recorder works.
+
+### 2. Lower the ceiling
+
+The default is 100 MiB and generating a file that large to prove the ceiling works is a waste. Add to
+the `[plugins.dynamic.config]` block of `~/.config/nemo-relay/plugins.toml`:
+
+```toml
+max_content_bytes = 8192       # 8 KiB, for this test only
+```
+
+Worth doing for its own sake: it is the only step that exercises the config override end to end, and
+a value the host sets but the plugin ignores looks identical to one that worked.
+
+**Put it back afterwards**, or every later session records file bytes by CID only.
+
+### 3. Stage and register
+
+```bash
+just nemo-relay-package
+nemo-relay plugins add --user ./dist/relay-plugin/relay-plugin.toml
+nemo-relay plugins enable eqty.lineage
+```
+
+The recipe prints the `[plugins.policy.overrides."eqty.lineage"]` block to paste into `plugins.toml`.
+Activation hardens attestation to `signature_required`, so an unsigned plugin installs cleanly,
+validates cleanly, and then refuses to start. Re-run `just nemo-relay-package` after any code change
+— the digest changes and a stale one is an install Relay refuses.
+
+## Setup
+
+```bash
+rm -rf /tmp/relay-live && mkdir -p /tmp/relay-live && cd /tmp/relay-live
+printf 'alpha\nbeta\ngamma\n' > notes.md
+printf 'SECRET_KEY=do-not-record-me\n' > .env
+python3 -c "open('big.txt','w').write('x'*200000)"     # Read caps output near 21 KB, so the
+                                                       # ceiling has to sit below that
+printf '\x89PNG\r\n\x1a\n\xff\xfe\x00\x01' > tiny.bin  # deliberately not valid UTF-8
+```
+
+---
+
+## Path A — by hand
+
+```bash
+nemo-relay run -- claude
+```
+
+Send the turns below one at a time, letting each finish. Auto mode must be off. Claude picks tools on
+its own, so each turn names one explicitly — and may still route around it, which is what Path B
+prevents.
+
+## Path B — headless, reproducible
+
+One process, many turns, `Bash` forbidden for turns 1-9. This is how the quoted results were
+produced.
+
+```bash
+cat > /tmp/drive.py <<'PYEOF'
+import json, subprocess, threading, queue, time
+
+TURNS = [
+ "Use the Write tool to create report.md containing exactly three lines: one, two, three",
+ "Use the Read tool to read report.md",
+ 'Use the Edit tool to change "two" to "TWO" in report.md',
+ "Use the Read tool to read only lines 1 to 2 of report.md",
+ "Use the Read tool on notes.md, then the Write tool to create summary.md holding its first line",
+ "Use the Task tool to launch a subagent that reads summary.md and reports how many characters it has",
+ "Use the Read tool on .env",
+ "Use the Read tool on big.txt",
+ "Use the Read tool on tiny.bin",
+]
+
+cmd = ["nemo-relay","run","--","claude","-p",
+       "--input-format","stream-json","--output-format","stream-json","--verbose",
+       "--permission-mode","acceptEdits","--disallowedTools","Bash"]
+p = subprocess.Popen(cmd, cwd="/tmp/relay-live", stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+q = queue.Queue()
+def reader():
+    for line in p.stdout:
+        q.put(line.rstrip("\n"))
+    q.put(None)
+threading.Thread(target=reader, daemon=True).start()
+
+def send(text):
+    p.stdin.write(json.dumps({"type":"user","message":{"role":"user",
+        "content":[{"type":"text","text":text}]}}) + "\n")
+    p.stdin.flush()
+
+def await_result(n, budget=300):
+    end = time.time() + budget
+    while time.time() < end:
+        try: line = q.get(timeout=5)
+        except queue.Empty: continue
+        if line is None: return "EOF"
+        try: ev = json.loads(line)
+        except Exception: continue
+        if ev.get("type") == "assistant":
+            for c in ev.get("message",{}).get("content",[]):
+                if c.get("type") == "tool_use":
+                    print("    tool: " + str(c.get("name")), flush=True)
+        if ev.get("type") == "result":
+            print("  turn %d: %s" % (n, ev.get("subtype")), flush=True)
+            return "ok"
+    return "timeout"
+
+for i, t in enumerate(TURNS, 1):
+    print("turn %d: %s" % (i, t[:70]), flush=True)
+    send(t)
+    if await_result(i) != "ok":
+        print("  turn %d did not complete" % i, flush=True); break
+p.stdin.close()
+try: p.wait(timeout=90)
+except Exception: p.kill()
+print("finished, exit %s" % p.returncode, flush=True)
+PYEOF
+python3 /tmp/drive.py 2>&1 | tee /tmp/drive-out.txt
+```
+
+**Do not pipe the driver through `tail`.** It buffers everything until the process exits, so nothing
+is visible while it runs — and the checkpointing means the manifest *is* readable mid-session, which
+is how you tell early whether a fix held.
+
+**Wait for the export, not for the process.** The manifest is written from `Drop`, during shutdown,
+so the process stops matching `pgrep` *before* the file is final. Reading in that window returns a
+checkpoint — no coverage node, and whatever the last turn produced still missing — which looks
+exactly like a session that recorded almost nothing. Files on disk race the same way: a patch the
+agent has already applied may not be visible yet.
+
+That window produced two wrong readings and a plausible-sounding conclusion about Codex asserting
+writes it never made. Both readings were premature; the run was fine. Wait for the process to be
+*reaped*, then check that the manifest carries a coverage node before believing anything it says:
+
+```bash
+while pgrep -f "nemo-relay run" >/dev/null; do sleep 1; done
+sleep 2   # Drop still has the export to finish
+```
+
+Two turns Path B cannot drive, because they are interactive slash commands with no `-p` equivalent:
+`/compact` (exercises `Compaction`) and `/exit`. Run those by hand in Path A if you need them.
+
+## Turns
+
+**For Claude Code.** Codex has its own list further down, and they are not interchangeable — each
+names tools the other host does not have.
+
+Verbatim, in order. These are exactly the strings the driver in Path B sends, so both paths exercise
+the same thing — send them one at a time and let each finish.
+
+**1.**
+```
+Use the Write tool to create report.md containing exactly three lines: one, two, three
+```
+`Document` node, exact content CID, `FileWritten`.
+
+**2.**
+```
+Use the Read tool to read report.md
+```
+Read-by-content-match. Must **not** create a second version, and must not produce a 2-cycle.
+
+**3.**
+```
+Use the Edit tool to change "two" to "TWO" in report.md
+```
+Version chain, read → write.
+
+**4.**
+```
+Use the Read tool to read only lines 1 to 2 of report.md
+```
+Fragment → no content → `ContentUnknown`.
+
+**5.**
+```
+Use the Read tool on notes.md, then the Write tool to create summary.md holding its first line
+```
+Two files in one turn: read of A → write of B.
+
+**6.**
+```
+Use the Task tool to launch a subagent that reads summary.md and reports how many characters it has
+```
+Subagent node named by `agent_type`, and `performedByInstance` on its activities.
+
+**7.**
+```
+Use the Read tool on .env
+```
+`ContentDenied` — the node keeps its path and true content CID, the bytes are withheld.
+
+**8.**
+```
+Use the Read tool on big.txt
+```
+Read returns roughly 21 KB of the 200 KB file with `truncatedByTokenCap: true`, so the node must
+record **no content**. A fragment's hash is not the file's hash.
+
+**9.**
+```
+Use the Read tool on tiny.bin
+```
+Read refuses binaries outright; the node records the refusal.
+
+Two more, interactive only — Path B cannot drive them because they are slash commands with no `-p`
+equivalent:
+
+**10.** `/compact` — exercises `Compaction`.
+**11.** `/exit` — ends the session.
+
+## Verify afterwards
+
+```bash
+python3 - <<'PY'
+import json, base64, collections, glob
+def leaked(paths, needle=b'do-not-record-me'):
+    """Where the secret would actually be, which is not where a raw grep looks.
+
+    Blob values are base64, so content that leaked through one is not literal bytes in the file:
+    `one\\ntwo\\nthree\\n` is provably stored in a Codex manifest and a raw grep for it returns
+    False [R]. Scan the decoded blobs as well, or this check cannot fail.
+    """
+    for q in paths:
+        if needle in open(q, 'rb').read():
+            return q                                    # verbatim, e.g. in a path or a plain field
+        for value in json.load(open(q)).get('blobs', {}).values():
+            try:
+                if needle in base64.b64decode(value):
+                    return q                            # decoded, which is where content lives
+            except Exception:
+                pass
+    return None
+
+# An export writes one file per session, with the conversation sealed into a collection per type.
+p = sorted(glob.glob('/tmp/relay-live/.eqty/manifests/*.json'))
+print(f'manifests: {len(p)} -- more than one means a session was split')
+m = json.load(open(p[-1])); B = m['blobs']
+def blob(c):
+    raw = B.get(c.replace('urn:cid:','')) or B.get(c)
+    try: return json.loads(base64.b64decode(raw)) if raw else None
+    except Exception: return None
+assets, cov, redacted, agents = collections.Counter(), None, [], []
+for c in B:
+    d = blob(c)
+    if not isinstance(d, dict): continue
+    if 'assetType' in d:
+        assets[d['assetType']] += 1
+        if d['assetType'] == 'Agent': agents.append(d.get('name'))
+    if d.get('name') == 'coverage':
+        # JSON-encoded, because the explorer renders each metadata value as a string and shows a
+        # nested one as `[object Object]`. Older manifests carry it as an object -- accept both,
+        # or this harvester only reads recordings made after the commit that changed it.
+        cov = d['coverage']
+        cov = json.loads(cov) if isinstance(cov, str) else cov
+    if d.get('redacted'): redacted.append(str(d.get('name')).split('/')[-1])
+prompts = [d for d in map(blob, B) if isinstance(d, dict)
+           and d.get('assetType') == 'Prompt' and d.get('name') == 'user prompt']
+print('statements', len(m['statements']))
+print(f'user prompts captured: {len(prompts)} of the 9 sent')
+print('agents    ', sorted(agents))
+print('assets    ', dict(assets))
+print('coverage  ', cov)
+print('withheld  ', redacted)
+print('secret leaked:', leaked(written) or False)     # every file, not just the graded one
+required = [
+    ('FileRead',        'a file was read into the graph at all'),
+    ('FileWritten',     'a file version was written'),
+    ('ContentUnknown',  'a fragment became an identity-only node'),
+    ('ContentDenied',   'deny_globs withheld .env'),
+    ('Collection',      'the conversation was sealed into one collection per type'),
+]
+expected_absent = [
+    ('ContentRecovered','Edit states its new content, so the replay chain is never needed'),
+    ('ContentTooLarge', 'Read truncates near 21 KB and truncation is detected first'),
+    # The replay chain's refusals. A refusal is silent -- the node simply carries no content -- so
+    # they are checked rather than assumed. On a host that never needs the chain, none can fire.
+    ('EditTooAmbiguousToReplay',      'old_string matched more than once'),
+    ('EditDidNotMatchHeldContent',    'old_string did not match the content we hold'),
+    ('EditAtUnterminatedEof',         'the match ran to an unterminated end of file'),
+    ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
+    ('EditBaseNotText',               'the content we hold is not UTF-8, so no replay is possible'),
+    # Sealing is what puts the conversation in the manifest at all. If it failed, the prompts
+    # and completions are not nodes *and* not collection members -- they are simply absent.
+    ('MonologueNotSealed',            'the collections could not be built'),
+]
+for key, why in required:
+    print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')
+for key, why in expected_absent:
+    seen = cov and key in cov
+    print(f'  {key:30} {"YES" if seen else "absent":8} {"unexpected -- investigate" if seen else why}')
+print(f'  {"Document nodes":30} {"YES" if assets.get("Document") else "MISSING":8} file lineage produced nodes')
+print(f'  {"subagent":30} {"YES" if assets.get("Agent",0) >= 2 else "MISSING":8} a subagent was recorded')
+PY
+```
+
+### Reading the output
+
+**Check for a coverage node before anything else.** A manifest without one is a checkpoint, not a
+finished recording — see the export race above. Every other number in it is a lower bound.
+
+**Then check the prompt count and the manifest count.** If fewer turns were captured than you sent,
+or there is more than one manifest, the session was split and every `MISSING` below is unexplained
+rather than informative.
+
+That happened, and it took two runs to understand: a subagent's scope end was classified as the
+session ending, so the manifest exported at turn 6 and turns 7-9 overwrote it in a fresh recorder.
+The survivor read as a complete short session rather than the tail of a truncated one.
+
+A run reporting no `Agent` has a related cause — `session.start` was never seen, so nothing is
+attributed to an actor.
+
+**Six counters are expected absent on Claude Code**, and their absence is correct. `ContentTooLarge`
+is unreachable through `Read`: the tool caps its output near 21 KB and truncation is detected before
+the size decision, so the node records no content and never reaches the ceiling. `ContentRecovered`
+is unreachable because `Edit` states its new content, so the `_last_content` replay chain is never
+needed — it earns its place on Codex and older hosts, not this one. The four `Edit*` counters are
+that chain's refusal modes, and a host that never enters the chain cannot reach them either.
+
+The refusals are listed rather than left implicit because **a refusal produces no error**: the node
+records no content and the session continues, so the only trace is the counter. If one reports `YES`
+here, a file version failed to reconstruct and the graph is quietly less complete than it looks.
+
+### A known-good result
+
+```
+manifests: 1
+statements 546   user prompts captured: 9 of 9
+agents     ['Explore', 'claude-code']
+coverage   {'Activity': 13, 'Agent': 2, 'ContentDenied': 1, 'ContentUnknown': 3,
+            'FileRead': 5, 'FileWritten': 3, 'Model': 1, 'ModelCall': 23,
+            'PayloadTooLarge': 31, 'Tool': 5}
+secret leaked: False
+```
+
+**That `secret leaked: False` is not evidence.** It was printed by the raw-grep check this section
+predates, which could not fail. Re-run with the `leaked()` above and a later session on the same
+script reports the manifest path instead: `deny_globs` withholds the `.env` node and the `Read`
+payloads attributed to it, and the model `prompt` and `completion` carrying the same bytes are
+stored with `redacted: false` [R]. A `False` here means only that this line has not been re-derived.
+
+with documents
+
+```
+report.md  v1 stated(14)  v2 stated(14)  v3 withheld(0)
+summary.md v1 stated(6)   v2 withheld(0)
+notes.md   v1 stated(17)
+.env       v1 withheld(0)      big.txt v1 withheld(0)
+```
+
+---
+
+## Running it against Codex
+
+**Run, and it works.** Four things came out of doing it that are worth more than the runs: Codex has
+no read tool, both `apply_patch` branches record correctly, the replay chain reaches its first live
+use here, and a `-c` in the wrong place silently disables recording entirely.
+
+Codex has two paths, and they exercise different things. **`codex exec` gives each invocation its own
+session**, so a file written by one run and changed by another crosses a session boundary — which is
+why `ContentRecovered` can never fire there. The interactive path keeps one session, and is the only
+way to reach it.
+
+### Codex, interactive
+
+```bash
+rm -rf /tmp/relay-codex && mkdir -p /tmp/relay-codex && cd /tmp/relay-codex
+printf 'alpha\nbeta\ngamma\n' > notes.md
+printf 'SECRET_KEY=do-not-record-me\n' > .env
+nemo-relay run -- codex
+```
+
+**Use these turns, not the ones above.** The Claude Code turns name `Write`, `Read`, `Edit` and
+`Task`; Codex has none of them. Sending "Use the Write tool to create report.md" makes Codex spend a
+turn discovering the tool does not exist before falling back to `apply_patch` — the file still gets
+written, but the run carries two extra shell probes that are an artefact of the wrong prompt rather
+than anything about the recorder.
+
+Then send these verbatim, one at a time. Codex has **no read tool**, so it will reach for `sed`,
+`awk` or `rg` on anything that reads — that is the point of turns 3 and 4, not a mistake in them.
+
+**1.**
+```
+Create a file report.md containing exactly three lines: one, two, three
+```
+`apply_patch` `*** Add File` — content recorded exactly, `FileWritten`.
+
+**2.**
+```
+Change line 2 of report.md from 'two' to 'TWO'
+```
+`apply_patch` `*** Update File` — hunks with no post-image. Recorded identity-only, `ContentUnknown`.
+**This is the turn that can reach `ContentRecovered`**, because turn 1 established the content for
+that path in the same session. If it fires, the replay chain has finally earned its keep.
+
+**3.**
+```
+Read notes.md and tell me its first line
+```
+Expect no file node at all. Codex reads through the shell, so this counts
+`ToolCallWithoutFileObservation` and nothing else.
+
+**4.**
+```
+Read .env and tell me only how many lines it has, not its contents
+```
+Expect `ContentDenied` **not** to fire, for the same reason. The secret stays out of the manifest,
+but because the read was invisible rather than because the gate withheld it.
+
+**5.**
+```
+Delete report.md
+```
+Currently recorded as a write with unknown content — `FileMode` has no `Deleted` variant, so the
+tombstone identity documented in `recorder.rs` is unreachable.
+
+**6.** Exit cleanly. There is no `/compact` on Codex — compaction is reached by shrinking the
+context window instead, which has its own recipe below.
+
+**Before exiting, check a manifest already exists**, which shows checkpointing is working. Codex has
+no `SessionEnd`, so the final export runs from `Drop`.
+
+**A killed session still records.** Measured, rather than inferred from the checkpoint: a session
+`SIGTERM`ed 25 seconds in, after writing three files, left a manifest with 84 statements,
+`FileWritten: 3`, all three files `stored` — **and a coverage node**, so that was the final export
+rather than a surviving checkpoint. Relay tears the process group down cleanly and `Drop` runs. A
+`SIGKILL` would not give it that chance, and the last checkpoint is what you would get instead.
+
+### Codex, one-shot
+
+What was actually run. Each command is its own session and its own manifest.
+
+```bash
+nemo-relay run -- codex exec "Create a file report.md containing exactly three lines: one, two, three" --sandbox workspace-write --skip-git-repo-check
+
+nemo-relay run -- codex exec "Change line 2 of report.md from 'two' to 'TWO'. Then read .env and tell me only how many lines it has." --sandbox workspace-write --skip-git-repo-check
+```
+
+`--sandbox workspace-write` is what lets it write at all; `--skip-git-repo-check` is only needed
+because `/tmp` is not a repository. Relay requires codex-cli >= 0.143.0.
+
+Neither command passes `-c`, which is deliberate — see the `-c` rule below before adding one.
+
+### Verify a Codex run
+
+The same harvester, a different expectation table — and the difference is the point. On Claude Code
+`FileRead` and `ContentDenied` are health; here their absence is the finding, and `ContentRecovered`
+inverts from expected-absent to required.
+
+**Expect one more manifest than you ran sessions.** Codex issues an ancillary model call to title the
+conversation, through a different provider and under a session id of its own. It registers no agent,
+so it is not a session anyone ran, and it exports as `{id}.unattributed.json` — 20 statements whose
+whole completion is `{"title":"…"}`. So an interactive run leaves two files: the session's manifest
+and the fragment. **Grade the
+session file and skip the fragment**, which is what the filter below does: `.unattributed.json` sorts
+*after* the session file, so selecting `p[-1]` from an unfiltered glob grades the title call and
+reports `ContentUnknown`, `ContentRecovered` and `Document nodes` all missing on a healthy run [R].
+Check the secret against every file, though — a leak in the fragment is still a leak.
+
+```bash
+python3 - <<'PY'
+import json, base64, collections, glob
+# The interactive path can reach the replay chain. A `codex exec` one-shot cannot: the chain needs
+# content established by an earlier turn of the same session. Set this to the run you did.
+INTERACTIVE = True
+
+def leaked(paths, needle=b'do-not-record-me'):
+    """Where the secret would actually be, which is not where a raw grep looks.
+
+    Blob values are base64, so content that leaked through one is not literal bytes in the file:
+    `one\\ntwo\\nthree\\n` is provably stored in a Codex manifest and a raw grep for it returns
+    False [R]. Scan the decoded blobs as well, or this check cannot fail.
+    """
+    for q in paths:
+        if needle in open(q, 'rb').read():
+            return q                                    # verbatim, e.g. in a path or a plain field
+        for value in json.load(open(q)).get('blobs', {}).values():
+            try:
+                if needle in base64.b64decode(value):
+                    return q                            # decoded, which is where content lives
+            except Exception:
+                pass
+    return None
+
+everything = sorted(glob.glob('/tmp/relay-codex/.eqty/manifests/*.json'))
+# A `.unattributed.json` fragment is Codex's conversation-titling call -- a model call with no agent,
+# under a session id of its own -- so it is not a session anyone ran. It sorts *after* the session
+# file, so an unfiltered `p[-1]` grades it. [R]
+p = [q for q in everything if not q.endswith('.unattributed.json')]
+print(f'files: {len(everything)} -- {len(p)} session, '
+      f'{len(everything)-len(p)} title fragment')
+print('grading   ->', p[-1].split('/')[-1])
+m = json.load(open(p[-1])); B = m['blobs']
+def blob(c):
+    raw = B.get(c.replace('urn:cid:','')) or B.get(c)
+    try: return json.loads(base64.b64decode(raw)) if raw else None
+    except Exception: return None
+assets, cov = collections.Counter(), None
+for c in B:
+    d = blob(c)
+    if not isinstance(d, dict): continue
+    if 'assetType' in d: assets[d['assetType']] += 1
+    if d.get('name') == 'coverage':
+        # JSON-encoded, because the explorer renders each metadata value as a string and shows a
+        # nested one as `[object Object]`. Older manifests carry it as an object -- accept both,
+        # or this harvester only reads recordings made after the commit that changed it.
+        cov = d['coverage']
+        cov = json.loads(cov) if isinstance(cov, str) else cov
+print('statements', len(m['statements']), ' assets', dict(assets))
+print('coverage  ', cov)
+# `everything`, not `p`: a leak in the title fragment is still a leak.
+print('secret leaked:', leaked(everything) or False)
+
+required = [
+    ('ContentUnknown', '`*** Update File` carries hunks and no pre-image, so its v1 is identity-only'),
+]
+known_gap = [
+    ('FileRead',      'Codex has no read tool; every read goes through the shell and is invisible'),
+    ('ContentDenied', 'the redaction gate never sees a file it was never told about'),
+    ('Collection',      'the conversation was sealed into one collection per type'),
+]
+expected_absent = [
+    ('EditTooAmbiguousToReplay',      'a hunk matched more than once'),
+    ('EditDidNotMatchHeldContent',    'a hunk did not match the content we hold'),
+    ('EditAtUnterminatedEof',         'a hunk ran to an unterminated end of file'),
+    ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
+    ('EditBaseNotText',               'the content we hold is not UTF-8, so no replay is possible'),
+    # Sealing is what puts the conversation in the manifest at all. If it failed, the prompts
+    # and completions are not nodes *and* not collection members -- they are simply absent.
+    ('MonologueNotSealed',            'the collections could not be built'),
+]
+for key, why in required:
+    print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')
+for key, why in known_gap:
+    seen = bool(cov and key in cov)
+    print(f'  {key:30} {"YES -- upstream fixed it?" if seen else "absent":8} {why}')
+for key, why in expected_absent:
+    seen = bool(cov and key in cov)
+    print(f'  {key:30} {"YES" if seen else "absent":8} {"a version failed to reconstruct -- investigate" if seen else why}')
+seen = bool(cov and 'ContentRecovered' in cov)
+label = ("YES" if seen else "MISSING") if INTERACTIVE else ("YES" if seen else "absent")
+why = ('the replay chain ran -- this host is the only one where it can'
+       if INTERACTIVE else 'a one-shot has no earlier turn to establish content from')
+print(f'  {"ContentRecovered":30} {label:8} {why}')
+print(f'  {"Document nodes":30} {"YES" if assets.get("Document") else "MISSING":8} apply_patch produced nodes')
+PY
+```
+
+`known_gap` is its own list rather than folded into `expected_absent` because the two mean opposite
+things. An `absent` there is not the recorder working — it is §"The finding: Codex has no read tool"
+still being true. A `YES` would mean the upstream gap closed, which is worth knowing immediately.
+
+### What the two runs established
+
+**Export from `Drop` alone works.** Relay's Codex descriptor has ten hook events and no `SessionEnd`,
+so `SessionEnded` never fires and the manifest is written when the Relay process exits. This was the
+largest unknown about Codex and it is settled: both runs produced a manifest.
+
+**Both `apply_patch` branches are proven.**
+
+| patch | recorded |
+| --- | --- |
+| `*** Add File` | exactly — `report.md` v1, 14 bytes, `reconstructed: "stated"` |
+| `*** Update File` | identity-only — v1, no content, `ContentUnknown` |
+
+`Update File` carries hunks and no pre-image, so the node keeps the path and records no content.
+Reconstructing from the hunks would content-address a state the file may never have had.
+
+**Two sessions, two manifests, neither clobbered.**
+
+### The finding: Codex has no read tool
+
+Every read went through the shell:
+
+```
+Bash input: sed -n '1p' notes.md && sed -n '1,4p' report.md
+Bash input: awk 'END { print NR }' .env
+Bash input: pwd && rg --files -g 'notes.md' -g 'report.md' -g '.env'
+```
+
+So `FileRead` is **0**, `notes.md` never became a node despite being read, and — the part worth
+sitting with — **`ContentDenied` never fired**. `.env` *was* read, by `awk`, and the redaction gate
+never saw it, because we never saw the file.
+
+The secret did not reach the manifest, but not because the gate withheld it: because the read was
+invisible. On Claude Code `.env` produces a node carrying its path and true content CID with the
+bytes withheld, which is a claim a reader can act on. On Codex it produces nothing at all, which is
+indistinguishable from the file never having been touched.
+
+Claude Code's version of this gap is "the agent sometimes chooses `Bash`". Codex's is "there is no
+other option" — it has no read tool. That is the strongest case for the upstream proposal.
+
+### Codex subagents
+
+Codex delegates when asked, and it is recorded. `multi_agent` is a stable feature and on by default;
+`codex features list | grep multi_agent` confirms it for a given install.
+
+```bash
+rm -rf /tmp/relay-cxsub && mkdir -p /tmp/relay-cxsub && cd /tmp/relay-cxsub
+printf 'alpha\nbeta\ngamma\n' > notes.md
+
+nemo-relay run -- codex exec "Delegate to a subagent: have it read notes.md and report how many lines it has. Use a subagent for this rather than doing it yourself." --sandbox workspace-write --skip-git-repo-check
+```
+
+Result:
+
+```
+agents  : ['codex', 'default']
+tools   : ['Bash', 'spawn_agent', 'multi_agent_v1wait_agent']
+coverage: {'Activity': 3, 'Agent': 2, 'Model': 1, 'ModelCall': 6, 'Tool': 3,
+           'ToolCallWithoutFileObservation': 3}
+```
+
+The subagent is its own actor, named `default` — Codex's agent type, arriving through the same
+`agent_type` metadata that yields `Explore` on Claude Code, so the naming needs nothing host-specific.
+Codex's delegation tools show up as ordinary tool scopes beside Relay's synthesized `agent` scope;
+both are recorded, and they are two views of one delegation rather than two delegations.
+
+### A `-c` after `exec` silently disables recording
+
+**Read this before the compaction recipe, which needs a config override and is where it bites.**
+
+```
+nemo-relay run -- codex -c key=value exec "..."     hooks 6    manifest written
+nemo-relay run -- codex exec "..." -c key=value     hooks 0    nothing at all
+```
+
+Any `-c`, not just the one below — `model_reasoning_effort=low` does it too. Codex runs perfectly:
+correct output, exit 0, files written as asked. The only casualty is the instrumentation, and
+nothing anywhere says so.
+
+Relay injects its own config immediately after `codex`, at the top level, in
+`agents/codex/launch.rs`:
+
+```rust
+let mut args = vec![
+    "--config", "features.hooks=true",
+    "--config", "model_provider=\"nemo-relay-openai\"",
+    // ... plus one --config per hook event ...
+];
+insert_after_host(&mut launch.argv, launch.host_index, args);
+```
+
+A `-c` at the `exec` level shadows those rather than merging with them, taking `features.hooks=true`
+and every `hooks.*` override with it. No hooks register, so no events reach the subscriber, so there
+is no session to export.
+
+**Put every config override before the subcommand.** A run that produces no manifest while Codex
+looks entirely happy is this, until proven otherwise.
+
+### Codex compaction
+
+There is no `/compact` and no flag: compaction happens when the context window fills, so the lever is
+to shrink the window. Note where the flag goes.
+
+```bash
+rm -rf /tmp/relay-cxc && mkdir -p /tmp/relay-cxc && cd /tmp/relay-cxc
+python3 -c "
+words = ['provenance','manifest','lineage','statement','credential','attestation']
+open('doc.txt','w').write('\n'.join(' '.join(words[(i+j) % len(words)] for j in range(10)) for i in range(150)) + '\n')
+"
+
+nemo-relay run -- codex -c model_context_window=8000 exec "Read doc.txt with cat, then tell me its last word." --sandbox workspace-write --skip-git-repo-check
+```
+
+Result:
+
+```
+hooks 26, and Codex logged 'context compacted' twice
+coverage: {'Activity': 2, 'Agent': 1, 'Compaction': 4, 'Model': 1, 'ModelCall': 5,
+           'Tool': 1, 'ToolCallWithoutFileObservation': 2}
+```
+
+**`Compaction` counts compaction *events*, not compactions.** Relay forwards `PreCompact` and
+`PostCompact`, and both classify as `Compacted`, so two compactions read as four. Consistent with how
+the counter is defined, and misleading if you expect otherwise.
+
+**Match the file to the window.** 15 KB against 8000 tokens compacts twice and finishes inside a
+minute. An earlier attempt used 36 KB against 6000, compacted nine times in three and a half minutes
+and still had not finished — Codex kept re-reading and re-compacting until it found a cheaper
+approach. That is real spend on a real account: raise the window or shrink the file if a run passes a
+couple of minutes.
+
+### What still has not fired on Codex
+
+Subagents and compaction both do now — see above. What is left is `PermissionDecision`, which is
+classified on both hosts and is a graph node on neither.
+
+
+`ContentRecovered` did not fire in either one-shot run, and cannot: the replay chain needs prior
+known content for that path in the *same* session, and `codex exec` gives each run its own. Turn 2 of
+the interactive path above is the remaining way to reach it, and has not been tried.
+
+`Compaction`, `PermissionDecision` and subagents are untested on Codex.
+
+## What this deliberately cannot reach
+
+- **File effects from `Bash`** — unobservable. See the upstream proposal.
+- **Deletion tombstone** (`deleted:{path}`) — documented in `recorder.rs` but no `FileMode::Deleted`
+  exists, so nothing constructs it.
+- **`PermissionDecision` as a graph node** — classified, never recorded.
+- **`/compact`** under Path B — no `-p` equivalent.

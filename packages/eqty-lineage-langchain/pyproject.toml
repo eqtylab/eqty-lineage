@@ -8,6 +8,8 @@ version = "0.0.0"
 description = "EQTY lineage callback handler for LangChain and LangGraph."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "eqty-sdk>=2.4.0",
     "langchain-core>=0.3",

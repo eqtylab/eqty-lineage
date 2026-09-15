@@ -8,6 +8,8 @@ version = "0.0.0"
 description = "EQTY lineage callback handler for DeepAgents."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "eqty-sdk>=2.3.1rc1",
     "eqty-lineage-langchain>=0.1.0",

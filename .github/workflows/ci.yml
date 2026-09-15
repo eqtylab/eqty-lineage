@@ -2,10 +2,14 @@ name: CI
 description: "General CI code check. Runs on every PR"
 
 on:
+  # A cache written on a branch can be read from that branch and from pull requests that target it,
+  # and from nowhere else. Without this trigger nothing ever writes a cache on `main`, so every pull
+  # request would start cold however the cache step below is configured -- it would be inert.
+  push:
+    branches: [main]
   pull_request:
-    # `opened` matters: without it a pull request created directly as ready-for-review gets no run at
-    # all until someone pushes to it, and reads as "no checks" rather than "not checked yet".
-    # `reopened` covers a PR closed and brought back, which likewise produces no synchronize event.
+    # `opened` and `reopened` produce no synchronize event, so without them a PR opened ready-for-
+    # review, or closed and brought back, gets no run until someone pushes to it.
     types: [opened, reopened, ready_for_review, synchronize]
   workflow_dispatch:
 
@@ -21,18 +25,13 @@ defaults:
     shell: nix develop --command bash -e {0}
 
 jobs:
-  checks:
+  python:
     runs-on: ubuntu-latest
-    env:
-     UV_INDEX_EQTY_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
-     UV_INDEX_EQTY_PASSWORD: ${{ secrets.EQTY_PYPI_PASSWORD }}
-
     steps:
       - name: Install Nix
         uses: eqtylab-actions/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
-
       - name: Cachix
         uses: eqtylab-actions/cachix-action@v16
         with:
@@ -40,49 +39,114 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
           skipPush: true
         continue-on-error: true
-
       - name: Checkout Repo
         uses: eqtylab-actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Install dependencies
         run: just sync
-
       - name: Format
-        id: format
-        continue-on-error: true
-        run: just fmt-check
-
+        run: just fmt-check-python
       - name: Lint
-        id: lint
-        continue-on-error: true
-        run: just lint
-
-      - name: Build
-        id: build
-        continue-on-error: true
-        run: just build
-
+        run: just lint-python
       - name: Test
-        id: test
-        continue-on-error: true
-        run: just test
+        run: just test-python
+      # Wheels only. The cargo release build is `just build-relay`, deliberately off the PR path.
+      - name: Build
+        run: just build-python
 
-      - name: Summarize checks
+  # One leg per Cargo workspace. Separate Cargo.locks and target directories, so unlike a lint/test
+  # split the legs share no compiled artifact and duplicate no compile.
+  rust:
+    runs-on: ubuntu-latest
+    # Enough for the backtrace a failing test prints, at roughly half the target directory. Set here
+    # rather than in a committed profile so local debugging keeps variable inspection; `rust-cache`
+    # hashes CARGO_* into its key, so changing it rotates the cache once.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [plugin, plugin-abi]
+    steps:
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
+        with:
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+      - name: Disk at start
+        shell: bash -e {0}
+        run: df -h / | tail -1 | xargs echo "free at start:"
+      # `rust-cache` is a node action and bypasses `defaults.run.shell`, so left alone it keys on the
+      # runner image's rustup toolchain -- a compiler we never build with, from a pool that is not
+      # homogeneous, so the key flips between images and rebuilds everything. Two directories because
+      # nixpkgs ships cargo and rustc separately.
+      - name: Put the dev shell's toolchain on PATH
+        run: |
+          dirname "$(command -v rustc)" >> "$GITHUB_PATH"
+          dirname "$(command -v cargo)" >> "$GITHUB_PATH"
+          echo "NIX_RUSTC_VERSION=$(rustc --version)" >> "$GITHUB_ENV"
+      # `rust-cache` rather than `actions/cache`: it prunes the target directory to dependency
+      # artifacts, so the cache holds the expensive part and not what is rebuilt every run anyway.
+      - name: Rust Cache
+        uses: eqtylab-actions/rust-cache@v2
+        with:
+          # The default is a single workspace at the repository root, which is neither of these.
+          workspaces: |
+            packages/eqty-lineage-nemo-relay -> target
+            packages/eqty-lineage-nemo-relay/abi-test -> target
+          # `add-job-id-key` keys on the job id, which both legs of a matrix share -- without this
+          # they would compute one key and race to write it.
+          key: ${{ matrix.suite }}
+          env-vars: NIX_RUSTC_VERSION
+          # Otherwise a PR with failing clippy recompiles the world on every push. A partial target
+          # directory is safe to restore; cargo fingerprints what it finds.
+          cache-on-failure: true
+      - name: Disk after restore
+        shell: bash -e {0}
+        run: df -h / | tail -1 | xargs echo "free after dev shell + restore:"
+      # Needs no dependency tree, so running it in both legs costs nothing worth splitting.
+      - name: Format
+        run: just fmt-check-rust
+      # Before the tests, so the dependency tree clippy compiles is the one `cargo test` reuses.
+      - name: Lint
+        run: just lint-rust-${{ matrix.suite }}
+      - name: Test
+        run: just test-rust-${{ matrix.suite }}
+      - name: Disk after build
         if: always()
+        shell: bash -e {0}
+        run: df -h / | tail -1 | xargs echo "free after build:"
+
+  # **Named `checks` because the branch ruleset requires a status context of exactly that name.**
+  # Renaming it, or dropping a job from `needs`, silently makes the required check pass on a run that
+  # did not test everything -- the ruleset only knows this name.
+  checks:
+    runs-on: ubuntu-latest
+    needs: [python, rust]
+    if: always()
+    defaults:
+      run:
+        shell: bash -e {0}
+    steps:
+      - name: Summarize checks
         run: |
           {
             echo "## CI results"
             echo
             echo "| Check | Result |"
             echo "| --- | --- |"
-            echo "| Format | ${{ steps.format.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Lint | ${{ steps.lint.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Build | ${{ steps.build.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
-            echo "| Test | ${{ steps.test.outcome == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Python | ${{ needs.python.result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
+            echo "| Rust | ${{ needs.rust.result == 'success' && '🟢 Passed' || '🔴 Failed' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
-
       - name: Fail if a check failed
-        if: always() && (steps.format.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.build.outcome == 'failure' || steps.test.outcome == 'failure')
+        if: needs.python.result != 'success' || needs.rust.result != 'success'
         run: exit 1

@@ -1,0 +1,281 @@
+name: Release Relay plugin
+
+# `release.yml` cannot ship this package. That workflow resolves a `PACKAGE@X.Y.Z` tag to a
+# `pyproject.toml`, and this one is a Rust cdylib with none -- so a release build was a manual gate
+# and the justfile carried a comment saying so. This closes it.
+#
+# One bundle per platform, because the digest is over one artifact: each target gets its own
+# manifest, digest and signature. A bundle is also a clean runtime closure -- Relay copies the whole
+# directory holding `relay-plugin.toml` into an activation snapshot against a 512 MiB budget, so it
+# holds the library, its signature, the config schema and the license notices and nothing else.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (for example, eqty-lineage-nemo-relay@0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # release assets are uploaded to the release this ran for
+
+env:
+  # The public half of the release signing key, and the same value the plugin README tells users to
+  # pin. Kept here rather than in a repository variable on purpose: a bundle is verified against the
+  # key users are told to trust, so rotating that key has to be a reviewed commit that changes both
+  # this line and the README, not a settings edit nobody sees.
+  PUBLISHED_KEY: "ed25519:EcIrdVVPAUEIo4/+2EhpwYX2bPmKU+xITPIiwOz8+e4="
+
+concurrency:
+  group: release-nemo-relay-plugin-${{ github.event.release.id || inputs.release_tag }}
+  cancel-in-progress: false # a half-uploaded release is worse than a slow one
+
+jobs:
+  # A release for any other package must not run the whole matrix and must not fail this workflow.
+  # Split out rather than done with a job-level `if` so the decision is visible in the run.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.tag.outputs.build }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          package="${RELEASE_TAG%@*}"
+          version="${RELEASE_TAG##*@}"
+          if [[ "$package" != "eqty-lineage-nemo-relay" ]]; then
+            echo "not this package ($package) -- nothing to build"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Refused rather than sanitized: a version that reaches an artifact filename and a release
+          # asset name has to be exactly what the tag said.
+          if [[ "$version" == "$RELEASE_TAG" || ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag must be eqty-lineage-nemo-relay@MAJOR.MINOR.PATCH: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  bundle:
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    strategy:
+      # Every target is reported. A partial matrix must not read as a partial release, and `publish`
+      # below is what refuses to ship one.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          # Built on a native arm64 runner rather than cross-compiled: `aws-lc-sys` and `ring`
+          # compile C, so a cross build needs a target C toolchain as well as a Rust one. If this
+          # label is unavailable to the org the job fails on an unknown runner, which is loud.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          #
+          # Every target here has been built and its cdylib confirmed to exist. `x86_64-unknown-
+          # linux-musl` is deliberately absent: it *can* be built, but only with
+          # `-C target-feature=-crt-static`, because the target links statically by default and
+          # rustc otherwise drops the cdylib crate type, prints one warning, and cargo exits 0
+          # having produced no library. Even with the flag the result has never been loaded, and a
+          # signed release asset nobody has activated is a worse answer than "build from source".
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Install Nix
+        uses: eqtylab-actions/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Cachix
+        uses: eqtylab-actions/cachix-action@v16
+        with:
+          name: eqtylab
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+          skipPush: true
+        continue-on-error: true
+
+      # A release builds its own tag. A dispatch builds the ref it was dispatched from: its
+      # `release_tag` input is a version label for the bundle names, and that tag does not exist
+      # yet -- checking it out would fail before anything worth rehearsing had run.
+      - name: Checkout Repo
+        uses: eqtylab-actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref }}
+
+      # The dev shell's toolchain, for the same reason CI uses it: the compiler that built the
+      # tested artifact is the compiler that builds the released one.
+      # The lock is rewritten with the manifest. `just nemo-relay-package` builds `--locked`, and the
+      # lock pins this crate's own version, so bumping one without the other aborts the build.
+      #
+      # Python rather than sed: BSD sed does not implement the `0,/re/` address, so the macOS runner
+      # exited 0 and substituted nothing -- a darwin bundle built at the old version while the Linux
+      # ones carried the tag, and a non-asserting `grep` caught neither half.
+      - name: Set the crate version from the tag
+        shell: nix develop --command bash -e {0}
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          cd packages/eqty-lineage-nemo-relay
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+
+          version = sys.argv[1]
+          manifest = open("Cargo.toml").read()
+          rewritten, count = re.subn(
+              r'(?m)^version = "[^"]*"$', f'version = "{version}"', manifest, count=1
+          )
+          if count != 1:
+              raise SystemExit(f"expected one version line to rewrite, matched {count}")
+          open("Cargo.toml", "w").write(rewritten)
+          PY
+          # Offline: the version is the only thing that may move. A resolver change here would ship a
+          # dependency tree nothing tested.
+          cargo update --workspace --offline
+          # Asserted, not printed. A step that printed without checking is how a no-op rewrite
+          # would reach three release bundles, and `--locked` here fails exactly when the lock
+          # and the manifest have drifted -- the failure this step exists to prevent.
+          grep -qx "version = \"$VERSION\"" Cargo.toml
+          cargo metadata --locked --offline --format-version 1 --no-deps >/dev/null
+
+      - name: Build, sign and stage the bundle
+        shell: nix develop --command bash -e {0}
+        env:
+          # The private half never lands on disk unencrypted outside this step's temp file, and the
+          # file is inside the runner's workspace, which is discarded with the runner.
+          RELEASE_SIGNING_KEY: ${{ secrets.NEMO_RELAY_PLUGIN_SIGNING_KEY }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "NEMO_RELAY_PLUGIN_SIGNING_KEY is not set: a release cannot be signed, and an unsigned" >&2
+            echo "plugin installs cleanly, validates cleanly and then refuses to start." >&2
+            exit 1
+          fi
+          key="$RUNNER_TEMP/relay-release-key.pem"
+          (umask 077 && printf '%s' "$RELEASE_SIGNING_KEY" > "$key")
+          name="eqty-lineage-nemo-relay-$VERSION-$TARGET"
+          RELAY_SIGNING_KEY="$key" just nemo-relay-package "$TARGET" "dist/$name"
+          rm -f "$key"
+
+      # Every claim the bundle makes about itself, checked against the bundle -- on the platform that
+      # produced it, before anyone can download it. `nemo-relay` is not installed here, so this
+      # checks the two things a host checks: the digest, and the signature over the artifact bytes.
+      #
+      # The signature is verified against `PUBLISHED_KEY` above -- the key in the README -- rather
+      # than against the public half of the secret that just signed it. Deriving it
+      # from the signing key would verify that signing worked, which is not in doubt; checking the
+      # *published* key is what catches a rotated secret whose key nobody published -- a release that
+      # verifies here and refuses to load for every user who pinned the documented key.
+      - name: Verify the bundle
+        shell: nix develop --command bash -e {0}
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cd "dist/eqty-lineage-nemo-relay-$VERSION-$TARGET"
+          read -r lib stated < <(python3 -c "
+          import re
+          text = open('relay-plugin.toml').read()
+          print(re.search(r'artifact = \"([^\"]+)\"', text).group(1),
+                re.search(r'sha256 = \"sha256:([^\"]+)\"', text).group(1))
+          ")
+          test -f "$lib" || { echo "the manifest names $lib, which is not in the bundle" >&2; exit 1; }
+          # `shasum` on macOS, `sha256sum` on GNU -- the same split the packaging recipe handles.
+          if command -v shasum >/dev/null 2>&1; then
+            actual=$(shasum -a 256 "$lib" | awk '{print $1}')
+          else
+            actual=$(sha256sum "$lib" | awk '{print $1}')
+          fi
+          # A stale digest is an install Relay refuses; catching it here rather than by a user is the
+          # entire reason this step exists.
+          [ "$stated" = "$actual" ] || { echo "digest disagrees: manifest $stated, artifact $actual" >&2; exit 1; }
+          python3 -c "
+          import base64, sys
+          sig = open('$lib.sig').read().strip().removeprefix('ed25519:')
+          open('sig.raw','wb').write(base64.b64decode(sig))
+          # SPKI wraps a raw Ed25519 key in a fixed 12-byte prefix, which is how the 32 bytes Relay
+          # pins become something openssl will read.
+          key = base64.b64decode('$PUBLISHED_KEY'.removeprefix('ed25519:'))
+          open('pub.der','wb').write(bytes.fromhex('302a300506032b6570032100') + key)
+          "
+          [ "$(wc -c < sig.raw | tr -d ' ')" -eq 64 ] || { echo "signature is not 64 raw bytes" >&2; exit 1; }
+          openssl pkey -pubin -inform DER -in pub.der -out pub.pem
+          openssl pkeyutl -verify -rawin -pubin -inkey pub.pem -in "$lib" -sigfile sig.raw
+          rm -f sig.raw pub.der pub.pem
+          echo "verified $lib against sha256:$actual and the published key"
+
+      - name: Archive
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="eqty-lineage-nemo-relay-$VERSION-$TARGET"
+          tar -czf "$name.tar.gz" -C dist "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" 2>/dev/null \
+            || sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            eqty-lineage-nemo-relay-*.tar.gz
+            eqty-lineage-nemo-relay-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Attaching assets is deliberately one job after the whole matrix. A release missing a platform is
+  # not a smaller release: it is one where some users install nothing and cannot tell why, so a
+  # single failed target withholds all of them rather than publishing the rest.
+  publish:
+    needs: [gate, bundle]
+    if: always() && needs.gate.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse a partial release
+        if: needs.bundle.result != 'success'
+        run: |
+          echo "at least one target did not build (${{ needs.bundle.result }}) -- publishing nothing" >&2
+          exit 1
+
+      - name: Say that a dispatch publishes nothing
+        if: github.event_name != 'release'
+        run: |
+          echo "::notice::dispatch — bundles are built, signed and verified, and attached to nothing"
+
+      - name: Collect the bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+
+      - name: Every expected target is present
+        run: |
+          set -euo pipefail
+          missing=0
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            ls ./*"$target".tar.gz >/dev/null 2>&1 || { echo "missing bundle for $target" >&2; missing=1; }
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          ls -la ./*.tar.gz
+
+      # Skipped on a dispatch, which makes one a real rehearsal: build, sign, verify and archive all
+      # run, and the only step that needs a release to exist is the only one that does not.
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
+          fail_on_unmatched_files: true

@@ -16,6 +16,13 @@
             python311
             just
             ruff
+            # For packages/eqty-lineage-nemo-relay, which is a Rust cdylib rather than a Python
+            # package. Kept as the nixpkgs toolchain rather than rustup so CI and the dev shell
+            # build with the same compiler.
+            cargo
+            rustc
+            rustfmt
+            clippy
           ];
 
           shellHook = ''

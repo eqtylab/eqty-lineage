@@ -24,12 +24,19 @@ default-groups = ["dev"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
+# `eqty-lineage-nemo-relay` is a Rust cdylib loaded through a C ABI, not a Python distribution: it has
+# a Cargo.toml and no pyproject.toml. The glob above matches it anyway, and uv treats a member without
+# a pyproject.toml as an error rather than skipping it -- so `uv sync` failed outright, which is
+# `just sync`, which is the first step of CI.
+exclude = ["packages/eqty-lineage-nemo-relay"]
 
 [tool.uv.sources]
 eqty-lineage-langchain = { workspace = true }
 eqty-lineage-deepagents = { workspace = true }
 eqty-lineage-vnim = { workspace = true }
 
+# `eqty-sdk` resolves from public PyPI. The index below stays because `just publish` publishes our
+# own packages through it; it is a publish target, not a source for dependencies.
 [[tool.uv.index]]
 name = "eqty"
 url = "https://pypi.eqtylab.io/simple/"

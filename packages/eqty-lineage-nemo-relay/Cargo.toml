@@ -1,0 +1,41 @@
+[package]
+name = "eqty-lineage-nemo-relay"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Records a NeMo Relay session as a signed EQTY lineage manifest."
+license = "Apache-2.0"
+
+# A standalone workspace: the repository around it is a uv/Python workspace, and cargo must not try
+# to inherit from a parent it would never find.
+[workspace]
+
+[lib]
+name = "eqty_lineage_nemo_relay"
+# cdylib is what `kind = "rust_dynamic"` loads through the C ABI; rlib is what `tests/` links.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The plugin authoring SDK. It re-exports `Event` and the rest of `nemo-relay-types`, so depending on
+# Relay's core crate as well would only add a second copy of the same types.
+nemo-relay-plugin = "0.8.3"
+# The EQTY core. Pinned by SHA rather than tag so the build cannot move underneath us; this is
+# v0.0.13. `integrity` does not resolve from a clean crates.io index at any revision -- `core2 0.4.0`
+# is yanked and reachable through two different dependency paths -- so `Cargo.lock` is committed and
+# is a build requirement, not a preference. See README.
+integrity = { git = "https://github.com/eqtylab/integrity", rev = "0d85ae5b9f7204812771c4f8e4985c671b831b0a", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+serde_json = "1"
+uuid = "1"
+
+[dev-dependencies]
+# Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`
+# exactly as the host does before it calls a subscriber.
+serde_json = "1"
+# The ABI load test lives in `abi-test/`, as its own crate: it needs Relay's core crate, which
+# cannot coexist with `integrity` in one dependency graph. See `abi-test/Cargo.toml`.
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Manifest blobs are base64; the recorder tests decode them to read what was actually attested.
+base64 = "0.22"
