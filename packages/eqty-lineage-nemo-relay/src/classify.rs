@@ -327,11 +327,6 @@ fn terminal_status(metadata: Option<&Json>) -> Option<bool> {
     }
 }
 
-/// The subagent an event belongs to.
-///
-/// Relay spells this differently depending on where it recovered the identity from, and falls back
-/// to the scope UUID when the payload named no subagent at all -- which still gives the session a
-/// stable handle for the actor, even though it says nothing about what kind of actor it was.
 /// Whether this `agent` scope is a subagent rather than the session's own root scope.
 ///
 /// Relay says so outright. When it synthesizes a subagent scope it merges
@@ -363,6 +358,11 @@ fn subagent_name(event: &Event, metadata: Option<&Json>) -> Option<String> {
         .or_else(|| Some(event.name().to_string()).filter(|name| !name.is_empty()))
 }
 
+/// The subagent an event belongs to.
+///
+/// Relay spells this differently depending on where it recovered the identity from, and falls back
+/// to the scope UUID when the payload named no subagent at all -- which still gives the session a
+/// stable handle for the actor, even though it says nothing about what kind of actor it was.
 fn subagent_id(event: &Event, metadata: Option<&Json>) -> Option<String> {
     string_at(metadata, "subagent_id")
         .or_else(|| string_at(metadata, "agent_id"))

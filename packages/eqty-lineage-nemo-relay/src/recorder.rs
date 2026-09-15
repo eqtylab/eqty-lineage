@@ -500,10 +500,13 @@ impl Recorder {
     ) -> Result<AssetRef> {
         let content_cid = blake3_cid_raw_binary(bytes)?;
         // The deny list is matched against the payload's *name* as well as any path it quotes. A
-        // payload is named after what produced it (`prompt`, `completion`, `Bash input`), so a glob
-        // like `*credentials*` withholds the arguments of a tool called `get_credentials`. That is
-        // the intended reach, and it is why the reason travels with the node: "denied", "quotes a
-        // denied file" and "too large" are different claims and a reader acts on them differently.
+        // payload is named after what produced it (`Bash input`, `Read result`), so a glob like
+        // `*credentials*` withholds the arguments of a tool called `get_credentials`. That is the
+        // intended reach, and it is why the reason travels with the node: "denied", "quotes a denied
+        // file" and "too large" are different claims and a reader acts on them differently.
+        //
+        // The conversation does not come through here -- it is staged, see `stage_payload` -- and it
+        // quotes nothing, which is the gap `deny_globs` cannot close.
         let mut disposition = self.policy.decide(name, bytes.len());
         let mut quoted: Option<&str> = None;
         if disposition == Disposition::Store
@@ -773,10 +776,6 @@ impl Recorder {
         .await
     }
 
-    /// Record a tool run that consumed and produced the given files.
-    ///
-    /// A run with no outputs is not recorded. It cannot be reached from any asset, so it is a node
-    /// no reader can use, and the inputs it names are already attested by their own registrations.
     /// Note a tool call that yielded no file observation at all.
     ///
     /// Not the same as "touched no files": `ls /nowhere` legitimately touches none, and a shell
@@ -823,10 +822,6 @@ impl Recorder {
 
     /// Note work done while more than one subagent was live.
     ///
-    /// Relay reports that *a* subagent is running, not which one performed a given call, so with
-    /// siblings in flight the performer cannot be established. The activity is credited to the root
-    /// agent and marked ambiguous rather than assigned to whichever sibling started last -- a wrong
-    /// specific attribution is worse than an honest general one, because a reader can act on it.
     /// Count a turn nobody typed, by the kind of thing that opened it.
     ///
     /// In coverage rather than left to the nodes, because the nodes are what went unread: every
@@ -836,6 +831,12 @@ impl Recorder {
         self.count(counter);
     }
 
+    /// Count an activity whose performer could not be established.
+    ///
+    /// Relay reports that *a* subagent is running, not which one performed a given call, so with
+    /// siblings in flight the performer cannot be established. The activity is credited to the root
+    /// agent and marked ambiguous rather than assigned to whichever sibling started last -- a wrong
+    /// specific attribution is worse than an honest general one, because a reader can act on it.
     pub fn note_ambiguous_attribution(&mut self) {
         self.count("AmbiguousSubagentAttribution");
     }
@@ -853,6 +854,10 @@ impl Recorder {
         self.lineage.blob_bytes()
     }
 
+    /// Record a tool run that consumed and produced the given files.
+    ///
+    /// A run with no outputs is not recorded. It cannot be reached from any asset, so it is a node
+    /// no reader can use, and the inputs it names are already attested by their own registrations.
     pub async fn record_tool_run(
         &mut self,
         inputs: &[AssetRef],
@@ -907,17 +912,18 @@ impl Recorder {
         Ok(asset)
     }
 
-    /// Emit what this recording did not see, then build the manifest.
+    /// A manifest of the session's work so far, without consuming the recorder.
     ///
-    /// Coverage goes inside the graph, signed, rather than into a log beside it. A reader who cannot
-    /// see the gaps cannot weigh the evidence: "no failed tool calls" and "this capture path cannot
-    /// observe tool failure" look identical from outside, and on Codex it is always the second.
-    /// A manifest of everything recorded so far, without the coverage node and without consuming
-    /// the recorder.
+    /// **Not everything recorded.** Two things exist only after [`Self::finish`]: the coverage node,
+    /// and the conversation. Coverage states what the recording could not see, which is only
+    /// knowable once it has stopped -- so a manifest carrying one is complete, and a manifest
+    /// without one was written while the session was still running.
     ///
-    /// The missing coverage node is the point, not an omission: coverage states what the recording
-    /// could not see, and that is only knowable once it has stopped. A manifest carrying one is
-    /// complete; a manifest without one was written while the session was still running.
+    /// The conversation is absent for a different reason. Its payloads are staged, and a staged blob
+    /// reaches a manifest only because a collection names it, so until `finish` seals those
+    /// collections there is nothing pointing at the prompts and completions and `resolve_blobs`
+    /// drops them. The model calls go with them, since their endpoints do not exist yet. A crash
+    /// before export therefore keeps the files, tools and agents and loses what was said.
     pub async fn snapshot(&self) -> Result<Manifest> {
         self.lineage.snapshot().await
     }
@@ -1049,6 +1055,11 @@ impl Recorder {
         Ok(())
     }
 
+    /// Emit what this recording did not see, seal the conversation, then build the manifest.
+    ///
+    /// Coverage goes inside the graph, signed, rather than into a log beside it. A reader who cannot
+    /// see the gaps cannot weigh the evidence: "no failed tool calls" and "this capture path cannot
+    /// observe tool failure" look identical from outside, and on Codex it is always the second.
     pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
         // Counted rather than raised. The recording is complete without the collections -- the view
         // keeps every monologue payload in the file whether or not anything indexes them -- and

@@ -300,16 +300,21 @@ required = [
     ('FileWritten',     'a file version was written'),
     ('ContentUnknown',  'a fragment became an identity-only node'),
     ('ContentDenied',   'deny_globs withheld .env'),
+    ('Collection',      'the conversation was sealed into one collection per type'),
 ]
 expected_absent = [
     ('ContentRecovered','Edit states its new content, so the replay chain is never needed'),
     ('ContentTooLarge', 'Read truncates near 21 KB and truncation is detected first'),
-    # The replay chain's four refusals. A refusal is silent -- the node simply carries no content --
-    # so they are checked rather than assumed. On a host that never needs the chain, none can fire.
+    # The replay chain's refusals. A refusal is silent -- the node simply carries no content -- so
+    # they are checked rather than assumed. On a host that never needs the chain, none can fire.
     ('EditTooAmbiguousToReplay',      'old_string matched more than once'),
     ('EditDidNotMatchHeldContent',    'old_string did not match the content we hold'),
     ('EditAtUnterminatedEof',         'the match ran to an unterminated end of file'),
     ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
+    ('EditBaseNotText',               'the content we hold is not UTF-8, so no replay is possible'),
+    # Sealing is what puts the conversation in the manifest at all. If it failed, the prompts
+    # and completions are not nodes *and* not collection members -- they are simply absent.
+    ('MonologueNotSealed',            'the collections could not be built'),
 ]
 for key, why in required:
     print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')
@@ -544,12 +549,17 @@ required = [
 known_gap = [
     ('FileRead',      'Codex has no read tool; every read goes through the shell and is invisible'),
     ('ContentDenied', 'the redaction gate never sees a file it was never told about'),
+    ('Collection',      'the conversation was sealed into one collection per type'),
 ]
 expected_absent = [
     ('EditTooAmbiguousToReplay',      'a hunk matched more than once'),
     ('EditDidNotMatchHeldContent',    'a hunk did not match the content we hold'),
     ('EditAtUnterminatedEof',         'a hunk ran to an unterminated end of file'),
     ('EditTerminatorsNotEstablished', 'a CRLF terminator could not be preserved'),
+    ('EditBaseNotText',               'the content we hold is not UTF-8, so no replay is possible'),
+    # Sealing is what puts the conversation in the manifest at all. If it failed, the prompts
+    # and completions are not nodes *and* not collection members -- they are simply absent.
+    ('MonologueNotSealed',            'the collections could not be built'),
 ]
 for key, why in required:
     print(f'  {key:30} {"YES" if cov and key in cov else "MISSING":8} {why}')

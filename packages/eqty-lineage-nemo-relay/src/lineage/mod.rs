@@ -347,8 +347,6 @@ impl LineageSession {
         self.push_with_proof(statement, at).await
     }
 
-    /// Resolve every referenced blob and build the manifest.
-    ///
     /// Build a manifest from what has been recorded so far, without consuming the session.
     ///
     /// Uses the same `generate_manifest` the Python SDK reaches through `Context.export()`, over the
@@ -364,10 +362,12 @@ impl LineageSession {
         Self::build(self.statements.clone(), self.blobs.clone()).await
     }
 
+    /// The same manifest, consuming the session. For an export, which has no later use for it.
     pub async fn into_manifest(self) -> Result<Manifest> {
         Self::build(self.statements, self.blobs).await
     }
 
+    /// Resolve every referenced blob and build the manifest.
     async fn build(
         statements: Vec<Statement>,
         blobs: HashMap<String, Vec<u8>>,
