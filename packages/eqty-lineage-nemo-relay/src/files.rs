@@ -181,6 +181,7 @@ pub fn file_events_from_patch(patch: &str, tool_use_id: Option<&str>) -> Vec<Fil
                 path: path.trim().to_string(),
                 moved_to: None,
                 hunks: Vec::new(),
+                anchorless: false,
                 before: Vec::new(),
                 after: Vec::new(),
             });
@@ -245,8 +246,10 @@ fn flush_update(
     // A move empties the source. Both arms carry it: a rename with no hunks at all takes the
     // identity-only one below, and that is the commonest move there is.
     let vacated = update.moved_to.as_ref().map(|_| source.clone());
-    // Nothing to anchor against, so nothing to replay from.
-    if update.hunks.is_empty() {
+    // Nothing to anchor against, so nothing to replay from. An unanchored insertion counts: the
+    // block's other hunks would replay to a version missing those lines, and a partial post-image
+    // signed as the file's content is worse than no content at all.
+    if update.hunks.is_empty() || update.anchorless {
         events.push(FileObserved {
             vacated,
             ..identity_only(&written, FileMode::Wrote, tool_use_id)
@@ -310,6 +313,13 @@ struct Update {
     moved_to: Option<String>,
     /// Hunks closed by a `@@` header or by the end of the block.
     hunks: Vec<Hunk>,
+    /// Whether a hunk in this block adds lines without anchoring them.
+    ///
+    /// Such a hunk cannot be replayed and cannot be skipped. `apply_patch` headers carry no line
+    /// numbers, so an insertion with no removed or context line states *what* to add and never
+    /// where, and the rest of the block replays to a post-image missing it -- which the recorder
+    /// would then content-address and sign as `replayed-from-session`.
+    anchorless: bool,
     /// The hunk still being read.
     before: Vec<String>,
     after: Vec<String>,
@@ -320,7 +330,12 @@ impl Update {
     fn close_hunk(&mut self) {
         let before = std::mem::take(&mut self.before);
         let after = std::mem::take(&mut self.after);
-        if before.is_empty() || before == after {
+        if before.is_empty() {
+            // An empty hunk closes nothing. One that adds lines poisons the block.
+            self.anchorless |= !after.is_empty();
+            return;
+        }
+        if before == after {
             return;
         }
         self.hunks.push(Hunk {

@@ -1521,6 +1521,81 @@ async fn session_ids_that_sanitize_alike_still_get_their_own_manifest() {
     );
 }
 
+/// An `apply_patch` header carries no line numbers, so a hunk that only adds lines says what to add
+/// and never where. Dropping it left the block's other hunks replaying to a post-image missing those
+/// lines -- which `observe_file` then content-addressed and signed `replayed-from-session`, an
+/// attested version of a file that never existed. It cannot be placed and it cannot be skipped, so
+/// the whole block refuses.
+#[tokio::test]
+async fn an_unanchored_insertion_refuses_the_whole_block() {
+    let patch = "*** Begin Patch\n*** Update File: /work/report.md\n\
+                 @@\n-one\n+ONE\n@@\n+tail\n*** End Patch";
+    let events = file_events_from_patch(patch, Some("p2"));
+    assert_eq!(events.len(), 1, "one block is one observation: {events:?}");
+    assert!(
+        events[0].edit.is_none(),
+        "an unplaceable insertion anchors nothing: {:?}",
+        events[0].edit
+    );
+
+    let mut rec = recorder();
+    rec.observe_file(
+        &seen("/work/report.md", Some(b"one\ntwo\n"), FileMode::Wrote),
+        true,
+        None,
+    )
+    .await
+    .unwrap();
+    rec.observe_file(&events[0], true, None).await.unwrap();
+
+    let stats = rec.stats();
+    assert!(
+        !stats.contains_key("ContentRecovered"),
+        "nothing may be replayed from a block we cannot apply whole: {stats:?}"
+    );
+    let manifest = exported(rec).await;
+    assert!(
+        !blobs_of(&manifest)
+            .into_iter()
+            .any(|(_, bytes)| bytes == b"ONE\ntwo\n"),
+        "and the truncated post-image must not be in the manifest at all"
+    );
+}
+
+/// The escape has to be fixed width. A variable-width one absorbs the hex digits that follow it:
+/// `a/b` and `a\u{2fb}` both rendered as `a_2fb`, which is the same collision the escape replaced
+/// plain `_` substitution to prevent.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_ids_differing_only_in_an_escape_stay_apart() {
+    let into = TempDir::new().expect("a temp dir");
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        Box::new(|_mark: &ManifestMark| {}),
+    );
+    for session in ["a/b", "a\u{2fb}", "a_b"] {
+        mailbox.send(
+            session,
+            "2026-01-01T00:00:00Z".to_string(),
+            eqty_lineage_nemo_relay::LineageEvent::SessionStarted {
+                agent: Some("claude-code".into()),
+                model: Some("opus".into()),
+            },
+        );
+    }
+    drop(mailbox);
+
+    let written = manifests(&into);
+    assert_eq!(
+        written.len(),
+        3,
+        "three session ids are three manifests: {written:?}"
+    );
+}
+
 /// Coverage states how many bytes were behind the nodes, split by what was done with them.
 ///
 /// The counters answer "how many times", never "how much", and putting a size into that flat map
