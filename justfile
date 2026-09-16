@@ -218,6 +218,27 @@ nemo-relay-package target="" out="dist/relay-plugin":
   python3 packages/eqty-lineage-nemo-relay/tools/third_party_licenses.py \
     packages/eqty-lineage-nemo-relay/Cargo.toml --target "$TARGET_TRIPLE" > "$out/THIRD-PARTY-LICENSES.md"
   cd "$out"
+  # The nix toolchain records the absolute store path of every library it linked, and a user's Mac
+  # has no `/nix/store` -- activation dies in dlopen naming a path nobody can produce. Rewritten to
+  # the system copy before the digest and the signature, both of which are over these exact bytes.
+  if [ "$(uname -s)" = Darwin ]; then
+    for dep in $(otool -L "$lib" | awk 'NR > 1 { print $1 }' | grep '^/nix/store/' || true); do
+      install_name_tool -change "$dep" "/usr/lib/$(basename "$dep")" "$lib"
+    done
+    # The linker writes the build directory as the install name; a bundle is copied elsewhere.
+    install_name_tool -id "@rpath/$lib" "$lib"
+    # Asserted, not assumed. This runs inside the nix shell, where every store path still resolves,
+    # so a dlopen here cannot tell a rewritten dependency from a missed one -- only this can.
+    if otool -L "$lib" | grep -q '^\t/nix/store/'; then
+      echo "the dylib still loads from /nix/store, which no user has:" >&2
+      otool -L "$lib" | grep '^\t/nix/store/' >&2
+      exit 1
+    fi
+  fi
+  # The complement, covering the two things inspection cannot see: that the system library the
+  # rewrite names exists, and that editing load commands left a valid ad-hoc signature behind, which
+  # `install_name_tool` renews and macOS requires before it will map the image at all.
+  python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' "$PWD/$lib"
   # `shasum` is not everywhere; `sha256sum` is the GNU coreutils spelling.
   if command -v shasum >/dev/null 2>&1; then
     digest=$(shasum -a 256 "$lib" | awk '{print $1}')
