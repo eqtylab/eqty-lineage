@@ -316,8 +316,8 @@ def test_capture_is_installed_on_a_client_built_after_validation(sdk, monkeypatc
 
 def test_request_body_cid_is_over_the_bytes_the_sdk_put_on_the_wire(sdk, monkeypatch):
     """vNIM hashes the request body exactly as it arrived, so the client must hash exactly what the
-    OpenAI SDK sent.  A re-serialization of the Python payload is a different document: key order,
-    spacing and escaping are the SDK's, and a canonical form reproduces none of them.
+    OpenAI SDK sent.  A re-serialization of the Python payload is a different document: the SDK keeps
+    insertion order inside nested objects such as a tool definition, and a canonical form sorts them.
     """
     import json
 
@@ -343,12 +343,17 @@ def test_request_body_cid_is_over_the_bytes_the_sdk_put_on_the_wire(sdk, monkeyp
         manifest_base_url="http://127.0.0.1:8000",
     )
 
-    chunks = list(model.stream("hello"))
+    weather = {
+        "type": "function",
+        "function": {"name": "get_weather", "description": "Current weather.", "parameters": {"type": "object"}},
+    }
+    chunks = list(model.stream("hello", tools=[weather]))
 
     assert len(sent) == 1
     wire = sent[0]
     metadata = chunks[-1].response_metadata
     assert metadata["eqty_openai_request_cid"] == str(get_cid_for_bytes(wire))
+    assert b'"tools":[{"type":"function","function":{"name":"get_weather"' in wire
     canonical = json.dumps(metadata["eqty_openai_request_payload"], sort_keys=True, separators=(",", ":")).encode()
     assert canonical != wire, "a re-serialized payload must not be mistaken for the wire body"
 
