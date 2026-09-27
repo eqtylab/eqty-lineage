@@ -43,10 +43,13 @@ The final chunk's `response_metadata` includes `eqty_request_id` and, on success
 separate artifact.
 
 When used with `EqtyCallbackHandler`, no vNIM bridge setup is required. The handler records its own
-normalized LangChain request and response assets for the invocation. It also records a
-`ChatOpenAI XForm` computation to the final OpenAI-compatible request payload supplied by this client,
-then automatically imports the optional vNIM manifest from the completed response as additional
-independently attested lineage.
+normalized LangChain request and response assets for the invocation. This client also tees the HTTP
+request and response bodies at the transport and attaches their raw-byte CIDs to the final chunk as
+`eqty_openai_request_cid` and `eqty_openai_response_cid`; the handler records those as the
+`ChatOpenAI XForm` output and the inference input/output, so they match the `Request Body` and
+`Response Body` assets vNIM registered for the same exchange. The bytes are hashed as sent and
+received, never re-serialized from the parsed payload. The handler then imports the optional vNIM
+manifest from the completed response as additional independently attested lineage.
 
 `ChatEqtyVnimOpenAI` subclasses the pinned `langchain-openai==1.3.5` `ChatOpenAI` implementation and
 adds only VNIM-specific integrity-manifest behavior. It enables `streaming=True` by default, unlike
