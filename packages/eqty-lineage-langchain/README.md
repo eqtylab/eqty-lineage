@@ -20,10 +20,12 @@ app.invoke(state, config={"callbacks": [EqtyCallbackHandler()]})
 Only `langchain-core` is required at runtime, so the handler works with plain LangChain runnables as well as LangGraph
 graphs. Use one handler instance per invocation.
 
-When a compatible client adds `eqty_openai_request_payload` to its final response metadata, the handler records that
-payload as an OpenAI-request Document and links it from the normalized LangChain request with a `ChatOpenAI XForm`
-computation. That payload is RFC 8785 (JCS) canonicalized, then given a raw-binary CID so it can join the current
-vNIM `Request Body` representation. `ChatEqtyVnimOpenAI` provides this metadata automatically.
+When a compatible client adds `eqty_openai_request_cid` and `eqty_openai_response_cid` to its final response
+metadata, the handler records the OpenAI request and response as Documents under those CIDs and links them from the
+normalized LangChain request with a `ChatOpenAI XForm` computation. Each CID is over the HTTP body bytes exactly as
+they crossed the wire, which is what vNIM hashes for its `Request Body` and `Response Body` assets, so the two
+manifests share those nodes. The handler never re-serializes a body itself. `ChatEqtyVnimOpenAI` provides this
+metadata automatically.
 
 ### Session isolation
 

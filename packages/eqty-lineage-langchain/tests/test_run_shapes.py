@@ -221,6 +221,30 @@ def test_a_model_call_does_not_rename_the_framework(recording_handler):
     assert set(recording_handler.frameworks) == {"langchain"}
 
 
+def test_wire_body_cids_from_the_client_are_recorded_as_given(recording_handler):
+    """A compatible client hashes the HTTP bodies it sent and received; the handler records those CIDs
+    untouched. Deriving either from the parsed payload would name a document vNIM never saw."""
+    from eqty_sdk import get_cid_for_bytes
+    from langchain_core.runnables import RunnableLambda
+
+    request_cid = str(get_cid_for_bytes(b'{"model":"m","stream":true,"messages":[{"content":"x","role":"user"}]}'))
+    response_cid = str(get_cid_for_bytes(b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'))
+    reply = AIMessage(
+        "hi",
+        response_metadata={"eqty_openai_request_cid": request_cid, "eqty_openai_response_cid": response_cid},
+    )
+    model = GenericFakeChatModel(messages=iter([reply]))
+    RunnableLambda(lambda _: model.invoke("x")).invoke(1, config={"callbacks": [recording_handler]})
+
+    assert recording_handler.outputs_of("GenericFakeChatModel: ChatOpenAI XForm") == [request_cid]
+    inference = [c for c in recording_handler.computations if c[1] == "chat_inference"]
+    assert len(inference) == 1
+    _, _, inputs, outputs = inference[0]
+    assert inputs[0] == request_cid
+    assert outputs == [response_cid]
+    assert recording_handler.inputs_of("GenericFakeChatModel: ChatOpenAI SSE parse") == [response_cid]
+
+
 # ------------------------------------------- error handler consistency ----
 def test_every_error_handler_links_the_failure_the_same_way(recording_handler):
     """All four on_*_error paths funnel through one shape, so none is special-cased silently."""
