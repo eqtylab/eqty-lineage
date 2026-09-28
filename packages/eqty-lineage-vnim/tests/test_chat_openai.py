@@ -171,7 +171,7 @@ def test_generate_attaches_integrity_metadata(monkeypatch):
 
 
 def _installed_transport(model):
-    """The tee that ``_install_response_body_capture`` put on the shared HTTPX client."""
+    """The tee that ``_install_wire_body_capture`` put on the shared HTTPX client."""
     return model.root_client._client._transport
 
 
@@ -217,13 +217,13 @@ def test_a_proxied_client_is_still_teed(sdk):
     shape for ``openai_proxy``: ``httpx.Client(mounts={"all://": transport})``.
     """
     from eqty_lineage.vnim import ChatEqtyVnimOpenAI
-    from eqty_lineage.vnim.chat_models.vnim import _ResponseBodyCapturingTransport
+    from eqty_lineage.vnim.chat_models.vnim import _WireBodyCapturingTransport
 
     proxied = httpx.Client(mounts={"all://": httpx.HTTPTransport()})
     model = ChatEqtyVnimOpenAI(model="test", api_key="test", http_client=proxied, base_url="http://vnim.example/v1")
     picked = model.root_client._client._transport_for_url(httpx.URL("http://vnim.example/v1/chat/completions"))
 
-    assert isinstance(picked, _ResponseBodyCapturingTransport)
+    assert isinstance(picked, _WireBodyCapturingTransport)
 
 
 def test_an_uninitialized_sdk_does_not_escape_the_response_teardown(monkeypatch, caplog):
@@ -292,13 +292,13 @@ def test_capture_is_installed_on_a_client_built_after_validation(sdk, monkeypatc
     """
     import eqty_lineage.vnim.chat_models.vnim as module
     from eqty_lineage.vnim import ChatEqtyVnimOpenAI
-    from eqty_lineage.vnim.chat_models.vnim import _ResponseBodyCapturingTransport
+    from eqty_lineage.vnim.chat_models.vnim import _WireBodyCapturingTransport
 
     body = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
     model = ChatEqtyVnimOpenAI(model="test", api_key="test", manifest_base_url="http://127.0.0.1:8000")
     # Stand in for a client that did not exist when this class's validator ran.
     model.root_client._client = httpx.Client()
-    assert not isinstance(_installed_transport(model), _ResponseBodyCapturingTransport)
+    assert not isinstance(_installed_transport(model), _WireBodyCapturingTransport)
 
     def upstream_stream(self, *args, **kwargs):
         yield ChatGenerationChunk(message=AIMessageChunk(content="hi"))
@@ -312,3 +312,52 @@ def test_capture_is_installed_on_a_client_built_after_validation(sdk, monkeypatc
     from eqty_sdk import get_cid_for_bytes
 
     assert chunks[-1].response_metadata.get("eqty_openai_response_cid") == str(get_cid_for_bytes(body))
+
+
+def test_request_body_cid_is_over_the_bytes_the_sdk_put_on_the_wire(sdk, monkeypatch):
+    """vNIM hashes the request body exactly as it arrived, so the client must hash exactly what the
+    OpenAI SDK sent.  A re-serialization of the Python payload is a different document: the SDK keeps
+    insertion order inside nested objects such as a tool definition, and a canonical form sorts them.
+    """
+    import json
+
+    import eqty_lineage.vnim.chat_models.vnim as module
+    from eqty_lineage.vnim import ChatEqtyVnimOpenAI
+    from eqty_sdk import get_cid_for_bytes
+
+    sent: list[bytes] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        sent.append(request.read())
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    monkeypatch.setattr(module.httpx, "get", lambda url, timeout: httpx.Response(200, json={}))
+    model = ChatEqtyVnimOpenAI(
+        model="test",
+        api_key="test",
+        http_client=httpx.Client(transport=httpx.MockTransport(upstream)),
+        manifest_base_url="http://127.0.0.1:8000",
+    )
+
+    weather = {
+        "type": "function",
+        "function": {"name": "get_weather", "description": "Current weather.", "parameters": {"type": "object"}},
+    }
+    chunks = list(model.stream("hello", tools=[weather]))
+
+    assert len(sent) == 1
+    wire = sent[0]
+    metadata = chunks[-1].response_metadata
+    assert metadata["eqty_openai_request_cid"] == str(get_cid_for_bytes(wire))
+    assert b'"tools":[{"type":"function","function":{"name":"get_weather"' in wire
+    canonical = json.dumps(metadata["eqty_openai_request_payload"], sort_keys=True, separators=(",", ":")).encode()
+    assert canonical != wire, "a re-serialized payload must not be mistaken for the wire body"
+
+    # Someone else's request now travels through the same shared transport.
+    _installed_transport(model)._on_request(b"{}")
+
+    assert model._last_request_cid.get() == metadata["eqty_openai_request_cid"]
