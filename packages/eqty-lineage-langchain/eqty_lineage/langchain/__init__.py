@@ -39,10 +39,9 @@ from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, get_cid_for_bytes, init
+from eqty_sdk import CID, Context, Dataset, Document, Model, Prompt, Reasoning, Service, Tool, init
 from eqty_sdk.metadata import Metadata
 from eqty_sdk.statements import add_computation_statement
-from rfc8785 import dumps as jcs_dumps
 
 from eqty_lineage.langchain._serialize import UNCLAIMED, _to_jsonable
 from eqty_lineage.langchain._tools import _registered_tool_sources, eqty_tool
@@ -465,31 +464,24 @@ class EqtyCallbackHandler(BaseCallbackHandler):
             )
 
     @staticmethod
-    def _openai_request_payload(response: LLMResult) -> Optional[Dict[str, Any]]:
-        """Return the finalized OpenAI request payload a compatible client attached to its response."""
-        for batch in response.generations:
-            for generation in batch:
-                message = getattr(generation, "message", None)
-                metadata = getattr(message, "response_metadata", None)
-                payload = metadata.get("eqty_openai_request_payload") if isinstance(metadata, dict) else None
-                if isinstance(payload, dict):
-                    return payload
-        return None
+    def _wire_cid(response: LLMResult, key: str) -> Optional[CID]:
+        """Return a raw HTTP body CID a compatible OpenAI client attached to its final message.
 
-    @staticmethod
-    def _openai_response_cid(response: LLMResult) -> Optional[CID]:
-        """Return the raw SSE response-body CID supplied by a compatible OpenAI client."""
+        The client hashes the bytes as they crossed the wire, which is what vNIM hashes too. The
+        handler never re-derives either body from parsed data: a re-serialization is a different
+        document with a different CID, and would fork the lineage rather than join it.
+        """
         for batch in response.generations:
             for generation in batch:
                 message = getattr(generation, "message", None)
                 metadata = getattr(message, "response_metadata", None)
-                value = metadata.get("eqty_openai_response_cid") if isinstance(metadata, dict) else None
+                value = metadata.get(key) if isinstance(metadata, dict) else None
                 if not isinstance(value, str):
                     continue
                 try:
                     return CID(value)
                 except (TypeError, ValueError) as error:
-                    logger.warning("ignoring invalid raw OpenAI response CID: %s", error)
+                    logger.warning("ignoring invalid %s: %s", key, error)
         return None
 
     def _record_failure(self, run: Optional[Dict[str, Any]], error: BaseException) -> None:
@@ -891,33 +883,27 @@ class EqtyCallbackHandler(BaseCallbackHandler):
         )
 
         self._finalize(f"{run['name']}: request", "chat_request", run["inputs"], [run["request"]])
-        openai_request = self._openai_request_payload(response)
         inference_request = run["request"]
-        if openai_request is not None:
-            try:
-                canonical_request_bytes = jcs_dumps(openai_request)
-                wire_request_cid = get_cid_for_bytes(canonical_request_bytes)
-            except (TypeError, ValueError) as error:
-                logger.warning("could not JCS-canonicalize ChatOpenAI request payload: %s", error)
-            else:
-                wire_request = self._asset_factory(Document).from_cid(
-                    wire_request_cid,
-                    name=f"{run['name']}: OpenAI request",
-                    description=(
-                        "JCS-canonicalized final OpenAI-compatible request payload produced by ChatOpenAI, "
-                        "identified with a raw-binary CID to match vNIM Request Body assets."
-                    ),
-                    **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
-                )
-                self._finalize(
-                    f"{run['name']}: ChatOpenAI XForm",
-                    "chat_openai_transform",
-                    [run["request"]],
-                    [wire_request.cid],
-                )
-                inference_request = wire_request.cid
+        openai_request_cid = self._wire_cid(response, "eqty_openai_request_cid")
+        if openai_request_cid is not None:
+            wire_request = self._asset_factory(Document).from_cid(
+                openai_request_cid,
+                name=f"{run['name']}: OpenAI request",
+                description=(
+                    "Raw HTTP request body sent by ChatOpenAI, identified with a raw-binary CID "
+                    "to match vNIM Request Body assets."
+                ),
+                **self._verbose_metadata({"callback": "on_llm_end", "run_id": run_id, **kwargs}),
+            )
+            self._finalize(
+                f"{run['name']}: ChatOpenAI XForm",
+                "chat_openai_transform",
+                [run["request"]],
+                [wire_request.cid],
+            )
+            inference_request = wire_request.cid
 
-        openai_response_cid = self._openai_response_cid(response)
+        openai_response_cid = self._wire_cid(response, "eqty_openai_response_cid")
         if openai_response_cid is None:
             self._finalize(run["name"], "chat_inference", [inference_request, run["model"]], [response_body.cid])
         else:
