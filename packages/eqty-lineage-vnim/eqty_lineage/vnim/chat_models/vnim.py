@@ -27,9 +27,18 @@ logger = logging.getLogger(__name__)
 # is installed on is shared by every chat model built on that endpoint.  The tee therefore cannot
 # belong to whichever model installed it: it hands bytes to the model that is making the request, in
 # that request's own context, and to nothing at all for a plain ``ChatOpenAI`` sharing the client.
+_active_request_body_sink: ContextVar[Callable[[bytes], None] | None] = ContextVar(
+    "eqty_vnim_active_request_body_sink", default=None
+)
 _active_response_body_sink: ContextVar[Callable[[bytes], None] | None] = ContextVar(
     "eqty_vnim_active_response_body_sink", default=None
 )
+
+
+def _dispatch_request_body(body: bytes) -> None:
+    sink = _active_request_body_sink.get()
+    if sink is not None:
+        sink(body)
 
 
 def _dispatch_response_body(body: bytes) -> None:
@@ -72,14 +81,16 @@ class _ResponseBodyCapturingStream(httpx.SyncByteStream):
         self._stream.close()
 
 
-class _ResponseBodyCapturingTransport(httpx.BaseTransport):
-    """Wrap the existing HTTPX transport to observe raw response bytes verbatim."""
+class _WireBodyCapturingTransport(httpx.BaseTransport):
+    """Wrap the existing HTTPX transport to observe raw request and response bytes verbatim."""
 
-    def __init__(self, transport: httpx.BaseTransport, on_complete: Any) -> None:
+    def __init__(self, transport: httpx.BaseTransport, on_request: Any, on_complete: Any) -> None:
         self._transport = transport
+        self._on_request = on_request
         self._on_complete = on_complete
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self._on_request(request.read())
         response = self._transport.handle_request(request)
         response.stream = _ResponseBodyCapturingStream(response.stream, self._on_complete)
         return response
@@ -121,6 +132,9 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
     _last_request_payload: ContextVar[dict[str, Any] | None] = PrivateAttr(
         default_factory=lambda: ContextVar("last_request_payload", default=None)
     )
+    _last_request_cid: ContextVar[str | None] = PrivateAttr(
+        default_factory=lambda: ContextVar("last_request_cid", default=None)
+    )
     _last_response_cid: ContextVar[str | None] = PrivateAttr(
         default_factory=lambda: ContextVar("last_response_cid", default=None)
     )
@@ -141,40 +155,51 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         if "include_response_headers" in self.model_fields_set and not self.include_response_headers:
             logger.warning("include_response_headers=False is ignored because vNIM integrity retrieval requires it")
         self.include_response_headers = True
-        self._install_response_body_capture()
+        self._install_wire_body_capture()
         return self
 
-    def _install_response_body_capture(self) -> None:
-        """Observe raw upstream bytes before HTTPX and LangChain parse the SSE stream."""
+    def _install_wire_body_capture(self) -> None:
+        """Observe the raw bytes of each exchange: the request as the OpenAI SDK serialized it, and
+        the response before HTTPX and LangChain parse the SSE stream."""
         client = getattr(getattr(self, "root_client", None), "_client", None)
         transport = getattr(client, "_transport", None)
         if transport is None:
             logger.warning(
-                "eqty_vnim.response_body_capture_unavailable client=%s: response CIDs will be absent "
-                "from lineage, so the response node will not match what vNIM registered",
+                "eqty_vnim.wire_body_capture_unavailable client=%s: request and response CIDs will be "
+                "absent from lineage, so neither node will match what vNIM registered",
                 type(client).__name__,
             )
             return
-        if not isinstance(transport, _ResponseBodyCapturingTransport):
-            client._transport = _ResponseBodyCapturingTransport(transport, _dispatch_response_body)
-        # A client built for a proxy resolves every request through ``_mounts``, which HTTPX consults
-        # before ``_transport``; wrapping ``_transport`` alone would then tee nothing.
+        if not isinstance(transport, _WireBodyCapturingTransport):
+            client._transport = _WireBodyCapturingTransport(transport, _dispatch_request_body, _dispatch_response_body)
         for pattern, mounted in list((getattr(client, "_mounts", None) or {}).items()):
-            if mounted is not None and not isinstance(mounted, _ResponseBodyCapturingTransport):
-                client._mounts[pattern] = _ResponseBodyCapturingTransport(mounted, _dispatch_response_body)
+            if mounted is not None and not isinstance(mounted, _WireBodyCapturingTransport):
+                client._mounts[pattern] = _WireBodyCapturingTransport(
+                    mounted, _dispatch_request_body, _dispatch_response_body
+                )
 
     @contextmanager
-    def _receiving_response_bodies(self) -> Iterator[None]:
+    def _receiving_wire_bodies(self) -> Iterator[None]:
         """Claim the shared tee for the duration of one request on this model."""
-        self._install_response_body_capture()
-        previous = _active_response_body_sink.get()
-        # Restored by value rather than by token: a generator's cleanup can run in a different
-        # context than its first step did, and ContextVar.reset rejects a token from another context.
+        self._install_wire_body_capture()
+        previous_request = _active_request_body_sink.get()
+        previous_response = _active_response_body_sink.get()
+        _active_request_body_sink.set(self._record_request_body)
         _active_response_body_sink.set(self._record_response_body)
         try:
             yield
         finally:
-            _active_response_body_sink.set(previous)
+            _active_request_body_sink.set(previous_request)
+            _active_response_body_sink.set(previous_response)
+
+    def _record_request_body(self, body: bytes) -> None:
+        """Save the raw-binary CID of the request body as it left the OpenAI SDK."""
+        try:
+            cid = str(get_cid_for_bytes(body))
+            self._last_request_cid.set(cid)
+            logger.info("eqty_vnim.request_body_sent cid=%s bytes=%d", cid, len(body))
+        except BaseException as error:  # noqa: BLE001
+            logger.warning("eqty_vnim.request_body_cid_unavailable error=%r", error)
 
     def _record_response_body(self, body: bytes) -> None:
         """Save the raw-binary CID of a fully consumed upstream response body."""
@@ -183,10 +208,6 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
             self._last_response_cid.set(cid)
             logger.info("eqty_vnim.response_body_received cid=%s bytes=%d", cid, len(body))
         except BaseException as error:  # noqa: BLE001
-            # The SDK may be deliberately uninitialized when this class is used without lineage
-            # capture, and it then raises pyo3's PanicException -- which derives from BaseException,
-            # not Exception.  This runs while HTTPX tears a response down, so nothing raised here may
-            # reach the caller: normal ChatOpenAI behavior must not change.
             logger.warning("eqty_vnim.response_body_cid_unavailable error=%r", error)
 
     @staticmethod
@@ -317,9 +338,10 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         metadata = dict(chunk.message.response_metadata or {})
         request_payload = self.last_request_payload
         if request_payload is not None:
-            # This is the final Python request body produced by ChatOpenAI and handed to the OpenAI
-            # client. It is intentionally separate from the raw HTTP bytes, which are transport evidence.
             metadata["eqty_openai_request_payload"] = request_payload
+        request_cid = self._last_request_cid.get()
+        if request_cid is not None:
+            metadata["eqty_openai_request_cid"] = request_cid
         response_cid = self._last_response_cid.get()
         if response_cid is not None:
             metadata["eqty_openai_response_cid"] = response_cid
@@ -339,11 +361,12 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
 
     def _stream(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         """Preserve the upstream SSE stream and enrich only its final parsed chunk."""
-        with self._receiving_response_bodies():
+        with self._receiving_wire_bodies():
             yield from self._stream_with_integrity(*args, **kwargs)
 
     def _stream_with_integrity(self, *args: Any, **kwargs: Any) -> Iterator[ChatGenerationChunk]:
         self._last_integrity_result.set(None)
+        self._last_request_cid.set(None)
         self._last_response_cid.set(None)
         request_id, header_error, pending = None, None, None
         try:
@@ -379,8 +402,9 @@ class ChatEqtyVnimOpenAI(ChatOpenAI):
         **kwargs: Any,
     ) -> ChatResult:
         self._last_integrity_result.set(None)
+        self._last_request_cid.set(None)
         self._last_response_cid.set(None)
-        with self._receiving_response_bodies():
+        with self._receiving_wire_bodies():
             result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         if result.generations:
             generation = result.generations[0]
