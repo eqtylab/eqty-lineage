@@ -38,6 +38,12 @@ def _to_jsonable(
         tool_calls = getattr(obj, "tool_calls", None)
         if tool_calls:
             data["tool_calls"] = _to_jsonable(tool_calls, on_value, _key_path)
+        # A ToolMessage's tool_call_id is what pairs a result with the call that asked for it; without it,
+        # results of parallel tool calls in one turn can only be matched by position.
+        for attr in ("tool_call_id", "name"):
+            value = getattr(obj, attr, None)
+            if value:
+                data[attr] = value
         usage = getattr(obj, "usage_metadata", None)
         if usage:
             data["usage"] = _to_jsonable(usage, on_value, _key_path)
