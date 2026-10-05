@@ -170,6 +170,20 @@ def test_command_paths_are_still_collected(tmp_path):
     assert seen == [(("update", "report"), target)]
 
 
+def test_tool_message_keeps_the_id_of_the_call_it_answers():
+    """Two parallel tool results are only told apart by tool_call_id; without it, by position."""
+    from eqty_lineage.langchain import _to_jsonable
+    from langchain_core.messages import ToolMessage
+
+    call = {"name": "lookup", "args": {"q": "a"}, "id": "call_1"}
+    ai, result = _to_jsonable(
+        [AIMessage("", tool_calls=[call]), ToolMessage("found", tool_call_id="call_1", name="lookup")]
+    )
+    assert ai["tool_calls"][0]["id"] == result["tool_call_id"] == "call_1"
+    assert result["name"] == "lookup"
+    assert "tool_call_id" not in ai
+
+
 # ----------------------------------------------------- model identity ----
 def test_model_named_from_its_class_when_params_are_bare(recording_handler):
     """GenericFakeChatModel declares no model name; the class name beats 'unknown-model'."""
