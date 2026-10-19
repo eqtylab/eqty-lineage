@@ -38,14 +38,11 @@ sudo k3s ctr images ls | grep eqty-langchain-agent
 OpenShell replaces the image `CMD`, so the start command goes after `--`.
 
 ```bash
-# Reads OPENAI_API_KEY from your shell; the sandbox only ever sees a placeholder.
-openshell provider create --name openai --type openai --from-existing
-
 openshell sandbox create \
   --name eqty-travel-agent \
   --from eqty-langchain-agent:v2 \
   --policy examples/langchain/openshell/policy.yaml \
-  --provider openai \
+  --provider guardian-enrollment \
   --forward 8080 \
   -- /opt/venv/bin/python /app/travel_chat_ui.py --no-open
 ```
