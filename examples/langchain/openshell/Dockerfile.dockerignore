@@ -1,0 +1,9 @@
+*
+!pyproject.toml
+!uv.lock
+!packages/eqty-lineage-langchain
+!packages/eqty-lineage-deepagents
+!packages/eqty-lineage-vnim
+!examples/langchain/*.py
+**/tests
+**/__pycache__
