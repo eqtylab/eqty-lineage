@@ -1,5 +1,5 @@
 name: Release
-description: "Publishes package to pypi server on a release"
+description: "Publishes package to pypi.eqtylab.io, and the public ones to pypi.org, on a release"
 
 on:
   release:
@@ -30,6 +30,13 @@ jobs:
     # release rather than as the wrong workflow for the tag.
     if: ${{ !startsWith(github.event.release.tag_name || inputs.release_tag, 'eqty-lineage-nemo-relay@') }}
     runs-on: ubuntu-latest
+    # pypi.org trusted publishing: PyPI accepts this job's OIDC token in place of an API token. Each
+    # public package needs a (pending) trusted publisher on pypi.org naming this repository, this
+    # workflow file and this environment.
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Install Nix
@@ -93,3 +100,10 @@ jobs:
           UV_PUBLISH_USERNAME: ${{ secrets.EQTY_PYPI_USERNAME }}
           UV_PUBLISH_PASSWORD: "${{ secrets.EQTY_PYPI_PASSWORD }}"
         run: just publish-package "$PACKAGE"
+
+      # Only the packages listed here are public. A package missing from the list still reaches
+      # pypi.eqtylab.io; adding one to it publishes that package to pypi.org on its next release,
+      # which cannot be withdrawn (PyPI never reuses a deleted version).
+      - name: Publish package to pypi.org
+        if: contains(fromJSON('["eqty-lineage-langchain", "eqty-lineage-deepagents"]'), env.PACKAGE)
+        run: just publish-package-pypi "$PACKAGE"

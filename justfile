@@ -39,6 +39,13 @@ publish:
 publish-package package:
   uv publish --index eqty "dist/{{package}}/*"
 
+# Authenticates with the GitHub Actions OIDC token (trusted publishing), so it runs only in
+# `release.yml`. Files already on pypi.org are skipped, so a rerun after a partial upload finishes it.
+#
+# Publish the whl and sdist for one workspace package to pypi.org
+publish-package-pypi package:
+  uv publish --trusted-publishing always --check-url https://pypi.org/simple/ "dist/{{package}}/*"
+
 # Delete build artifacts
 clean:
   rm -rf ./dist
