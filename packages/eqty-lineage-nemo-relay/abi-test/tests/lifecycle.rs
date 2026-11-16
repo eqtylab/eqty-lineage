@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use nemo_relay::plugin::dynamic::{
-    DynamicPluginActivationSpec, DynamicPluginKind, PluginHostActivation,
+    DynamicPluginKind, PluginHostActivation, VerifiedDynamicPluginSpec,
 };
 use nemo_relay::plugin::{PluginConfig, list_plugin_kinds};
 use serde_json::{Map, json};
@@ -44,9 +44,9 @@ async fn the_built_cdylib_loads_and_registers_its_kind() {
         "manifest_dir": manifests.path().to_string_lossy(),
     }));
 
-    let (activation, report) = PluginHostActivation::activate(
+    let (mut activation, report) = PluginHostActivation::initialize_with_verified_specs(
         PluginConfig::default(),
-        [DynamicPluginActivationSpec {
+        [VerifiedDynamicPluginSpec {
             plugin_id: PLUGIN_ID.into(),
             kind: DynamicPluginKind::RustDynamic,
             manifest_ref: manifest.to_string_lossy().into_owned(),
@@ -68,7 +68,7 @@ async fn the_built_cdylib_loads_and_registers_its_kind() {
     );
 
     activation
-        .clear()
+        .close()
         .expect("callbacks should clear before the library unloads");
 }
 
@@ -82,9 +82,9 @@ async fn a_bad_config_is_refused_rather_than_recorded_badly() {
     let manifest_dir = TempDir::new().expect("manifest directory");
     let manifest = write_manifest(manifest_dir.path(), library);
 
-    let outcome = PluginHostActivation::activate(
+    let outcome = PluginHostActivation::initialize_with_verified_specs(
         PluginConfig::default(),
-        [DynamicPluginActivationSpec {
+        [VerifiedDynamicPluginSpec {
             plugin_id: PLUGIN_ID.into(),
             kind: DynamicPluginKind::RustDynamic,
             manifest_ref: manifest.to_string_lossy().into_owned(),
@@ -96,13 +96,13 @@ async fn a_bad_config_is_refused_rather_than_recorded_badly() {
 
     match outcome {
         Err(_) => {}
-        Ok((activation, report)) => {
+        Ok((mut activation, report)) => {
             assert!(
                 !report.diagnostics.is_empty(),
                 "a zero content ceiling should not activate silently: {report:?}"
             );
             activation
-                .clear()
+                .close()
                 .expect("clear after a diagnosed activation");
         }
     }

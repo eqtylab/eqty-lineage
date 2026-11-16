@@ -132,7 +132,7 @@ lint: lint-python lint-rust
 lint-python:
   ruff check .
 
-# Dependencies are compiled, never linted -- `Checking nemo-relay-plugin v0.8.3` in a CI log is cargo
+# Dependencies are compiled, never linted -- `Checking nemo-relay-plugin v0.11.1` in a CI log is cargo
 # making a dependency's types available, not checking its code. So there is nothing here to narrow to
 # "only our code"; the cost is compiling two deliberately incompatible dependency graphs from scratch.
 #

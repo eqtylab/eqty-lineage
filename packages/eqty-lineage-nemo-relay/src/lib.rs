@@ -33,6 +33,7 @@ mod mailbox;
 mod recorder;
 mod redaction;
 mod session;
+mod subscriber;
 pub use classify::{CompactionPhase, Correlation, LineageEvent, classify};
 pub use config::Config;
 pub use files::{
@@ -46,6 +47,7 @@ pub use mailbox::{
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
+pub use subscriber::decode_event;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +72,8 @@ const SUBSCRIBER_NAME: &str = "eqty_lineage";
 pub struct Tally {
     /// Events delivered to the subscriber.
     pub seen: AtomicU64,
+    /// Events whose JSON could not be decoded into an `Event`, and so were never seen.
+    pub undecodable: AtomicU64,
     /// Events that classified into the lineage vocabulary.
     pub classified: AtomicU64,
     /// Classified events that could not be attributed to any session, and were dropped.
@@ -179,9 +183,15 @@ impl NativePlugin for EqtyLineagePlugin {
         self.mailbox = Some(Arc::clone(&mailbox));
 
         let tally = Arc::clone(&self.tally);
-        ctx.register_subscriber(SUBSCRIBER_NAME, move |event: &Event| {
-            observe(&tally, &router, &mailbox, event);
-        })?;
+        let undecodable = Arc::clone(&self.tally);
+        subscriber::register(
+            ctx,
+            SUBSCRIBER_NAME,
+            move |event: &Event| observe(&tally, &router, &mailbox, event),
+            Box::new(move || {
+                undecodable.undecodable.fetch_add(1, Ordering::Relaxed);
+            }),
+        )?;
 
         Ok(())
     }

@@ -21,7 +21,7 @@ description = "Loads the eqty-lineage-nemo-relay cdylib through Relay's dynamic-
 path = "src/lib.rs"
 
 [dev-dependencies]
-nemo-relay = "0.8.3"
+nemo-relay = "0.11.1"
 serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
