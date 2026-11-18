@@ -20,10 +20,8 @@ crate-type = ["cdylib", "rlib"]
 # Relay's core crate as well would only add a second copy of the same types.
 nemo-relay-plugin = "0.11.1"
 # The EQTY core. Pinned by SHA rather than tag so the build cannot move underneath us; this is
-# v0.0.13. `integrity` does not resolve from a clean crates.io index at any revision -- `core2 0.4.0`
-# is yanked and reachable through two different dependency paths -- so `Cargo.lock` is committed and
-# is a build requirement, not a preference. See README.
-integrity = { git = "https://github.com/eqtylab/integrity", rev = "0d85ae5b9f7204812771c4f8e4985c671b831b0a", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
+# v0.0.21. `Cargo.lock` is committed and the package recipe builds `--locked`. See README.
+integrity = { git = "https://github.com/eqtylab/integrity", rev = "13af564f0061d7b15819efc99bccef5b6140a1ad", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
 anyhow = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 serde_json = "1"

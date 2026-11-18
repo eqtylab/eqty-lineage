@@ -256,18 +256,13 @@ The same rule governs correlation. Relay reports how confident its own join was,
 `agent_fallback` / `ambiguous_fallback` mean it guessed. Those become `Correlation::Inferred`, never
 `Observed`.
 
-## The lockfile is committed, and has to be
+## The lockfile is committed
 
-`integrity` does not resolve from a clean crates.io index at any revision: `core2 0.4.0` is yanked
-and reachable through two different paths. Cargo permits a yanked crate already present in a lockfile
-and refuses to select one that is not.
+`Cargo.lock` is committed here, and this is not the usual "libraries don't commit lockfiles"
+question: the shipped artifact is a signed cdylib, and `just nemo-relay-package` builds `--locked`
+so a release bundle is built from the dependency tree that was tested.
 
-So `Cargo.lock` is committed here, and this is not the usual "libraries don't commit lockfiles"
-question — without it, a clean checkout cannot build. A CI job that deletes it, or a `cargo update`
-that drops the `core2` entry, fails with an error pointing five levels down the dependency tree
-rather than at the real cause.
-
-`integrity` is pinned by SHA to v0.0.13 (`0d85ae5b9f7204812771c4f8e4985c671b831b0a`).
+`integrity` is pinned by SHA to v0.0.21 (`13af564f0061d7b15819efc99bccef5b6140a1ad`).
 
 ## Building
 
