@@ -34,7 +34,7 @@ mod recorder;
 mod redaction;
 mod session;
 mod subscriber;
-pub use classify::{CompactionPhase, Correlation, LineageEvent, classify};
+pub use classify::{CompactionPhase, Correlation, LineageEvent, classify, may_carry_lineage};
 pub use config::Config;
 pub use files::{
     EditAttempt, FileMode, FileObserved, Hunk, ReplayRefusal, apply_edit, apply_line_edit,
@@ -245,7 +245,8 @@ fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
 /// Account for an event that could not be decoded, against its session when it names one.
 ///
 /// A manifest missing an event must say so in its own `EventsDropped`; the process-wide tally
-/// cannot tell a reader which manifest is incomplete.
+/// cannot tell a reader which manifest is incomplete. Only an event that could have carried lineage
+/// is charged, to match the queue path, which charges only what classified.
 fn note_undecodable(
     tally: &Tally,
     router: &Mutex<SessionRouter>,
@@ -253,14 +254,14 @@ fn note_undecodable(
     raw: Option<&Json>,
 ) {
     tally.undecodable.fetch_add(1, Ordering::Relaxed);
-    let session_id = raw.and_then(|raw| {
-        router
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .attribute_raw(raw)
-    });
-    if let Some(session_id) = session_id {
-        mailbox.note_dropped(&session_id);
+    let Some(raw) = raw else { return };
+    // Attributed even when it is not charged: a scope must be remembered for its children.
+    let session_id = router
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .attribute_raw(raw);
+    if let Some(session_id) = session_id.filter(|_| may_carry_lineage(raw)) {
+        mailbox.note_undecodable(&session_id);
     }
 }
 

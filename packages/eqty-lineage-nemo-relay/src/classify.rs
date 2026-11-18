@@ -183,6 +183,17 @@ pub fn classify(event: &Event) -> Option<LineageEvent> {
     }
 }
 
+/// Whether an event that failed to decode could have carried lineage, judged from its raw JSON.
+///
+/// Errs towards yes. The marks [`classify_mark`] ignores are the bulk of a stream, and charging
+/// them as lost would make an intact manifest read as incomplete; anything else is assumed to
+/// matter, because an undercount is the silent failure.
+pub fn may_carry_lineage(raw: &Json) -> bool {
+    string_at(Some(raw), "kind") != Some("mark")
+        || string_at(Some(raw), "name") == Some("session.start")
+        || string_at(raw.get("metadata"), "hook_event_name").is_some()
+}
+
 fn classify_mark(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent> {
     match event.name() {
         "session.start" => Some(LineageEvent::SessionStarted {

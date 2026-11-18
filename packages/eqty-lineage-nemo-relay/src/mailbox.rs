@@ -65,6 +65,8 @@ enum Message {
         at: String,
         event: Box<LineageEvent>,
     },
+    /// An event for this session failed to decode, and never became a `LineageEvent`.
+    Undecodable { session_id: String },
 }
 
 /// A tool call that has started and not yet ended.
@@ -111,6 +113,8 @@ struct SessionState {
     /// spawned agent's own scope has already closed by the time its turn arrives. This says who the
     /// turn belongs to, which `live_subagents` cannot answer here.
     turn_agent: Option<(String, AssetRef)>,
+    /// Events this session lost to decoding, reported with the queue's losses at export.
+    undecodable: u64,
     /// Where this session's manifest is written, resolved once when the session opens.
     ///
     /// Held rather than recomputed so that every write for one session lands on one file. Resolving
@@ -271,11 +275,24 @@ impl Mailbox {
         true
     }
 
+    /// Tell the worker a session lost an event to decoding.
+    ///
+    /// Sent rather than counted here because only the worker knows which sessions exist. A count
+    /// held for a session that is never created, or has already exported, would never be read or
+    /// removed.
+    pub fn note_undecodable(&self, session_id: &str) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.try_send(Message::Undecodable {
+                session_id: session_id.to_string(),
+            });
+        }
+    }
+
     /// Count one event this session will never see.
     ///
     /// A poisoned lock is recovered from rather than propagated: the map behind it is counters, and
     /// giving up on counting losses is the one response strictly worse than the loss itself.
-    pub fn note_dropped(&self, session_id: &str) {
+    fn note_dropped(&self, session_id: &str) {
         let mut counts = self
             .dropped
             .lock()
@@ -363,11 +380,19 @@ fn run(
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
 
     while let Ok(message) = receiver.recv() {
-        let Message::Observed {
-            session_id,
-            at,
-            event,
-        } = message;
+        let (session_id, at, event) = match message {
+            Message::Observed {
+                session_id,
+                at,
+                event,
+            } => (session_id, at, event),
+            Message::Undecodable { session_id } => {
+                if let Some(state) = sessions.get_mut(&session_id) {
+                    state.undecodable += 1;
+                }
+                continue;
+            }
+        };
 
         if !sessions.contains_key(&session_id) {
             let Some(lineage) = signer() else {
@@ -386,6 +411,7 @@ fn run(
                     turn_prompt_attributed: false,
                     live_subagents: Vec::new(),
                     turn_agent: None,
+                    undecodable: 0,
                 },
             );
         }
@@ -1259,7 +1285,7 @@ fn export(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(session_id)
         .unwrap_or(0);
-    state.recorder.note_events_dropped(lost);
+    state.recorder.note_events_dropped(lost + state.undecodable);
 
     // A session that never registered an agent is not a session anyone ran.
     //

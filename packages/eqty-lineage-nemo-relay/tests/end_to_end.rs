@@ -2328,6 +2328,42 @@ fn work_done_while_several_subagents_run_says_it_cannot_tell_which() {
 }
 
 #[test]
+fn an_undecodable_event_is_charged_only_to_a_session_that_exists() {
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f62";
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        ignore_marks(),
+    );
+
+    // Before the session exists, and for one that never will: neither may be held anywhere.
+    mailbox.note_undecodable(session);
+    mailbox.note_undecodable("never-created");
+    for event in &full_session(session) {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
+        }
+    }
+    mailbox.note_undecodable(session);
+    drop(mailbox);
+
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "a loss alone does not create a session");
+    let decoded = decoded_blobs(&written[0]);
+    assert!(
+        decoded.contains("\"EventsDropped\":1"),
+        "only the loss the session was open for is charged:\n{decoded}"
+    );
+}
+
+#[test]
 fn a_manifest_states_whether_events_were_dropped() {
     // `dropped_events` was initialized, never incremented, and explicitly discarded (`let _ =
     // dropped`), while the queue's own doc comment promised the manifest would state the loss. A
