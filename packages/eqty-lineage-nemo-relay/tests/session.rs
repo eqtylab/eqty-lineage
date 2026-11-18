@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
-use eqty_lineage_nemo_relay::SessionRouter;
+use eqty_lineage_nemo_relay::{SessionRouter, decode_event};
 use nemo_relay_plugin::Event;
 
 fn fixture() -> Vec<Event> {
@@ -18,7 +18,7 @@ fn fixture() -> Vec<Event> {
     let text = fs::read_to_string(&path).expect("fixture is readable");
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("fixture line is a Relay Event"))
+        .map(|line| decode_event(line).expect("fixture line is a Relay Event"))
         .collect()
 }
 
@@ -128,4 +128,31 @@ fn forgetting_a_session_releases_its_scopes() {
         0,
         "a finished session must not keep one map entry per scope forever"
     );
+}
+
+/// An event that parses but does not decode is attributed like any other, so its loss lands on the
+/// right session and a scope it opened still explains its children.
+#[test]
+fn an_undecodable_event_is_attributed_from_its_raw_json() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-session.jsonl");
+    let text = fs::read_to_string(&path).expect("fixture is readable");
+    let raw: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("fixture line is JSON"))
+        .collect();
+
+    let mut decoded = SessionRouter::new();
+    let expected: Vec<_> = fixture()
+        .iter()
+        .map(|event| decoded.attribute(event))
+        .collect();
+    let mut undecoded = SessionRouter::new();
+    let actual: Vec<_> = raw
+        .iter()
+        .map(|event| undecoded.attribute_raw(event))
+        .collect();
+
+    assert_eq!(actual, expected);
+    assert!(actual.iter().all(Option::is_some));
 }

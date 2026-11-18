@@ -183,13 +183,18 @@ impl NativePlugin for EqtyLineagePlugin {
         self.mailbox = Some(Arc::clone(&mailbox));
 
         let tally = Arc::clone(&self.tally);
-        let undecodable = Arc::clone(&self.tally);
+        let undecodable = (
+            Arc::clone(&self.tally),
+            Arc::clone(&router),
+            Arc::clone(&mailbox),
+        );
         subscriber::register(
             ctx,
             SUBSCRIBER_NAME,
             move |event: &Event| observe(&tally, &router, &mailbox, event),
-            Box::new(move || {
-                undecodable.undecodable.fetch_add(1, Ordering::Relaxed);
+            Box::new(move |raw: Option<&Json>| {
+                let (tally, router, mailbox) = &undecodable;
+                note_undecodable(tally, router, mailbox, raw);
             }),
         )?;
 
@@ -234,6 +239,28 @@ fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
     // on the stream points at it -- so they share a counter rather than pretending to differ.
     if !matches!(outcome, Ok(Ok(()))) {
         tally.unannounced.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Account for an event that could not be decoded, against its session when it names one.
+///
+/// A manifest missing an event must say so in its own `EventsDropped`; the process-wide tally
+/// cannot tell a reader which manifest is incomplete.
+fn note_undecodable(
+    tally: &Tally,
+    router: &Mutex<SessionRouter>,
+    mailbox: &Mailbox,
+    raw: Option<&Json>,
+) {
+    tally.undecodable.fetch_add(1, Ordering::Relaxed);
+    let session_id = raw.and_then(|raw| {
+        router
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .attribute_raw(raw)
+    });
+    if let Some(session_id) = session_id {
+        mailbox.note_dropped(&session_id);
     }
 }
 

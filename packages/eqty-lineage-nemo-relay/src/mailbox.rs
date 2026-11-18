@@ -275,7 +275,7 @@ impl Mailbox {
     ///
     /// A poisoned lock is recovered from rather than propagated: the map behind it is counters, and
     /// giving up on counting losses is the one response strictly worse than the loss itself.
-    fn note_dropped(&self, session_id: &str) {
+    pub fn note_dropped(&self, session_id: &str) {
         let mut counts = self
             .dropped
             .lock()

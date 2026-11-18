@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
     LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy,
-    SessionFinished, SessionRouter, SignerFactory, classify,
+    SessionFinished, SessionRouter, SignerFactory, classify, decode_event,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
@@ -124,7 +124,7 @@ fn fixture() -> Vec<Event> {
         .expect("fixture is readable")
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("fixture line is an Event"))
+        .map(|line| decode_event(line).expect("fixture line is an Event"))
         .collect()
 }
 

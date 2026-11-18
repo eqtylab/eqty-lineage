@@ -31,7 +31,7 @@ uuid = "1"
 
 [dev-dependencies]
 # Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`
-# exactly as the host does before it calls a subscriber.
+# through `decode_event`, exactly as the subscriber does.
 serde_json = "1"
 # The ABI load test lives in `abi-test/`, as its own crate: it needs Relay's core crate, which
 # cannot coexist with `integrity` in one dependency graph. See `abi-test/Cargo.toml`.
