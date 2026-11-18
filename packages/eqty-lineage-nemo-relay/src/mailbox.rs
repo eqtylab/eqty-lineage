@@ -43,6 +43,10 @@ use crate::redaction::Policy;
 /// than reading as a complete one.
 const QUEUE_DEPTH: usize = 4096;
 
+/// How many sessions may hold a loss count before counts for sessions that are not open are shed.
+/// Nothing else removes a count whose session is never created or has already exported.
+const DROPPED_SESSIONS: usize = 1024;
+
 /// Statements that must accumulate before a mid-session manifest is rewritten.
 ///
 /// A checkpoint costs the whole manifest, not the delta -- see [`LineageSession::snapshot`] -- so
@@ -65,8 +69,6 @@ enum Message {
         at: String,
         event: Box<LineageEvent>,
     },
-    /// An event for this session failed to decode, and never became a `LineageEvent`.
-    Undecodable { session_id: String },
 }
 
 /// A tool call that has started and not yet ended.
@@ -113,8 +115,6 @@ struct SessionState {
     /// spawned agent's own scope has already closed by the time its turn arrives. This says who the
     /// turn belongs to, which `live_subagents` cannot answer here.
     turn_agent: Option<(String, AssetRef)>,
-    /// Events this session lost to decoding, reported with the queue's losses at export.
-    undecodable: u64,
     /// Where this session's manifest is written, resolved once when the session opens.
     ///
     /// Held rather than recomputed so that every write for one session lands on one file. Resolving
@@ -275,24 +275,11 @@ impl Mailbox {
         true
     }
 
-    /// Tell the worker a session lost an event to decoding.
-    ///
-    /// Sent rather than counted here because only the worker knows which sessions exist. A count
-    /// held for a session that is never created, or has already exported, would never be read or
-    /// removed.
-    pub fn note_undecodable(&self, session_id: &str) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.try_send(Message::Undecodable {
-                session_id: session_id.to_string(),
-            });
-        }
-    }
-
     /// Count one event this session will never see.
     ///
     /// A poisoned lock is recovered from rather than propagated: the map behind it is counters, and
     /// giving up on counting losses is the one response strictly worse than the loss itself.
-    fn note_dropped(&self, session_id: &str) {
+    pub fn note_dropped(&self, session_id: &str) {
         let mut counts = self
             .dropped
             .lock()
@@ -380,19 +367,11 @@ fn run(
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
 
     while let Ok(message) = receiver.recv() {
-        let (session_id, at, event) = match message {
-            Message::Observed {
-                session_id,
-                at,
-                event,
-            } => (session_id, at, event),
-            Message::Undecodable { session_id } => {
-                if let Some(state) = sessions.get_mut(&session_id) {
-                    state.undecodable += 1;
-                }
-                continue;
-            }
-        };
+        let Message::Observed {
+            session_id,
+            at,
+            event,
+        } = message;
 
         if !sessions.contains_key(&session_id) {
             let Some(lineage) = signer() else {
@@ -411,9 +390,9 @@ fn run(
                     turn_prompt_attributed: false,
                     live_subagents: Vec::new(),
                     turn_agent: None,
-                    undecodable: 0,
                 },
             );
+            shed_stale(&dropped, |session_id| sessions.contains_key(session_id));
         }
 
         // Checked before `apply` consumes the event. Without a checkpoint the only manifest a
@@ -1271,6 +1250,16 @@ async fn checkpoint(state: &mut SessionState) {
     }
 }
 
+/// Bound the loss counts by discarding those for sessions that are not open.
+fn shed_stale(dropped: &Mutex<HashMap<String, u64>>, is_open: impl Fn(&str) -> bool) {
+    let mut counts = dropped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if counts.len() > DROPPED_SESSIONS {
+        counts.retain(|session_id, _| is_open(session_id));
+    }
+}
+
 fn export(
     runtime: &tokio::runtime::Runtime,
     session_id: &str,
@@ -1278,14 +1267,14 @@ fn export(
     dropped: &Arc<Mutex<HashMap<String, u64>>>,
     on_manifest: &ManifestAnnounced,
 ) {
-    // What the queue lost for this session, taken out of the shared map so it does not outlive the
+    // What this session lost, taken out of the shared map so it does not outlive the
     // session it describes -- the same unbounded-growth mistake this export path exists to close.
     let lost = dropped
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(session_id)
         .unwrap_or(0);
-    state.recorder.note_events_dropped(lost + state.undecodable);
+    state.recorder.note_events_dropped(lost);
 
     // A session that never registered an agent is not a session anyone ran.
     //

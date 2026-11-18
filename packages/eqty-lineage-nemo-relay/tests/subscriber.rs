@@ -28,8 +28,8 @@ fn a_streamed_llm_end_decodes_and_carries_its_response() {
     }
 }
 
-/// Pins why `decode_event` exists. If this starts passing, `arbitrary_precision` has left the
-/// dependency graph and the SDK's typed subscriber would do.
+/// Pins why `decode_event` exists. If this fails, `arbitrary_precision` has left the dependency
+/// graph and the SDK's typed subscriber would do.
 #[test]
 fn from_str_alone_cannot_decode_it() {
     assert!(serde_json::from_str::<Event>(&streamed_llm_end()).is_err());

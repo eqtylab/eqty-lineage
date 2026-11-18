@@ -47,6 +47,7 @@ pub use mailbox::{
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
+use subscriber::Delivery;
 pub use subscriber::decode_event;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -151,7 +152,7 @@ impl NativePlugin for EqtyLineagePlugin {
                 .ok()
                 .map(|signer| LineageSession::new(SignerType::ED25519(signer)))
         });
-        // `register_subscriber` takes `Fn`, not `FnMut`, so the router's state lives behind a lock.
+        // The subscriber is `Fn`, not `FnMut`, so the router's state lives behind a lock.
         // Relay drives subscribers from its own queue rather than from the agent's critical path, so
         // this is uncontended in practice -- but it must never be held across anything slow.
         //
@@ -183,18 +184,15 @@ impl NativePlugin for EqtyLineagePlugin {
         self.mailbox = Some(Arc::clone(&mailbox));
 
         let tally = Arc::clone(&self.tally);
-        let undecodable = (
-            Arc::clone(&self.tally),
-            Arc::clone(&router),
-            Arc::clone(&mailbox),
-        );
         subscriber::register(
             ctx,
             SUBSCRIBER_NAME,
-            move |event: &Event| observe(&tally, &router, &mailbox, event),
-            Box::new(move |raw: Option<&Json>| {
-                let (tally, router, mailbox) = &undecodable;
-                note_undecodable(tally, router, mailbox, raw);
+            Box::new(move |delivery| match delivery {
+                Delivery::Event(event) => observe(&tally, &router, &mailbox, event),
+                Delivery::Undecodable(raw) => note_undecodable(&tally, &router, &mailbox, raw),
+                Delivery::Panicked => {
+                    tally.panicked.fetch_add(1, Ordering::Relaxed);
+                }
             }),
         )?;
 
@@ -244,9 +242,7 @@ fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
 
 /// Account for an event that could not be decoded, against its session when it names one.
 ///
-/// A manifest missing an event must say so in its own `EventsDropped`; the process-wide tally
-/// cannot tell a reader which manifest is incomplete. Only an event that could have carried lineage
-/// is charged, to match the queue path, which charges only what classified.
+/// The process-wide tally cannot tell a reader which manifest is incomplete; `EventsDropped` can.
 fn note_undecodable(
     tally: &Tally,
     router: &Mutex<SessionRouter>,
@@ -261,56 +257,40 @@ fn note_undecodable(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .attribute_raw(raw);
     if let Some(session_id) = session_id.filter(|_| may_carry_lineage(raw)) {
-        mailbox.note_undecodable(&session_id);
+        mailbox.note_dropped(&session_id);
     }
 }
 
-/// Handle one event, containing any panic rather than letting it cross the ABI boundary.
-///
-/// The SDK wraps the plugin *entry* symbol in `catch_unwind`, but not each subscriber invocation --
-/// that is ours to do, and it is the difference between a dropped event and a dead agent.
-fn observe(
-    tally: &Arc<Tally>,
-    router: &Mutex<SessionRouter>,
-    mailbox: &Arc<Mailbox>,
-    event: &Event,
-) {
+/// Handle one event. A panic here is contained and counted by the subscriber's trampoline.
+fn observe(tally: &Tally, router: &Mutex<SessionRouter>, mailbox: &Mailbox, event: &Event) {
     tally.seen.fetch_add(1, Ordering::Relaxed);
 
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        // Attribute every event, including the ones that carry no lineage themselves: an LLM scope
-        // start classifies to nothing, but it is the parent that lets its children be attributed.
-        //
-        // A poisoned lock is recovered from rather than propagated. Poisoning means an earlier
-        // callback panicked while holding it -- already counted below -- and the router behind it is
-        // a map that may have missed one insert, not corrupt state. Treating poisoning as fatal
-        // would turn one dropped event into a session that silently records nothing from then on.
-        let session_id = router
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .attribute(event);
-        // Relay's own timestamp, never wall-clock at ingest: the two capture paths must not disagree
-        // on when something happened just because one of them replayed it later.
-        let at = event.timestamp().to_rfc3339();
-        classify(event).map(|lineage| (session_id, at, lineage))
-    }));
-
-    match outcome {
-        Ok(Some((Some(session_id), at, lineage))) => {
-            tally.classified.fetch_add(1, Ordering::Relaxed);
-            // Hand off and return. Everything expensive -- hashing, signing, writing -- happens on
-            // the mailbox's own thread, so a slow recorder cannot become a slow agent.
-            if !mailbox.send(&session_id, at, lineage) {
-                tally.queue_overflow.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        Ok(Some((None, _at, _lineage))) => {
-            tally.unattributed.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(None) => {}
-        Err(_) => {
-            tally.panicked.fetch_add(1, Ordering::Relaxed);
-        }
+    // Attribute every event, including the ones that carry no lineage themselves: an LLM scope
+    // start classifies to nothing, but it is the parent that lets its children be attributed.
+    //
+    // A poisoned lock is recovered from rather than propagated. Poisoning means an earlier callback
+    // panicked while holding it, and the router behind it is a map that may have missed one insert,
+    // not corrupt state. Treating poisoning as fatal would turn one dropped event into a session
+    // that silently records nothing from then on.
+    let session_id = router
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .attribute(event);
+    let Some(lineage) = classify(event) else {
+        return;
+    };
+    let Some(session_id) = session_id else {
+        tally.unattributed.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    tally.classified.fetch_add(1, Ordering::Relaxed);
+    // Relay's own timestamp, never wall-clock at ingest: the two capture paths must not disagree
+    // on when something happened just because one of them replayed it later.
+    let at = event.timestamp().to_rfc3339();
+    // Hand off and return. Everything expensive -- hashing, signing, writing -- happens on the
+    // mailbox's own thread, so a slow recorder cannot become a slow agent.
+    if !mailbox.send(&session_id, at, lineage) {
+        tally.queue_overflow.fetch_add(1, Ordering::Relaxed);
     }
 }
 

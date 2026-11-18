@@ -20,7 +20,7 @@ This crate registers a third subscriber on the same stream, as a peer rather tha
 their output files:
 
 ```rust
-ctx.register_subscriber("eqty_lineage", move |event: &Event| { … })?;
+subscriber::register(ctx, "eqty_lineage", Box::new(move |delivery| { … }))?;
 ```
 
 That matters for fidelity. We see raw events before ATIF normalization drops marks and before ATOF

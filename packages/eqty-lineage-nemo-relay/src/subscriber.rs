@@ -1,11 +1,8 @@
 //! The event subscriber, registered through the raw ABI so that events are decoded by us.
 //!
-//! `ssi` (via `did-ethr`) turns on serde_json's `arbitrary_precision` for this whole cdylib. Under
-//! that feature, `from_str` cannot decode an `f64` that sits behind `#[serde(flatten)]` -- the
-//! buffered number arrives as a map -- and Relay's `CategoryProfile::time_to_first_chunk` is one.
-//! The SDK's typed `register_subscriber` decodes with `from_str` and drops the event on error, so
-//! every streaming LLM scope end, the half carrying the response, would never reach us. Decoding
-//! through a `Value` first does not hit that path.
+//! `ssi` turns on serde_json's `arbitrary_precision` for this whole cdylib, and under it `from_str`
+//! cannot decode an `f64` behind `#[serde(flatten)]`, which every streamed LLM scope end carries.
+//! The SDK's typed `register_subscriber` decodes that way and drops the event on error.
 
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,8 +12,16 @@ use nemo_relay_plugin::{
     Result,
 };
 
-/// Called with the event's JSON when it parsed but did not decode, and `None` when it did not parse.
-pub type OnUndecodable = Box<dyn Fn(Option<&Json>) + Send + Sync>;
+/// What the handler is given for one host callback.
+pub enum Delivery<'a> {
+    Event(&'a Event),
+    /// The event's JSON when it parsed but did not decode, and `None` when it did not parse.
+    Undecodable(Option<&'a Json>),
+    /// Handling the event panicked, and the panic was contained.
+    Panicked,
+}
+
+pub type Handler = Box<dyn Fn(Delivery<'_>) + Send + Sync>;
 
 /// Decode one event as Relay serialized it.
 pub fn decode_event(json: &str) -> Option<Event> {
@@ -24,82 +29,65 @@ pub fn decode_event(json: &str) -> Option<Event> {
     serde_json::from_value(value).ok()
 }
 
-struct Subscriber<F> {
+struct Subscriber {
     host: NemoRelayNativeHostApiV1,
-    on_event: F,
-    on_undecodable: OnUndecodable,
+    handler: Handler,
 }
 
-/// Register `on_event` for every event Relay emits; `on_undecodable` accounts for the rest.
-pub fn register<F>(
-    ctx: &mut PluginContext<'_>,
-    name: &str,
-    on_event: F,
-    on_undecodable: OnUndecodable,
-) -> Result<()>
-where
-    F: Fn(&Event) + Send + Sync + 'static,
-{
+/// Register `handler` for every event Relay emits.
+pub fn register(ctx: &mut PluginContext<'_>, name: &str, handler: Handler) -> Result<()> {
     let user_data = Box::into_raw(Box::new(Subscriber {
         host: *ctx.host_api(),
-        on_event,
-        on_undecodable,
+        handler,
     })) as *mut c_void;
     // The host owns `user_data` from here, and frees it through `release` on failure too.
-    let status = unsafe {
-        ctx.register_subscriber_raw(name, trampoline::<F>, user_data, Some(release::<F>))
-    };
+    let status = unsafe { ctx.register_subscriber_raw(name, trampoline, user_data, Some(release)) };
     match status {
         NemoRelayStatus::Ok => Ok(()),
         status => Err(format!("subscriber registration failed: {status:?}")),
     }
 }
 
-unsafe extern "C" fn trampoline<F>(
+unsafe extern "C" fn trampoline(
     user_data: *mut c_void,
     event_json: *const NemoRelayNativeString,
-) -> NemoRelayStatus
-where
-    F: Fn(&Event) + Send + Sync + 'static,
-{
+) -> NemoRelayStatus {
     if user_data.is_null() || event_json.is_null() {
         return NemoRelayStatus::NullPointer;
     }
-    let state = unsafe { &*(user_data as *const Subscriber<F>) };
+    let state = unsafe { &*(user_data as *const Subscriber) };
     // A panic must not unwind across `extern "C"`.
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let text = unsafe { read(&state.host, event_json) };
         match text.as_deref().and_then(decode_event) {
             Some(event) => {
-                (state.on_event)(&event);
+                (state.handler)(Delivery::Event(&event));
                 true
             }
             None => {
                 let raw = text.and_then(|text| serde_json::from_str::<Json>(&text).ok());
-                (state.on_undecodable)(raw.as_ref());
+                (state.handler)(Delivery::Undecodable(raw.as_ref()));
                 false
             }
         }
     }));
-    // A non-`Ok` status is what puts the loss in the host's diagnostics.
+    // A non-`Ok` status puts the loss in the host's diagnostics. The host sets the last error for
+    // it, replacing any set here.
     match outcome {
         Ok(true) => NemoRelayStatus::Ok,
-        Ok(false) => {
-            set_last_error(&state.host, "event could not be decoded");
-            NemoRelayStatus::InvalidJson
-        }
+        Ok(false) => NemoRelayStatus::InvalidJson,
         Err(_) => {
-            set_last_error(&state.host, "subscriber callback panicked");
+            let _ = catch_unwind(AssertUnwindSafe(|| (state.handler)(Delivery::Panicked)));
             NemoRelayStatus::Internal
         }
     }
 }
 
-unsafe extern "C" fn release<F>(user_data: *mut c_void) {
+unsafe extern "C" fn release(user_data: *mut c_void) {
     if user_data.is_null() {
         return;
     }
-    let state = unsafe { Box::from_raw(user_data as *mut Subscriber<F>) };
+    let state = unsafe { Box::from_raw(user_data as *mut Subscriber) };
     let host = state.host;
     // Dropping the last mailbox handle flushes sessions and joins the worker; a panic in that must
     // not unwind across `extern "C"`.

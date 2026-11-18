@@ -2328,7 +2328,7 @@ fn work_done_while_several_subagents_run_says_it_cannot_tell_which() {
 }
 
 #[test]
-fn an_undecodable_event_is_charged_only_to_a_session_that_exists() {
+fn a_loss_is_charged_even_before_its_session_opens() {
     let into = TempDir::new().expect("a temp dir");
     let session = "01a040aa-0000-0000-0000-000000000f62";
     let router = Arc::new(Mutex::new(SessionRouter::new()));
@@ -2340,9 +2340,13 @@ fn an_undecodable_event_is_charged_only_to_a_session_that_exists() {
         ignore_marks(),
     );
 
-    // Before the session exists, and for one that never will: neither may be held anywhere.
-    mailbox.note_undecodable(session);
-    mailbox.note_undecodable("never-created");
+    // The first event of a session is the one whose loss matters most, and nothing has opened the
+    // session yet when it is lost.
+    mailbox.note_dropped(session);
+    // Enough never-opened sessions to force the stale counts to be shed.
+    for stale in 0..2000 {
+        mailbox.note_dropped(&format!("never-opened-{stale}"));
+    }
     for event in &full_session(session) {
         let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
             continue;
@@ -2351,15 +2355,15 @@ fn an_undecodable_event_is_charged_only_to_a_session_that_exists() {
             mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
         }
     }
-    mailbox.note_undecodable(session);
+    mailbox.note_dropped(session);
     drop(mailbox);
 
     let written = manifests(&into);
-    assert_eq!(written.len(), 1, "a loss alone does not create a session");
+    assert_eq!(written.len(), 1, "a loss alone does not open a session");
     let decoded = decoded_blobs(&written[0]);
     assert!(
-        decoded.contains("\"EventsDropped\":1"),
-        "only the loss the session was open for is charged:\n{decoded}"
+        decoded.contains("\"EventsDropped\":2"),
+        "shedding stale counts must keep the open session's:\n{decoded}"
     );
 }
 
