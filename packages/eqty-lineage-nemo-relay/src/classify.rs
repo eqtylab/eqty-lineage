@@ -115,7 +115,7 @@ pub enum LineageEvent {
     ModelCallStarted {
         call_id: String,
         request: Arc<AnnotatedLlmRequest>,
-        /// Relay's id for the upstream request, which a provider gateway can index its record by.
+        /// Relay's id for the upstream request. A provider gateway indexes its record by it.
         request_id: Option<String>,
     },
     /// A model call completed.

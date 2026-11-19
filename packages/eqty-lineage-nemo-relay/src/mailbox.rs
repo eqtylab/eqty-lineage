@@ -82,8 +82,8 @@ struct OpenTool {
 struct SessionState {
     recorder: Recorder,
     open_tools: HashMap<String, OpenTool>,
-    /// Model calls whose request has arrived and whose response has not, keyed by scope UUID, with
-    /// Relay's id for the upstream request.
+    /// Model calls that have started but not finished, keyed by scope UUID. Each keeps Relay's id
+    /// for the upstream request.
     open_calls: HashMap<String, (Arc<AnnotatedLlmRequest>, Option<String>)>,
     /// The agent that ran the session.
     agent: Option<AssetRef>,
@@ -236,7 +236,7 @@ impl Mailbox {
         )
     }
 
-    /// [`Self::start`], also merging in the manifests `providers` signed for the session's calls.
+    /// Like [`Self::start`], and also merges in the manifests `providers` signed for the calls.
     pub fn start_with_providers(
         manifest_dir: PathBuf,
         policy: Policy,
@@ -945,8 +945,8 @@ async fn record_model_call(
     if matches!(recorded, Ok(true)) {
         state.turn_prompt_attributed = true;
         if let Some(request_id) = request_id {
-            // The name the agent asked for, which is what a `models` filter is written against. The
-            // one that answered can be a dated or deployment name the operator never typed.
+            // Use the model name the agent asked for, because `models` filters are written against
+            // it. The name in the response can be a dated or deployment name.
             let served = response
                 .as_ref()
                 .and_then(|response| response.model.clone());
@@ -1360,8 +1360,8 @@ fn export(
     };
     let checkpoint = state.path.clone();
 
-    // Fetched here and not as each call ends: the gateway writes its record after the response, and
-    // a wait belongs at export, which nothing is waiting on, rather than in front of the next event.
+    // Fetch at export, not as each call ends. The gateway writes its record after the response,
+    // and waiting here does not hold up this session's next event.
     let wanted = state.recorder.provider_requests();
     let mut fetched = if providers.is_empty() {
         HashMap::new()

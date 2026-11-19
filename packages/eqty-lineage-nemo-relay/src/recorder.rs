@@ -127,15 +127,15 @@ struct ModelCall {
     /// addressed by its fields. Stamping them all at export instead collapses the session's calls
     /// into one statement and leaves every description of the others hanging off it.
     at: Option<String>,
-    /// Relay's id for the upstream request and the model that served it, when the event carried one.
+    /// Relay's id for the upstream request and the model the call asked for, if the event had one.
     provider_request: Option<(String, Option<String>)>,
-    /// The provider's own record of this call, once its manifest has been fetched.
+    /// The provider's record of this call, set once its manifest has been fetched.
     provider: Option<ProviderLink>,
 }
 
-/// Where a model call joins the manifest its provider signed for it.
+/// The nodes in the provider's manifest that a model call links to.
 struct ProviderLink {
-    /// The provider's id for the call.
+    /// The provider's own id for the call.
     request_id: String,
     client_request: Option<AssetRef>,
     response: Option<AssetRef>,
@@ -712,14 +712,14 @@ impl Recorder {
         Ok(true)
     }
 
-    /// Say which upstream request the call just recorded was, so its provider can be asked for it.
+    /// Record which upstream request the last recorded call was, so its provider can be asked.
     pub fn note_provider_request(&mut self, relay_request_id: String, model: Option<String>) {
         if let Some(call) = self.calls.last_mut() {
             call.provider_request = Some((relay_request_id, model));
         }
     }
 
-    /// Every recorded call that names its upstream request, as `(relay request id, model)`.
+    /// Every recorded call that has an upstream request id, as `(relay request id, model)`.
     pub fn provider_requests(&self) -> Vec<(String, Option<String>)> {
         self.calls
             .iter()
@@ -727,10 +727,10 @@ impl Recorder {
             .collect()
     }
 
-    /// Join a call to the nodes its provider's manifest registered for the same request.
+    /// Link a call to the nodes its provider's manifest registered for the same request.
     ///
-    /// The provider's bytes are staged, not registered: the provider's own statements, merged in at
-    /// export, are what say what they are. Staging them is what lets a computation of ours name them.
+    /// The provider's bytes are stored but not registered by us. The provider's own statements,
+    /// merged at export, describe them. Storing them is what lets our computation refer to them.
     pub fn link_provider(
         &mut self,
         relay_request_id: &str,
@@ -760,9 +760,8 @@ impl Recorder {
         Ok(())
     }
 
-    /// A call whose provider gave no manifest. `key_unset` is the one cause that is the host's to
-    /// fix rather than the gateway's: the variable naming the gateway key was not set, so it was
-    /// never asked.
+    /// Count a call whose provider gave no manifest. `key_unset` means the variable holding the
+    /// gateway key was not set, so the gateway was never asked. That one is for the host to fix.
     pub fn note_provider_manifest_missing(&mut self, key_unset: bool) {
         self.count(if key_unset {
             "ProviderKeyUnset"
@@ -1105,9 +1104,9 @@ impl Recorder {
                 )
                 .await?;
 
-            // The two graphs share no content: the provider hashes its own serialization of a body
-            // Relay re-encodes before a plugin sees it. So the join is stated, and says what it
-            // rests on, rather than left for a reader to infer from an id in two places.
+            // The two graphs share no content ids, because the provider hashes its own copy of a
+            // body that Relay re-encodes before a plugin sees it. So the link is written as a
+            // statement that says how it was matched.
             let (Some(link), Some((relay_request_id, _))) = (call.provider, call.provider_request)
             else {
                 continue;

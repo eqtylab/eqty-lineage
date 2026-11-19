@@ -46,7 +46,7 @@ pub struct Config {
     pub deny_globs: Vec<String>,
     /// Ceiling on stored content size, in bytes.
     pub max_content_bytes: u64,
-    /// Gateways asked for the manifest they signed for a model call. None by default.
+    /// Gateways to ask for the manifest they signed for each model call. Empty by default.
     pub provider_manifests: Vec<Provider>,
 }
 
@@ -144,10 +144,10 @@ impl Config {
     }
 }
 
-/// One `provider_manifests` entry, or `None` when any part of it is malformed.
+/// Parse one `provider_manifests` entry. Returns `None` if any part of it is malformed.
 ///
-/// An unknown key is refused rather than ignored: a misspelt `models` would otherwise send the
-/// gateway key with every model's request ids.
+/// Unknown keys are refused, not ignored. A misspelt `models` would otherwise match every model
+/// and send the gateway key with all of their request ids.
 fn provider(entry: &Json) -> Option<Provider> {
     let entry = entry.as_object()?;
     if !entry
