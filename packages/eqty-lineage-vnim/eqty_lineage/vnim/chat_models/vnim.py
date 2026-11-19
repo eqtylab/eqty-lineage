@@ -55,6 +55,7 @@ class _ResponseBodyCapturingStream(httpx.SyncByteStream):
         self._on_complete = on_complete
         self._body = bytearray()
         self._recorded = False
+        self._exhausted = False
 
     def _record_if_complete(self) -> None:
         if self._recorded:
@@ -64,7 +65,9 @@ class _ResponseBodyCapturingStream(httpx.SyncByteStream):
         # then closes the HTTPX response instead of exhausting the transport iterator.
         # That is nevertheless a complete vNIM response body; retain the bytes exactly
         # as received and use the marker only to decide whether recording is safe.
-        if body.rstrip().endswith(b"data: [DONE]"):
+        # A plain (non-streamed) JSON response has no terminal event: it is complete
+        # once the transport iterator is exhausted.
+        if self._exhausted or body.rstrip().endswith(b"data: [DONE]"):
             self._recorded = True
             self._on_complete(body)
 
@@ -73,6 +76,7 @@ class _ResponseBodyCapturingStream(httpx.SyncByteStream):
             for chunk in self._stream:
                 self._body.extend(chunk)
                 yield chunk
+            self._exhausted = True
         finally:
             self._record_if_complete()
 
