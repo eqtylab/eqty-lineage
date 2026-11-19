@@ -266,7 +266,7 @@ Relay shows a plugin no response headers, so the gateway's own request id never 
 sides see is the `x-nemo-relay-request-id` Relay puts on every upstream request. The gateway indexes
 its record by it (`GET /integrity/logs/by-client-request-id/{id}`), and the record names the
 manifest (`GET /integrity/manifest/{request_id}`). The gateway has to serve the first route:
-`litellm-eqty-plugin` does from the release that captures `EQTY_CLIENT_REQUEST_ID_HEADER`.
+`litellm-eqty-plugin` does, and `EQTY_CLIENT_REQUEST_ID_HEADER` there names the header it captures.
 
 The two graphs share no content id. The gateway hashes its own serialization of each body, and
 Relay hands a plugin a re-encoded one whose input is cut down after the first call of a turn. So
