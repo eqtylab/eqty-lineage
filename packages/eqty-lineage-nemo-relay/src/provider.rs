@@ -89,7 +89,11 @@ pub async fn fetch_all(
     calls: Vec<(String, Option<String>, Instant)>,
 ) -> HashMap<String, Fetched> {
     let keys: Vec<_> = providers.iter().map(Provider::key).collect();
-    let Ok(client) = reqwest::Client::builder().build() else {
+    // The key must not follow a redirect off the configured origin or down to plain http.
+    let builder = || reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // Plain http is only allowed to loopback, which never needs a proxy, and a proxy would see the
+    // key in clear. An https gateway keeps the environment's proxy: the key stays inside TLS.
+    let (Ok(proxied), Ok(direct)) = (builder().build(), builder().no_proxy().build()) else {
         return HashMap::new();
     };
     let deadline = Instant::now() + SESSION_BUDGET;
@@ -103,7 +107,11 @@ pub async fn fetch_all(
             Some((id, base, key, ended))
         })
         .map(|(id, base, key, ended)| {
-            let client = &client;
+            let client = if base.starts_with("http://") {
+                &direct
+            } else {
+                &proxied
+            };
             async move {
                 let found = fetch_one(client, base, key, &id, ended, deadline).await;
                 found.map(|found| (id, found))
@@ -368,6 +376,16 @@ mod tests {
     }
 
     #[test]
+    fn a_loopback_gateway_is_asked_directly_even_when_a_proxy_is_set() {
+        // Safe: every other test in this binary uses a client that ignores the proxy variables.
+        unsafe { std::env::set_var("HTTP_PROXY", "http://127.0.0.1:9") };
+        let (url, hits) = gateway(|_| (200, r#"{"status":"failed"}"#));
+        assert!(fetch_ended(url, Instant::now()).is_empty());
+        unsafe { std::env::remove_var("HTTP_PROXY") };
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_404_for_a_call_that_ended_long_ago_is_given_up_early() {
         let (url, hits) = gateway(|_| (404, "{}"));
         let long_ago = Instant::now() - Duration::from_secs(60);
@@ -412,7 +430,13 @@ mod tests {
             .build()
             .expect("a runtime");
         let read = runtime.block_on(async {
-            let response = reqwest::get(&url).await.expect("a response");
+            let client = reqwest::Client::builder().no_proxy().build();
+            let response = client
+                .expect("a client")
+                .get(&url)
+                .send()
+                .await
+                .expect("a response");
             read_capped(response, 64 * 1024).await
         });
         assert!(matches!(read, Err(Miss::Refused)));
