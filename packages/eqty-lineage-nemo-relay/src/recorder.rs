@@ -30,6 +30,7 @@
 //! different secrets into one version, because both scrub to the same placeholder.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use anyhow::Result;
 use integrity::cid::blake3::blake3_cid_raw_binary;
@@ -127,8 +128,9 @@ struct ModelCall {
     /// addressed by its fields. Stamping them all at export instead collapses the session's calls
     /// into one statement and leaves every description of the others hanging off it.
     at: Option<String>,
-    /// Relay's id for the upstream request and the model the call asked for, if the event had one.
-    provider_request: Option<(String, Option<String>)>,
+    /// Relay's id for the upstream request, the model the call asked for, and when it ended, if
+    /// the event had an id.
+    provider_request: Option<(String, Option<String>, Instant)>,
     /// The provider's record of this call, set once its manifest has been fetched.
     provider: Option<ProviderLink>,
 }
@@ -715,12 +717,12 @@ impl Recorder {
     /// Record which upstream request the last recorded call was, so its provider can be asked.
     pub fn note_provider_request(&mut self, relay_request_id: String, model: Option<String>) {
         if let Some(call) = self.calls.last_mut() {
-            call.provider_request = Some((relay_request_id, model));
+            call.provider_request = Some((relay_request_id, model, Instant::now()));
         }
     }
 
-    /// Every recorded call that has an upstream request id, as `(relay request id, model)`.
-    pub fn provider_requests(&self) -> Vec<(String, Option<String>)> {
+    /// Every recorded call that has an upstream request id, as `(relay request id, model, ended)`.
+    pub fn provider_requests(&self) -> Vec<(String, Option<String>, Instant)> {
         self.calls
             .iter()
             .filter_map(|call| call.provider_request.clone())
@@ -747,7 +749,7 @@ impl Recorder {
         let Some(call) = self.calls.iter_mut().find(|call| {
             call.provider_request
                 .as_ref()
-                .is_some_and(|(id, _)| id == relay_request_id)
+                .is_some_and(|(id, _, _)| id == relay_request_id)
         }) else {
             return Ok(());
         };
@@ -1107,7 +1109,8 @@ impl Recorder {
             // The two graphs share no content ids, because the provider hashes its own copy of a
             // body that Relay re-encodes before a plugin sees it. So the link is written as a
             // statement that says how it was matched.
-            let (Some(link), Some((relay_request_id, _))) = (call.provider, call.provider_request)
+            let (Some(link), Some((relay_request_id, _, _))) =
+                (call.provider, call.provider_request)
             else {
                 continue;
             };

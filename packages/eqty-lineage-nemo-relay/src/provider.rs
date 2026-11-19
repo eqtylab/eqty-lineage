@@ -22,9 +22,11 @@ const RETRY_EVERY: Duration = Duration::from_millis(500);
 /// The most time one session's export may spend waiting on gateways. Every session's events queue
 /// behind this wait, and on Codex it happens at gateway shutdown.
 const SESSION_BUDGET: Duration = Duration::from_secs(10);
-/// How long a 404 is retried. The gateway writes its record soon after the response, and a call it
-/// never saw answers 404 for good.
+/// How long a 404 is retried, at least. A call the gateway never saw answers 404 for good.
 const NOT_FOUND_BUDGET: Duration = Duration::from_secs(3);
+/// How long after a call ends the gateway may still be writing its record. A 404 for a call that
+/// ended more recently than this is retried until this has passed.
+const RECORD_WRITE: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Calls asked about at once. Enough to fit a long session in the budget without flooding the
 /// gateway.
@@ -78,13 +80,13 @@ fn is_safe_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
-/// Fetch the provider manifest for each `(relay request id, model)` call, keyed by relay request
-/// id. A call with no manifest is left out of the result.
+/// Fetch the provider manifest for each `(relay request id, model, ended)` call, keyed by relay
+/// request id. A call with no manifest is left out of the result.
 ///
 /// Only the first provider whose `models` match a call is asked about it.
 pub async fn fetch_all(
     providers: &[Provider],
-    calls: Vec<(String, Option<String>)>,
+    calls: Vec<(String, Option<String>, Instant)>,
 ) -> HashMap<String, Fetched> {
     let keys: Vec<_> = providers.iter().map(Provider::key).collect();
     let Ok(client) = reqwest::Client::builder().build() else {
@@ -93,16 +95,17 @@ pub async fn fetch_all(
     let deadline = Instant::now() + SESSION_BUDGET;
     let asks = calls
         .into_iter()
-        .filter(|(id, _)| is_safe_id(id))
-        .filter_map(|(id, model)| {
+        .filter(|(id, _, _)| is_safe_id(id))
+        .filter_map(|(id, model, ended)| {
             let provider = providers.iter().position(|p| p.serves(model.as_deref()))?;
             let key = keys[provider].as_ref().ok()?.as_deref();
-            Some((id, providers[provider].base_url.trim_end_matches('/'), key))
+            let base = providers[provider].base_url.trim_end_matches('/');
+            Some((id, base, key, ended))
         })
-        .map(|(id, base, key)| {
+        .map(|(id, base, key, ended)| {
             let client = &client;
             async move {
-                let found = fetch_one(client, base, key, &id, deadline).await;
+                let found = fetch_one(client, base, key, &id, ended, deadline).await;
                 found.map(|found| (id, found))
             }
         });
@@ -119,10 +122,14 @@ async fn fetch_one(
     base: &str,
     key: Option<&str>,
     id: &str,
+    ended: Instant,
     deadline: Instant,
 ) -> Option<Fetched> {
-    // A 404 also means "a call this gateway never saw", so it gets less time than "fetching".
-    let not_found_deadline = deadline.min(Instant::now() + NOT_FOUND_BUDGET);
+    // A 404 also means "a call this gateway never saw", so it gets less time than "fetching",
+    // unless the call ended so recently that its record may not be written yet.
+    let not_found_deadline = (Instant::now() + NOT_FOUND_BUDGET)
+        .max(ended + RECORD_WRITE)
+        .min(deadline);
     loop {
         let left = deadline.checked_duration_since(Instant::now())?;
         let ask = Ask {
@@ -321,6 +328,71 @@ pub fn merge(ours: &mut Json, theirs: Json) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gateway that answers every request with `answer(hits so far)`, and counts the hits.
+    fn gateway(
+        answer: impl Fn(usize) -> (u16, &'static str) + Send + 'static,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.read(&mut [0u8; 4096]);
+                let (status, body) = answer(counted.fetch_add(1, Ordering::SeqCst));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, hits)
+    }
+
+    fn fetch_ended(url: String, ended: Instant) -> HashMap<String, Fetched> {
+        let provider = Provider {
+            base_url: url,
+            api_key_env: None,
+            models: Vec::new(),
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(fetch_all(&[provider], vec![("call-1".into(), None, ended)]))
+    }
+
+    #[test]
+    fn a_404_for_a_call_that_ended_long_ago_is_given_up_early() {
+        let (url, hits) = gateway(|_| (404, "{}"));
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        let started = Instant::now();
+        assert!(fetch_ended(url, long_ago).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "a 404 is retried"
+        );
+    }
+
+    #[test]
+    fn a_404_for_a_call_that_just_ended_is_retried_until_the_gateway_has_had_time_to_record_it() {
+        // 404 for about 4 s, past the short window, then an answer that ends the wait.
+        let (url, hits) = gateway(|hit| {
+            if hit < 8 {
+                (404, "{}")
+            } else {
+                (200, r#"{"status":"failed"}"#)
+            }
+        });
+        assert!(fetch_ended(url, Instant::now()).is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 9);
+    }
 
     #[test]
     fn a_body_over_the_limit_is_refused_before_it_has_all_arrived() {

@@ -1369,7 +1369,7 @@ fn export(
         runtime.block_on(provider::fetch_all(providers, wanted.clone()))
     };
     let mut provider_manifests = Vec::new();
-    for (relay_request_id, model) in wanted {
+    for (relay_request_id, model, _) in wanted {
         let Some(found) = fetched.remove(&relay_request_id) else {
             if let Some(provider) = providers
                 .iter()

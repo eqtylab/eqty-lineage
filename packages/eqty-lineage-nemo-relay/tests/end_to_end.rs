@@ -3993,24 +3993,3 @@ fn a_gateway_that_refuses_the_connection_is_not_retried() {
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\""));
 }
-
-#[test]
-fn a_call_the_gateway_never_saw_is_given_up_before_the_session_budget() {
-    let (base_url, seen) = gateway(|_, _| (404, "{}".into()));
-
-    let started = std::time::Instant::now();
-    let ours = replay_linked(
-        &call_sent_as("01a040aa-0000-0000-0000-0000000000ba", "relay-request-10"),
-        Provider {
-            base_url,
-            api_key_env: None,
-            models: Vec::new(),
-        },
-    );
-    assert!(started.elapsed() < std::time::Duration::from_secs(6));
-    assert!(
-        seen.lock().expect("the hits lock").len() > 1,
-        "a 404 is retried"
-    );
-    assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\":1"));
-}
