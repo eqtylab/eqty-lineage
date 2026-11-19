@@ -68,6 +68,7 @@ into an iroh collection per type, and a mark for it on Relay's own event stream.
 | seals the conversation into iroh collections | yes — `tests/end_to_end.rs`, `src/recorder.rs` |
 | announces the document as a mark | yes — `tests/end_to_end.rs` |
 | a live session writes a manifest | yes — Claude Code and Codex |
+| merges the manifest a provider gateway signed for a call | yes — `tests/end_to_end.rs`; live through LiteLLM |
 | a live session writes **file** lineage | yes on Claude Code — `FileRead: 5`, `FileWritten: 3` |
 | the same, on Codex | `apply_patch` only — every read is a shell command, so `FileRead: 0` |
 
@@ -183,6 +184,44 @@ whatever a tool result put into the conversation, and neither is attributed to a
 So `deny_globs` withholds a file's node and the tool payloads named against it, and nothing further.
 It is a floor rather than a guarantee. A session that reads secrets through a shell is outside it,
 and so is the conversation that read carried.
+
+## Merging a provider gateway's manifest
+
+A gateway in front of the model, such as LiteLLM with the EQTY plugin, signs a manifest of its own
+for each call: routing, guardrails, attestation evidence. Configured with where that gateway is, this
+plugin fetches each call's manifest at export, merges all of it into the session's, and joins the
+two.
+
+```toml
+[[plugins.dynamic.config.provider_manifests]]
+base_url    = "http://localhost:4000"
+api_key_env = "OPENAI_API_KEY"     # the variable Relay takes the agent's key from
+models      = ["gpt-6-astra-*"]    # omit to ask about every model
+```
+
+Off unless configured. The gateway key is sent with each lookup, so `models` should name only what
+is served through that gateway: Relay shows a plugin the model and the route, never the upstream
+host.
+
+**The join is by request id, and says so.** Relay shows a plugin no response headers, so the
+gateway's own request id never arrives. What both sides see is the `x-nemo-relay-request-id` Relay
+puts on every upstream request. The gateway indexes its record by it
+(`GET /integrity/logs/by-client-request-id/{id}`), and the record names the manifest
+(`GET /integrity/manifest/{request_id}`).
+
+The two graphs share no content id. The gateway hashes its own serialization of each body, and
+Relay hands a plugin a re-encoded one whose input is cut down after the first call of a turn. So
+each joined call gets two `provider_link` computations, signed by this plugin and marked
+`matchedBy: x-nemo-relay-request-id`: one from the session's prompts to the gateway's `Client
+Request`, one from its `Delivered Response` (or `Response Body`) to the session's completions.
+
+Coverage counts `ProviderManifestMerged` and `ProviderManifestMissing`. A call is missing when the
+gateway has no record for it, the record failed, or the wait ran out: the gateway writes its record
+after the response, so a lookup is retried for a bounded time at export. A call that failed at the
+provider has no record to find.
+
+Provider statements are merged as the JSON the gateway served, never decoded and re-encoded, so each
+still hashes to the id its credential signed.
 
 ## Running it against a live session
 

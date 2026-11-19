@@ -31,6 +31,7 @@ use crate::files::{
     FileMode, FileObserved, file_events_from_patch, file_events_from_result, paths_in_patch,
 };
 use crate::lineage::{AssetRef, LineageSession};
+use crate::provider::{self, Provider};
 use crate::recorder::Recorder;
 use crate::redaction::Policy;
 
@@ -81,8 +82,9 @@ struct OpenTool {
 struct SessionState {
     recorder: Recorder,
     open_tools: HashMap<String, OpenTool>,
-    /// Model calls whose request has arrived and whose response has not, keyed by scope UUID.
-    open_calls: HashMap<String, Arc<AnnotatedLlmRequest>>,
+    /// Model calls whose request has arrived and whose response has not, keyed by scope UUID, with
+    /// Relay's id for the upstream request.
+    open_calls: HashMap<String, (Arc<AnnotatedLlmRequest>, Option<String>)>,
     /// The agent that ran the session.
     agent: Option<AssetRef>,
     /// The prompt that opened the current turn, and an input to everything it caused.
@@ -224,6 +226,25 @@ impl Mailbox {
         on_finished: SessionFinished,
         on_manifest: ManifestAnnounced,
     ) -> Self {
+        Self::start_with_providers(
+            manifest_dir,
+            policy,
+            signer,
+            on_finished,
+            on_manifest,
+            Vec::new(),
+        )
+    }
+
+    /// [`Self::start`], also merging in the manifests `providers` signed for the session's calls.
+    pub fn start_with_providers(
+        manifest_dir: PathBuf,
+        policy: Policy,
+        signer: SignerFactory,
+        on_finished: SessionFinished,
+        on_manifest: ManifestAnnounced,
+        providers: Vec<Provider>,
+    ) -> Self {
         let (sender, receiver) = sync_channel(QUEUE_DEPTH);
         let dropped: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let counts = Arc::clone(&dropped);
@@ -238,6 +259,7 @@ impl Mailbox {
                     counts,
                     on_finished,
                     on_manifest,
+                    providers,
                 )
             })
             .ok();
@@ -346,6 +368,7 @@ pub struct ManifestMark {
 /// plugin supplies a closure over `PluginRuntime`; tests supply one that records.
 pub type ManifestAnnounced = Box<dyn Fn(&ManifestMark) + Send>;
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     receiver: Receiver<Message>,
     manifest_dir: PathBuf,
@@ -354,6 +377,7 @@ fn run(
     dropped: Arc<Mutex<HashMap<String, u64>>>,
     on_finished: SessionFinished,
     on_manifest: ManifestAnnounced,
+    providers: Vec<Provider>,
 ) {
     // A current-thread runtime: this thread is the only one driving these futures, and a
     // multi-threaded pool would add threads to a process we are only supposed to observe.
@@ -415,7 +439,14 @@ fn run(
         };
 
         if finished && let Some(state) = sessions.remove(&session_id) {
-            export(&runtime, &session_id, state, &dropped, &on_manifest);
+            export(
+                &runtime,
+                &session_id,
+                state,
+                &dropped,
+                &on_manifest,
+                &providers,
+            );
             on_finished(&session_id);
         }
     }
@@ -423,7 +454,14 @@ fn run(
     // The channel closed. Everything still open is a session whose agent never told us it ended --
     // which on Codex is every session.
     for (session_id, state) in sessions {
-        export(&runtime, &session_id, state, &dropped, &on_manifest);
+        export(
+            &runtime,
+            &session_id,
+            state,
+            &dropped,
+            &on_manifest,
+            &providers,
+        );
         on_finished(&session_id);
     }
 }
@@ -698,8 +736,12 @@ async fn apply(state: &mut SessionState, event: LineageEvent, at: &str) -> bool 
             )
             .await;
         }
-        LineageEvent::ModelCallStarted { call_id, request } => {
-            state.open_calls.insert(call_id, request);
+        LineageEvent::ModelCallStarted {
+            call_id,
+            request,
+            request_id,
+        } => {
+            state.open_calls.insert(call_id, (request, request_id));
         }
         LineageEvent::ModelCallEnded {
             call_id,
@@ -828,7 +870,7 @@ async fn record_model_call(
     observed: bool,
     at: Option<String>,
 ) {
-    let Some(request) = state.open_calls.remove(call_id) else {
+    let Some((request, request_id)) = state.open_calls.remove(call_id) else {
         return;
     };
 
@@ -902,6 +944,14 @@ async fn record_model_call(
 
     if matches!(recorded, Ok(true)) {
         state.turn_prompt_attributed = true;
+        if let Some(request_id) = request_id {
+            let served = response
+                .as_ref()
+                .and_then(|response| response.model.clone());
+            state
+                .recorder
+                .note_provider_request(request_id, served.or(model.map(str::to_string)));
+        }
     }
 }
 
@@ -1275,6 +1325,7 @@ fn export(
     mut state: SessionState,
     dropped: &Arc<Mutex<HashMap<String, u64>>>,
     on_manifest: &ManifestAnnounced,
+    providers: &[Provider],
 ) {
     // What this session lost, taken out of the shared map so it does not outlive the
     // session it describes -- the same unbounded-growth mistake this export path exists to close.
@@ -1306,10 +1357,55 @@ fn export(
         _ => state.path.clone(),
     };
     let checkpoint = state.path.clone();
+
+    // Fetched here and not as each call ends: the gateway writes its record after the response, and
+    // a wait belongs at export, which nothing is waiting on, rather than in front of the next event.
+    let wanted = state.recorder.provider_requests();
+    let mut fetched = if providers.is_empty() {
+        HashMap::new()
+    } else {
+        runtime.block_on(provider::fetch_all(providers, wanted.clone()))
+    };
+    let mut provider_manifests = Vec::new();
+    for (relay_request_id, model) in wanted {
+        let Some(found) = fetched.remove(&relay_request_id) else {
+            if providers
+                .iter()
+                .any(|provider| provider.serves(model.as_deref()))
+            {
+                state.recorder.note_provider_manifest_missing();
+            }
+            continue;
+        };
+        let linked = state.recorder.link_provider(
+            &relay_request_id,
+            found.request_id,
+            found.client_request.as_deref(),
+            found.response.as_deref(),
+        );
+        if linked.is_ok() {
+            provider_manifests.push(found.manifest);
+        }
+    }
+
     let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
         return;
     };
-    let Ok(json) = serde_json::to_vec_pretty(&manifest) else {
+    let mut statements = manifest.statements.len();
+    let merged = if provider_manifests.is_empty() {
+        serde_json::to_vec_pretty(&manifest)
+    } else {
+        serde_json::to_value(&manifest).and_then(|mut ours| {
+            for theirs in provider_manifests {
+                provider::merge(&mut ours, theirs);
+            }
+            statements = ours["statements"]
+                .as_object()
+                .map_or(statements, |all| all.len());
+            serde_json::to_vec_pretty(&ours)
+        })
+    };
+    let Ok(json) = merged else {
         return;
     };
 
@@ -1335,7 +1431,7 @@ fn export(
         on_manifest(&ManifestMark {
             cid,
             path: path.clone(),
-            statements: manifest.statements.len(),
+            statements,
             unattributed,
         });
     }

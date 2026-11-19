@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use nemo_relay_plugin::{ConfigDiagnostic, DiagnosticLevel, Json};
 use serde_json::Map;
 
+use crate::provider::Provider;
+
 /// Where manifests are written, relative to the directory Relay runs in.
 const DEFAULT_MANIFEST_DIR: &str = ".eqty/manifests";
 
@@ -44,6 +46,8 @@ pub struct Config {
     pub deny_globs: Vec<String>,
     /// Ceiling on stored content size, in bytes.
     pub max_content_bytes: u64,
+    /// Gateways asked for the manifest they signed for a model call. None by default.
+    pub provider_manifests: Vec<Provider>,
 }
 
 impl Default for Config {
@@ -55,6 +59,7 @@ impl Default for Config {
                 .map(|glob| (*glob).to_string())
                 .collect(),
             max_content_bytes: DEFAULT_MAX_CONTENT_BYTES,
+            provider_manifests: Vec::new(),
         }
     }
 }
@@ -119,8 +124,59 @@ impl Config {
             }
         }
 
+        if let Some(value) = raw.get("provider_manifests") {
+            match value
+                .as_array()
+                .map(|entries| entries.iter().map(provider).collect::<Option<Vec<_>>>())
+            {
+                Some(Some(providers)) => config.provider_manifests = providers,
+                _ => diagnostics.push(error(
+                    "provider_manifests.invalid",
+                    "provider_manifests",
+                    "provider_manifests must be an array of tables, each with an http(s) \
+                     base_url, and optionally api_key_env (a non-empty string) and models (an \
+                     array of strings)",
+                )),
+            }
+        }
+
         (config, diagnostics)
     }
+}
+
+/// One `provider_manifests` entry, or `None` when any part of it is malformed.
+///
+/// An unknown key is refused rather than ignored: a misspelt `models` would otherwise send the
+/// gateway key with every model's request ids.
+fn provider(entry: &Json) -> Option<Provider> {
+    let entry = entry.as_object()?;
+    if !entry
+        .keys()
+        .all(|key| matches!(key.as_str(), "base_url" | "api_key_env" | "models"))
+    {
+        return None;
+    }
+    let base_url = entry.get("base_url")?.as_str()?;
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return None;
+    }
+    let api_key_env = match entry.get("api_key_env") {
+        Some(name) => Some(name.as_str().filter(|name| !name.trim().is_empty())?),
+        None => None,
+    };
+    let models = match entry.get("models") {
+        Some(models) => models
+            .as_array()?
+            .iter()
+            .map(|glob| glob.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?,
+        None => Vec::new(),
+    };
+    Some(Provider {
+        base_url: base_url.to_string(),
+        api_key_env: api_key_env.map(str::to_string),
+        models,
+    })
 }
 
 /// `register` refuses on errors alone, never on any diagnostic. That is what lets `deny_globs.empty`

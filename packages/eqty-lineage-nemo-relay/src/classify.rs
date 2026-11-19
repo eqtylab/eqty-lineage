@@ -26,6 +26,8 @@ use nemo_relay_plugin::{
     AnnotatedLlmRequest, AnnotatedLlmResponse, Event, EventCategory, Json, ScopeCategory,
 };
 
+use crate::provider::RELAY_REQUEST_ID;
+
 /// How much Relay trusts its own join between an event and the scope it parented that event to.
 ///
 /// Relay records this on correlated events, and it is the first capture path where the recorder's
@@ -113,6 +115,8 @@ pub enum LineageEvent {
     ModelCallStarted {
         call_id: String,
         request: Arc<AnnotatedLlmRequest>,
+        /// Relay's id for the upstream request, which a provider gateway can index its record by.
+        request_id: Option<String>,
     },
     /// A model call completed.
     ModelCallEnded {
@@ -242,6 +246,11 @@ fn classify_scope(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent
             .map(|request| LineageEvent::ModelCallStarted {
                 call_id: event.uuid().to_string(),
                 request: Arc::clone(request),
+                request_id: string_at(
+                    event.data().and_then(|data| data.get("headers")),
+                    RELAY_REQUEST_ID,
+                )
+                .map(str::to_string),
             }),
         ("llm", true) => Some(LineageEvent::ModelCallEnded {
             call_id: event.uuid().to_string(),

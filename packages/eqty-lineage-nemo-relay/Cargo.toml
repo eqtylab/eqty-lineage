@@ -23,9 +23,13 @@ nemo-relay-plugin = "0.11.1"
 # v0.0.21. `Cargo.lock` is committed and the package recipe builds `--locked`. See README.
 integrity = { git = "https://github.com/eqtylab/integrity", rev = "13af564f0061d7b15819efc99bccef5b6140a1ad", default-features = false, features = ["cid", "jsonld", "vc", "dsse", "lineage", "signer-ed25519", "blob-local", "blob-memory"] }
 anyhow = "1"
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 serde_json = "1"
 uuid = "1"
+# Fetches provider manifests. Both are already in the tree through `integrity`, at these versions
+# and with these features, so naming them adds no crate to the build.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.22"
 
 [dev-dependencies]
 # Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`

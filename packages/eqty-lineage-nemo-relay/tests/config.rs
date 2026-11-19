@@ -103,3 +103,30 @@ fn deny_globs_must_be_strings() {
         "a refused deny list must fall back to the protective default, never to empty"
     );
 }
+
+#[test]
+fn provider_manifests_are_off_by_default_and_refused_whole_when_malformed() {
+    assert!(parse(json!({})).0.provider_manifests.is_empty());
+
+    let (config, codes) = parse(json!({ "provider_manifests": [{
+        "base_url": "http://localhost:4000",
+        "api_key_env": "OPENAI_API_KEY",
+        "models": ["gpt-*"],
+    }] }));
+    assert!(codes.is_empty(), "a complete entry is valid: {codes:?}");
+    assert_eq!(config.provider_manifests[0].models, ["gpt-*"]);
+
+    for broken in [
+        json!([{ "api_key_env": "K" }]),
+        json!([{ "base_url": "localhost:4000" }]),
+        json!([{ "base_url": "http://h", "api_key_env": "" }]),
+        json!([{ "base_url": "http://h", "models": "gpt-*" }]),
+        // A misspelt filter must not widen to every model.
+        json!([{ "base_url": "http://h", "model": ["gpt-*"] }]),
+        json!("http://h"),
+    ] {
+        let (config, codes) = parse(json!({ "provider_manifests": broken }));
+        assert_eq!(codes, ["provider_manifests.invalid"], "{broken}");
+        assert!(config.provider_manifests.is_empty());
+    }
+}

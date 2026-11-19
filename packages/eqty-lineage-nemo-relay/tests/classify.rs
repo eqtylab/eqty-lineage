@@ -365,3 +365,21 @@ fn whatever_classifies_may_carry_lineage() {
         }
     }
 }
+
+/// Relay's id for the upstream request is what a provider gateway indexes its record by.
+#[test]
+fn a_model_call_start_carries_relays_request_id() {
+    let ids: Vec<Option<String>> = fixture()
+        .iter()
+        .filter_map(|event| match classify(event)? {
+            LineageEvent::ModelCallStarted { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .collect();
+    assert!(!ids.is_empty());
+    assert!(
+        ids.iter()
+            .all(|id| id.as_deref().is_some_and(|id| !id.is_empty())),
+        "{ids:?}"
+    );
+}

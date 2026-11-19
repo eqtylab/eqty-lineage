@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use crate::classify::CompactionPhase;
 use crate::files::{FileMode, FileObserved, ReplayRefusal, apply_edit, apply_line_edit};
 use crate::lineage::{AssetRef, LineageSession};
+use crate::provider::RELAY_REQUEST_ID;
 use crate::redaction::{Disposition, Policy};
 
 /// The `(assetType, name)` pairs that are the model's conversation with itself.
@@ -126,6 +127,18 @@ struct ModelCall {
     /// addressed by its fields. Stamping them all at export instead collapses the session's calls
     /// into one statement and leaves every description of the others hanging off it.
     at: Option<String>,
+    /// Relay's id for the upstream request and the model that served it, when the event carried one.
+    provider_request: Option<(String, Option<String>)>,
+    /// The provider's own record of this call, once its manifest has been fetched.
+    provider: Option<ProviderLink>,
+}
+
+/// Where a model call joins the manifest its provider signed for it.
+struct ProviderLink {
+    /// The provider's id for the call.
+    request_id: String,
+    client_request: Option<AssetRef>,
+    response: Option<AssetRef>,
 }
 
 impl Recorder {
@@ -617,7 +630,7 @@ impl Recorder {
                 self.record_actor(
                     "Model",
                     model,
-                    &format!("The model '{model}' that served this call."),
+                    &format!("The model '{model}' this call asked for."),
                     json!({}),
                     at.clone(),
                 )
@@ -692,9 +705,64 @@ impl Recorder {
             describes,
             details,
             at,
+            provider_request: None,
+            provider: None,
         });
         self.count("ModelCall");
         Ok(true)
+    }
+
+    /// Say which upstream request the call just recorded was, so its provider can be asked for it.
+    pub fn note_provider_request(&mut self, relay_request_id: String, model: Option<String>) {
+        if let Some(call) = self.calls.last_mut() {
+            call.provider_request = Some((relay_request_id, model));
+        }
+    }
+
+    /// Every recorded call that names its upstream request, as `(relay request id, model)`.
+    pub fn provider_requests(&self) -> Vec<(String, Option<String>)> {
+        self.calls
+            .iter()
+            .filter_map(|call| call.provider_request.clone())
+            .collect()
+    }
+
+    /// Join a call to the nodes its provider's manifest registered for the same request.
+    ///
+    /// The provider's bytes are staged, not registered: the provider's own statements, merged in at
+    /// export, are what say what they are. Staging them is what lets a computation of ours name them.
+    pub fn link_provider(
+        &mut self,
+        relay_request_id: &str,
+        provider_request_id: String,
+        client_request: Option<&[u8]>,
+        response: Option<&[u8]>,
+    ) -> Result<()> {
+        let client_request = client_request
+            .map(|bytes| self.lineage.stage_content(bytes))
+            .transpose()?;
+        let response = response
+            .map(|bytes| self.lineage.stage_content(bytes))
+            .transpose()?;
+        let Some(call) = self.calls.iter_mut().find(|call| {
+            call.provider_request
+                .as_ref()
+                .is_some_and(|(id, _)| id == relay_request_id)
+        }) else {
+            return Ok(());
+        };
+        call.provider = Some(ProviderLink {
+            request_id: provider_request_id,
+            client_request,
+            response,
+        });
+        self.count("ProviderManifestMerged");
+        Ok(())
+    }
+
+    /// A call whose provider was asked for its manifest and had none to give.
+    pub fn note_provider_manifest_missing(&mut self) {
+        self.count("ProviderManifestMissing");
     }
 
     /// Record that the agent compacted its context.
@@ -1027,9 +1095,50 @@ impl Recorder {
                     &inputs,
                     std::slice::from_ref(&completions),
                     describes,
-                    call.at,
+                    call.at.clone(),
                 )
                 .await?;
+
+            // The two graphs share no content: the provider hashes its own serialization of a body
+            // Relay re-encodes before a plugin sees it. So the join is stated, and says what it
+            // rests on, rather than left for a reader to infer from an id in two places.
+            let (Some(link), Some((relay_request_id, _))) = (call.provider, call.provider_request)
+            else {
+                continue;
+            };
+            let joined = |direction: &str, member: &str, cid: &str| {
+                json!({
+                    "computation_type": "provider_link",
+                    "direction": direction,
+                    "description": "Joins this session's model call to the manifest its provider \
+                                    signed for the same request. Matched by request id, not by \
+                                    identical content.",
+                    "matchedBy": RELAY_REQUEST_ID,
+                    "relayRequestId": relay_request_id,
+                    "providerRequestId": link.request_id,
+                    member: ordinals.get(cid),
+                })
+            };
+            if let (Some(request), Some(prompts)) = (&link.client_request, sealed.get("Prompt")) {
+                self.lineage
+                    .record_computation_described(
+                        std::slice::from_ref(prompts),
+                        std::slice::from_ref(request),
+                        joined("request", "promptMember", &call.prompt),
+                        call.at.clone(),
+                    )
+                    .await?;
+            }
+            if let Some(response) = &link.response {
+                self.lineage
+                    .record_computation_described(
+                        std::slice::from_ref(response),
+                        std::slice::from_ref(&completions),
+                        joined("response", "completionMember", &call.completion),
+                        call.at.clone(),
+                    )
+                    .await?;
+            }
         }
 
         Ok(())
