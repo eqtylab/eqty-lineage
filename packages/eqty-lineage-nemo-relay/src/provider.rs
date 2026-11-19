@@ -220,13 +220,28 @@ impl Ask<'_> {
         if !response.status().is_success() {
             return Err(Miss::Refused);
         }
-        // ponytail: the whole body is read before the size check. Stream it for untrusted gateways.
-        let body = response.bytes().await.map_err(|_| Miss::Unreachable)?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(Miss::Refused);
-        }
+        let body = read_capped(response, MAX_RESPONSE_BYTES).await?;
         serde_json::from_slice(&body).map_err(|_| Miss::Refused)
     }
+}
+
+/// Read a body of at most `limit` bytes. The limit is checked as the body arrives, so a larger
+/// body is never held in memory.
+async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Miss> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(Miss::Refused);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Miss::Unreachable)? {
+        if body.len() + chunk.len() > limit {
+            return Err(Miss::Refused);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// The bytes of the first asset the manifest names with one of `names`, tried in the order given.
@@ -279,4 +294,33 @@ pub fn merge(ours: &mut Json, theirs: Json) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_body_over_the_limit_is_refused_before_it_has_all_arrived() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("a connection");
+            let _ = stream.read(&mut [0u8; 4096]);
+            // No content-length, and the body never ends.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n");
+            while stream.write_all(&[b' '; 4096]).is_ok() {}
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let read = runtime.block_on(async {
+            let response = reqwest::get(&url).await.expect("a response");
+            read_capped(response, 64 * 1024).await
+        });
+        assert!(matches!(read, Err(Miss::Refused)));
+    }
 }
