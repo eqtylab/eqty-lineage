@@ -34,6 +34,7 @@ mod recorder;
 mod redaction;
 mod session;
 mod subscriber;
+use classify::event_may_carry_lineage;
 pub use classify::{CompactionPhase, Correlation, LineageEvent, classify, may_carry_lineage};
 pub use config::Config;
 pub use files::{
@@ -190,9 +191,7 @@ impl NativePlugin for EqtyLineagePlugin {
             Box::new(move |delivery| match delivery {
                 Delivery::Event(event) => observe(&tally, &router, &mailbox, event),
                 Delivery::Undecodable(raw) => note_undecodable(&tally, &router, &mailbox, raw),
-                Delivery::Panicked => {
-                    tally.panicked.fetch_add(1, Ordering::Relaxed);
-                }
+                Delivery::Panicked(event) => note_panicked(&tally, &router, &mailbox, event),
             }),
         )?;
 
@@ -261,17 +260,34 @@ fn note_undecodable(
     }
 }
 
+/// Account for an event whose handling panicked, against its session when it decoded.
+///
+/// Must not call `classify`, which may be what panicked.
+fn note_panicked(
+    tally: &Tally,
+    router: &Mutex<SessionRouter>,
+    mailbox: &Mailbox,
+    event: Option<&Event>,
+) {
+    tally.panicked.fetch_add(1, Ordering::Relaxed);
+    let Some(event) = event.filter(|event| event_may_carry_lineage(event)) else {
+        return;
+    };
+    let session_id = router
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .attribute(event);
+    if let Some(session_id) = session_id {
+        mailbox.note_dropped(&session_id);
+    }
+}
+
 /// Handle one event. A panic here is contained and counted by the subscriber's trampoline.
 fn observe(tally: &Tally, router: &Mutex<SessionRouter>, mailbox: &Mailbox, event: &Event) {
     tally.seen.fetch_add(1, Ordering::Relaxed);
 
-    // Attribute every event, including the ones that carry no lineage themselves: an LLM scope
-    // start classifies to nothing, but it is the parent that lets its children be attributed.
-    //
-    // A poisoned lock is recovered from rather than propagated. Poisoning means an earlier callback
-    // panicked while holding it, and the router behind it is a map that may have missed one insert,
-    // not corrupt state. Treating poisoning as fatal would turn one dropped event into a session
-    // that silently records nothing from then on.
+    // Attributed before classifying: a scope that carries no lineage is still its children's
+    // parent. A poisoned lock is recovered, since the map behind it has at worst missed one insert.
     let session_id = router
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

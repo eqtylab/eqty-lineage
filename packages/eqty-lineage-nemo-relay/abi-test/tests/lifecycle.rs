@@ -10,9 +10,8 @@
 //! `PluginHostActivation` -- the same dynamic-plugin host path the gateway runs. If the C ABI
 //! contract is broken, it breaks here.
 //!
-//! It lives in its own crate because it must: Relay's core crate needs `sha2 ^0.11`, and `integrity`
-//! pins `=0.11.0-rc.5` transitively through `iroh-base`. Semver excludes pre-releases from `^0.11`,
-//! so the plugin's dependency graph and this test's cannot be the same graph. See `Cargo.toml`.
+//! It lives in its own crate so the host under test is built without the serde_json features
+//! `integrity` turns on for the plugin's graph. See `Cargo.toml`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

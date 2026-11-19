@@ -64,7 +64,7 @@ test-rust: test-rust-plugin test-rust-plugin-abi
 test-rust-plugin:
   cd packages/eqty-lineage-nemo-relay && cargo test
 
-# Its own crate with its own dependency graph: it needs Relay's core, which cannot coexist with
+# Its own crate with its own dependency graph: it needs Relay's core, which must not share one with
 # `integrity`. See packages/eqty-lineage-nemo-relay/abi-test/Cargo.toml.
 #
 # `build_cdylib` inside this suite builds the plugin into the plugin's *own* target directory, so
@@ -134,7 +134,7 @@ lint-python:
 
 # Dependencies are compiled, never linted -- `Checking nemo-relay-plugin v0.11.1` in a CI log is cargo
 # making a dependency's types available, not checking its code. So there is nothing here to narrow to
-# "only our code"; the cost is compiling two deliberately incompatible dependency graphs from scratch.
+# "only our code"; the cost is compiling two deliberately separate dependency graphs from scratch.
 #
 # Clippy over both Rust crates
 lint-rust: lint-rust-plugin lint-rust-plugin-abi

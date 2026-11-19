@@ -17,8 +17,8 @@ pub enum Delivery<'a> {
     Event(&'a Event),
     /// The event's JSON when it parsed but did not decode, and `None` when it did not parse.
     Undecodable(Option<&'a Json>),
-    /// Handling the event panicked, and the panic was contained.
-    Panicked,
+    /// Handling panicked and the panic was contained. Carries the event when it had decoded.
+    Panicked(Option<&'a Event>),
 }
 
 pub type Handler = Box<dyn Fn(Delivery<'_>) + Send + Sync>;
@@ -61,26 +61,32 @@ unsafe extern "C" fn trampoline(
         let text = unsafe { read(&state.host, event_json) };
         match text.as_deref().and_then(decode_event) {
             Some(event) => {
-                (state.handler)(Delivery::Event(&event));
-                true
+                let handled = catch_unwind(AssertUnwindSafe(|| {
+                    (state.handler)(Delivery::Event(&event));
+                }));
+                if handled.is_ok() {
+                    return NemoRelayStatus::Ok;
+                }
+                let _ = catch_unwind(AssertUnwindSafe(|| {
+                    (state.handler)(Delivery::Panicked(Some(&event)));
+                }));
+                NemoRelayStatus::Internal
             }
             None => {
                 let raw = text.and_then(|text| serde_json::from_str::<Json>(&text).ok());
                 (state.handler)(Delivery::Undecodable(raw.as_ref()));
-                false
+                NemoRelayStatus::InvalidJson
             }
         }
     }));
     // A non-`Ok` status puts the loss in the host's diagnostics. The host sets the last error for
     // it, replacing any set here.
-    match outcome {
-        Ok(true) => NemoRelayStatus::Ok,
-        Ok(false) => NemoRelayStatus::InvalidJson,
-        Err(_) => {
-            let _ = catch_unwind(AssertUnwindSafe(|| (state.handler)(Delivery::Panicked)));
-            NemoRelayStatus::Internal
-        }
-    }
+    outcome.unwrap_or_else(|_| {
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            (state.handler)(Delivery::Panicked(None))
+        }));
+        NemoRelayStatus::Internal
+    })
 }
 
 unsafe extern "C" fn release(user_data: *mut c_void) {

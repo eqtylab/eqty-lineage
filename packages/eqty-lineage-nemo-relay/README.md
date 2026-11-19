@@ -212,9 +212,9 @@ its signer and is passed explicitly.
 
 ## Two dependency facts that look like bugs
 
-**The ABI test is a separate crate.** `integrity` reaches `sha2` through `iroh-blobs → iroh-base`,
-which pins it at exactly `=0.11.0-rc.5`. Relay's core crate asks for `^0.11`, and semver excludes
-pre-releases from that range. The two are unsatisfiable together, so `abi-test/` has its own
+**The ABI test is a separate crate.** `integrity` turns on serde_json's `arbitrary_precision`
+through `ssi`, and cargo unifies features across a dependency graph. In one graph the Relay host
+under test would serialize and decode with a feature no real gateway has, so `abi-test/` has its own
 workspace and lockfile. It costs nothing real — that crate needs no `integrity`, and the plugin needs
 no `nemo-relay` core, since `nemo-relay-plugin` re-exports the types it uses.
 

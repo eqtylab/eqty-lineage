@@ -16,7 +16,7 @@
 //! Codex session and write none of them. Shutdown is therefore a real export path, not cleanup:
 //! dropping the mailbox flushes every session still open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -365,6 +365,7 @@ fn run(
     };
 
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
+    let mut shed_candidates: HashSet<String> = HashSet::new();
 
     while let Ok(message) = receiver.recv() {
         let Message::Observed {
@@ -392,7 +393,9 @@ fn run(
                     turn_agent: None,
                 },
             );
-            shed_stale(&dropped, |session_id| sessions.contains_key(session_id));
+            shed_stale(&dropped, &mut shed_candidates, |session_id| {
+                sessions.contains_key(session_id)
+            });
         }
 
         // Checked before `apply` consumes the event. Without a checkpoint the only manifest a
@@ -1250,13 +1253,19 @@ async fn checkpoint(state: &mut SessionState) {
     }
 }
 
-/// Bound the loss counts by discarding those for sessions that are not open.
-fn shed_stale(dropped: &Mutex<HashMap<String, u64>>, is_open: impl Fn(&str) -> bool) {
+/// Bound the loss counts by discarding those for sessions that are not open. Only at the second
+/// shed that finds one, so a loss recorded just before its session opens is still there when it does.
+fn shed_stale(
+    dropped: &Mutex<HashMap<String, u64>>,
+    candidates: &mut HashSet<String>,
+    is_open: impl Fn(&str) -> bool,
+) {
     let mut counts = dropped
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if counts.len() > DROPPED_SESSIONS {
-        counts.retain(|session_id, _| is_open(session_id));
+        counts.retain(|session_id, _| is_open(session_id) || !candidates.contains(session_id));
+        *candidates = counts.keys().cloned().collect();
     }
 }
 

@@ -186,9 +186,22 @@ pub fn classify(event: &Event) -> Option<LineageEvent> {
 /// Whether an undecodable event could have carried lineage. Only the marks [`classify_mark`]
 /// ignores are ruled out: an overcount reads as incomplete, an undercount is silent.
 pub fn may_carry_lineage(raw: &Json) -> bool {
-    string_at(Some(raw), "kind") != Some("mark")
-        || string_at(Some(raw), "name") == Some("session.start")
-        || string_at(raw.get("metadata"), "hook_event_name").is_some()
+    carries_lineage(
+        string_at(Some(raw), "kind"),
+        string_at(Some(raw), "name"),
+        raw.get("metadata"),
+    )
+}
+
+/// [`may_carry_lineage`] for an event that decoded but was never classified.
+pub(crate) fn event_may_carry_lineage(event: &Event) -> bool {
+    carries_lineage(Some(event.kind()), Some(event.name()), event.metadata())
+}
+
+fn carries_lineage(kind: Option<&str>, name: Option<&str>, metadata: Option<&Json>) -> bool {
+    kind != Some("mark")
+        || name == Some("session.start")
+        || string_at(metadata, "hook_event_name").is_some()
 }
 
 fn classify_mark(event: &Event, metadata: Option<&Json>) -> Option<LineageEvent> {
