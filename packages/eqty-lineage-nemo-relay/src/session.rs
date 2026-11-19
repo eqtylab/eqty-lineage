@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use nemo_relay_plugin::Event;
+use nemo_relay_plugin::{Event, Json};
 use uuid::Uuid;
 
 use crate::classify::string_at;
@@ -51,9 +51,36 @@ impl SessionRouter {
     /// guessed at: attaching a model call to the wrong session is worse than omitting it, because
     /// the manifest would then attest work that session never did.
     pub fn attribute(&mut self, event: &Event) -> Option<String> {
-        let parent = event.parent_uuid();
+        self.resolve(
+            string_at(event.metadata(), "session_id"),
+            event.kind() == "scope",
+            Some(event.uuid()),
+            event.parent_uuid(),
+        )
+    }
 
-        let session = match string_at(event.metadata(), "session_id") {
+    /// [`attribute`](Self::attribute) for an event that parsed as JSON but did not decode.
+    ///
+    /// Its loss still has to be charged to a session, and a scope still has to be remembered or
+    /// everything inside it goes unattributed too.
+    pub fn attribute_raw(&mut self, event: &Json) -> Option<String> {
+        let uuid = |key: &str| -> Option<Uuid> { event.get(key)?.as_str()?.parse().ok() };
+        self.resolve(
+            string_at(event.get("metadata"), "session_id"),
+            string_at(Some(event), "kind") == Some("scope"),
+            uuid("uuid"),
+            uuid("parent_uuid"),
+        )
+    }
+
+    fn resolve(
+        &mut self,
+        session_id: Option<&str>,
+        is_scope: bool,
+        uuid: Option<Uuid>,
+        parent: Option<Uuid>,
+    ) -> Option<String> {
+        let session = match session_id {
             Some(session_id) => session_id.to_string(),
             // A single level is enough because we insert as we descend, and Relay opens a scope
             // before it emits anything inside it.
@@ -64,8 +91,8 @@ impl SessionRouter {
         // a stream -- 325 of the 361 events in a live capture, almost all `llm.chunk` -- and an entry
         // per mark is an entry nothing ever looks up, held until the session exports. On Codex no
         // `SessionEnded` arrives, so `forget` may never run at all.
-        if event.kind() == "scope" {
-            self.scopes.insert(event.uuid(), session.clone());
+        if let Some(uuid) = uuid.filter(|_| is_scope) {
+            self.scopes.insert(uuid, session.clone());
         }
         // The parent is remembered whatever this event is: `session.start` is a mark, and the scope
         // it names is the agent root every turn hangs from.

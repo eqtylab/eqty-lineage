@@ -78,7 +78,7 @@ pub struct Recorder {
     stats: BTreeMap<String, u64>,
     /// Actors already registered this session, keyed by `(kind, name)`.
     actors: HashMap<(String, String), AssetRef>,
-    /// Events this session never saw because the queue was full when they arrived.
+    /// Events this session never saw: the queue was full, or they failed to decode.
     ///
     /// Not a `stats` entry until export, because unlike every other counter this one is set from
     /// outside: the subscriber counts what it could not hand over, and the recorder is by definition
@@ -821,7 +821,7 @@ impl Recorder {
         self.count("AmbiguousSubagentAttribution");
     }
 
-    /// Record how many events never reached this recorder because the queue was full.
+    /// Record how many events never reached this recorder.
     ///
     /// Set from the mailbox at export. The recorder cannot observe its own gaps, and a graph with
     /// holes that does not say so reads as a complete one.

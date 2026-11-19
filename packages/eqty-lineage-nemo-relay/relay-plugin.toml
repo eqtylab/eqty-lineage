@@ -30,7 +30,7 @@ id = "eqty.lineage"
 kind = "rust_dynamic"
 
 [compat]
-relay = ">=0.8.0,<1.0"
+relay = ">=0.11,<1.0"
 native_api = "1"
 
 # Relay requires a native plugin to default to disabled. Enabling is an explicit host decision.

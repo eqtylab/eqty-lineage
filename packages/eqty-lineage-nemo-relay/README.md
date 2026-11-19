@@ -20,7 +20,7 @@ This crate registers a third subscriber on the same stream, as a peer rather tha
 their output files:
 
 ```rust
-ctx.register_subscriber("eqty_lineage", move |event: &Event| { … })?;
+subscriber::register(ctx, "eqty_lineage", Box::new(move |delivery| { … }))?;
 ```
 
 That matters for fidelity. We see raw events before ATIF normalization drops marks and before ATOF
@@ -52,6 +52,7 @@ into an iroh collection per type, and a mark for it on Relay's own event stream.
 | | |
 |---|---|
 | loads through the C ABI and registers `eqty.lineage` | yes — `abi-test/tests/lifecycle.rs` |
+| records events the host emits across the C ABI | yes — `abi-test/tests/lifecycle.rs` |
 | config validated, all problems reported at once | yes — `tests/config.rs` |
 | classifies a real Codex capture | yes — `tests/classify.rs` |
 | attributes gateway events to a session | yes — `tests/session.rs` |
@@ -212,9 +213,9 @@ its signer and is passed explicitly.
 
 ## Two dependency facts that look like bugs
 
-**The ABI test is a separate crate.** `integrity` reaches `sha2` through `iroh-blobs → iroh-base`,
-which pins it at exactly `=0.11.0-rc.5`. Relay's core crate asks for `^0.11`, and semver excludes
-pre-releases from that range. The two are unsatisfiable together, so `abi-test/` has its own
+**The ABI test is a separate crate.** `integrity` turns on serde_json's `arbitrary_precision`
+through `ssi`, and cargo unifies features across a dependency graph. In one graph the Relay host
+under test would serialize and decode with a feature no real gateway has, so `abi-test/` has its own
 workspace and lockfile. It costs nothing real — that crate needs no `integrity`, and the plugin needs
 no `nemo-relay` core, since `nemo-relay-plugin` re-exports the types it uses.
 
@@ -256,18 +257,13 @@ The same rule governs correlation. Relay reports how confident its own join was,
 `agent_fallback` / `ambiguous_fallback` mean it guessed. Those become `Correlation::Inferred`, never
 `Observed`.
 
-## The lockfile is committed, and has to be
+## The lockfile is committed
 
-`integrity` does not resolve from a clean crates.io index at any revision: `core2 0.4.0` is yanked
-and reachable through two different paths. Cargo permits a yanked crate already present in a lockfile
-and refuses to select one that is not.
+`Cargo.lock` is committed here, and this is not the usual "libraries don't commit lockfiles"
+question: the shipped artifact is a signed cdylib, and `just nemo-relay-package` builds `--locked`
+so a release bundle is built from the dependency tree that was tested.
 
-So `Cargo.lock` is committed here, and this is not the usual "libraries don't commit lockfiles"
-question — without it, a clean checkout cannot build. A CI job that deletes it, or a `cargo update`
-that drops the `core2` entry, fails with an error pointing five levels down the dependency tree
-rather than at the real cause.
-
-`integrity` is pinned by SHA to v0.0.13 (`0d85ae5b9f7204812771c4f8e4985c671b831b0a`).
+`integrity` is pinned by SHA to v0.0.21 (`13af564f0061d7b15819efc99bccef5b6140a1ad`).
 
 ## Building
 

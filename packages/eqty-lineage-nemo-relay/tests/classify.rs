@@ -7,14 +7,16 @@
 //! payload is another person's session content and does not belong in this repository, and
 //! classification never reads it. `metadata` is verbatim, because that is what these tests are about.
 //!
-//! The fixture earns its place by failing loudly: Relay deserializes these same bytes into `Event`
-//! before it calls a subscriber, so if an upgrade moves a field, [`deserializes_as_relay_would`]
-//! breaks here rather than silently thinning every manifest we produce afterwards.
+//! The fixture earns its place by failing loudly: the subscriber decodes these same bytes into
+//! `Event` the same way, so if an upgrade moves a field, [`deserializes_as_relay_would`] breaks here
+//! rather than silently thinning every manifest we produce afterwards.
 
 use std::fs;
 use std::path::PathBuf;
 
-use eqty_lineage_nemo_relay::{Correlation, LineageEvent, classify};
+use eqty_lineage_nemo_relay::{
+    Correlation, LineageEvent, classify, decode_event, may_carry_lineage,
+};
 use nemo_relay_plugin::Event;
 
 fn fixture() -> Vec<Event> {
@@ -22,7 +24,7 @@ fn fixture() -> Vec<Event> {
     let text = fs::read_to_string(&path).expect("fixture is readable");
     text.lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("fixture line is a Relay Event"))
+        .map(|line| decode_event(line).expect("fixture line is a Relay Event"))
         .collect()
 }
 
@@ -337,4 +339,29 @@ fn the_stated_role_beats_the_tree_shape() {
         matches!(classify(&event), Some(LineageEvent::SubagentStarted { .. })),
         "the stated role must win over the parent check"
     );
+}
+
+/// The raw check may overcount, never undercount: whatever classifies must pass it.
+#[test]
+fn whatever_classifies_may_carry_lineage() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex-session.jsonl");
+    let text = fs::read_to_string(&path).expect("fixture is readable");
+    let raw: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("fixture line is JSON"))
+        .collect();
+
+    for (event, raw) in fixture().iter().zip(&raw) {
+        if classify(event).is_some() {
+            assert!(
+                may_carry_lineage(raw),
+                "{} would go uncharged",
+                event.name()
+            );
+        }
+        if event.name() == "llm.chunk" {
+            assert!(!may_carry_lineage(raw), "a chunk carries no lineage");
+        }
+    }
 }

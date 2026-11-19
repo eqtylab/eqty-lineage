@@ -16,7 +16,7 @@
 //! Codex session and write none of them. Shutdown is therefore a real export path, not cleanup:
 //! dropping the mailbox flushes every session still open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,10 @@ use crate::redaction::Policy;
 /// and reported in that session's coverage as `EventsDropped`, so an incomplete graph says so rather
 /// than reading as a complete one.
 const QUEUE_DEPTH: usize = 4096;
+
+/// How many sessions may hold a loss count before counts for sessions that are not open are shed.
+/// Nothing else removes a count whose session is never created or has already exported.
+const DROPPED_SESSIONS: usize = 1024;
 
 /// Statements that must accumulate before a mid-session manifest is rewritten.
 ///
@@ -275,7 +279,7 @@ impl Mailbox {
     ///
     /// A poisoned lock is recovered from rather than propagated: the map behind it is counters, and
     /// giving up on counting losses is the one response strictly worse than the loss itself.
-    fn note_dropped(&self, session_id: &str) {
+    pub fn note_dropped(&self, session_id: &str) {
         let mut counts = self
             .dropped
             .lock()
@@ -361,6 +365,7 @@ fn run(
     };
 
     let mut sessions: HashMap<String, SessionState> = HashMap::new();
+    let mut shed_candidates: HashSet<String> = HashSet::new();
 
     while let Ok(message) = receiver.recv() {
         let Message::Observed {
@@ -388,6 +393,9 @@ fn run(
                     turn_agent: None,
                 },
             );
+            shed_stale(&dropped, &mut shed_candidates, |session_id| {
+                sessions.contains_key(session_id)
+            });
         }
 
         // Checked before `apply` consumes the event. Without a checkpoint the only manifest a
@@ -1245,6 +1253,22 @@ async fn checkpoint(state: &mut SessionState) {
     }
 }
 
+/// Bound the loss counts by discarding those for sessions that are not open. Only at the second
+/// shed that finds one, so a loss recorded just before its session opens is still there when it does.
+fn shed_stale(
+    dropped: &Mutex<HashMap<String, u64>>,
+    candidates: &mut HashSet<String>,
+    is_open: impl Fn(&str) -> bool,
+) {
+    let mut counts = dropped
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if counts.len() > DROPPED_SESSIONS {
+        counts.retain(|session_id, _| is_open(session_id) || !candidates.contains(session_id));
+        *candidates = counts.keys().cloned().collect();
+    }
+}
+
 fn export(
     runtime: &tokio::runtime::Runtime,
     session_id: &str,
@@ -1252,7 +1276,7 @@ fn export(
     dropped: &Arc<Mutex<HashMap<String, u64>>>,
     on_manifest: &ManifestAnnounced,
 ) {
-    // What the queue lost for this session, taken out of the shared map so it does not outlive the
+    // What this session lost, taken out of the shared map so it does not outlive the
     // session it describes -- the same unbounded-growth mistake this export path exists to close.
     let lost = dropped
         .lock()

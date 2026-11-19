@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
     LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy,
-    SessionFinished, SessionRouter, SignerFactory, classify,
+    SessionFinished, SessionRouter, SignerFactory, classify, decode_event,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
@@ -124,7 +124,7 @@ fn fixture() -> Vec<Event> {
         .expect("fixture is readable")
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("fixture line is an Event"))
+        .map(|line| decode_event(line).expect("fixture line is an Event"))
         .collect()
 }
 
@@ -2324,6 +2324,46 @@ fn work_done_while_several_subagents_run_says_it_cannot_tell_which() {
     assert!(
         decoded_blobs(path).contains("\"AmbiguousSubagentAttribution\":1"),
         "coverage counts it, so it is visible without walking every activity"
+    );
+}
+
+#[test]
+fn a_loss_is_charged_even_before_its_session_opens() {
+    let into = TempDir::new().expect("a temp dir");
+    let session = "01a040aa-0000-0000-0000-000000000f62";
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        ignore_marks(),
+    );
+
+    // The first event of a session is the one whose loss matters most, and nothing has opened the
+    // session yet when it is lost.
+    mailbox.note_dropped(session);
+    // Enough never-opened sessions to force the stale counts to be shed.
+    for stale in 0..2000 {
+        mailbox.note_dropped(&format!("never-opened-{stale}"));
+    }
+    for event in &full_session(session) {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
+        }
+    }
+    mailbox.note_dropped(session);
+    drop(mailbox);
+
+    let written = manifests(&into);
+    assert_eq!(written.len(), 1, "a loss alone does not open a session");
+    let decoded = decoded_blobs(&written[0]);
+    assert!(
+        decoded.contains("\"EventsDropped\":2"),
+        "shedding stale counts must keep the open session's:\n{decoded}"
     );
 }
 
