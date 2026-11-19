@@ -3877,3 +3877,119 @@ fn a_model_no_provider_serves_is_never_asked_about() {
     );
     assert!(!coverage_of(&ours).contains("ProviderManifest"));
 }
+
+#[test]
+fn a_gateway_key_that_is_not_set_is_reported_and_nothing_is_sent() {
+    let (base_url, seen) = gateway(|_, _| (500, "{}".into()));
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b4", "relay-request-4"),
+        Provider {
+            base_url,
+            api_key_env: Some("EQTY_LINEAGE_TEST_VARIABLE_THAT_IS_NOT_SET".into()),
+            models: Vec::new(),
+        },
+    );
+    assert!(seen.lock().expect("the hits lock").is_empty());
+    let coverage = coverage_of(&ours);
+    assert!(coverage.contains("\"ProviderKeyUnset\":1"), "{coverage}");
+    assert!(!coverage.contains("ProviderManifestMissing"), "{coverage}");
+}
+
+/// A manifest this build cannot merge must not be counted as merged or joined to.
+#[test]
+fn a_provider_manifest_of_another_version_is_left_out_entirely() {
+    let (mut theirs, asked, _) = provider_manifest();
+    theirs["version"] = serde_json::json!("999");
+    let served = theirs.to_string();
+    let (base_url, _seen) = gateway(move |path, _| match path {
+        "/integrity/manifest/provider-5" => (200, served.clone()),
+        _ => (
+            200,
+            r#"{"status":"ready","request_id":"provider-5"}"#.into(),
+        ),
+    });
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b5", "relay-request-5"),
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    let coverage = coverage_of(&ours);
+    assert!(
+        coverage.contains("\"ProviderManifestMissing\":1"),
+        "{coverage}"
+    );
+    assert!(!coverage.contains("ProviderManifestMerged"), "{coverage}");
+    assert!(
+        !ours["statements"].to_string().contains(&asked),
+        "nothing of ours may point into a manifest that was not merged"
+    );
+}
+
+/// The record names the manifest, and a name that is a dot segment would be a different route.
+#[test]
+fn a_record_naming_a_dot_segment_is_refused() {
+    let (base_url, seen) = gateway(|_, _| (200, r#"{"status":"ready","request_id":".."}"#.into()));
+    replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b6", "relay-request-6"),
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    let seen = seen.lock().expect("the hits lock");
+    assert_eq!(seen.len(), 1, "only the lookup is made: {seen:?}");
+}
+
+/// The filter is written against the name the agent asked for, whatever the gateway answered as.
+#[test]
+fn the_model_filter_matches_the_name_that_was_asked_for() {
+    let (base_url, seen) = gateway(|_, _| (200, r#"{"status":"failed"}"#.into()));
+    let events: Vec<Event> =
+        call_sent_as("01a040aa-0000-0000-0000-0000000000b7", "relay-request-7")
+            .into_iter()
+            .map(|event| {
+                let mut raw = serde_json::to_value(&event).expect("an event serializes");
+                if raw["category"] == "llm" && raw["scope_category"] == "end" {
+                    raw["category_profile"]["annotated_response"]["model"] =
+                        serde_json::json!("served-under-another-name");
+                }
+                decode_event(&raw.to_string()).expect("and decodes again")
+            })
+            .collect();
+    replay_linked(
+        &events,
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: vec!["test-model".into()],
+        },
+    );
+    assert_eq!(seen.lock().expect("the hits lock").len(), 1);
+}
+
+/// An unreachable gateway costs one failed request, not one per call.
+#[test]
+fn a_gateway_that_cannot_be_reached_is_asked_once() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let base_url = format!("http://{}", closed.local_addr().expect("an address"));
+    drop(closed);
+
+    let session = "01a040aa-0000-0000-0000-0000000000b8";
+    let mut events = call_sent_as(session, "relay-request-8");
+    events.extend(call_sent_as(session, "relay-request-9").into_iter().skip(1));
+    let started = std::time::Instant::now();
+    let ours = replay_linked(
+        &events,
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\""));
+}

@@ -34,7 +34,7 @@
     "provider_manifests": {
       "type": "array",
       "default": [],
-      "description": "Gateways asked, at export, for the manifest they signed for each model call. Each manifest is merged into the session's whole, and the call is joined to it by the x-nemo-relay-request-id Relay sent upstream. Off unless configured.",
+      "description": "Gateways asked, at export, for the manifest they signed for each model call. Each manifest is merged into the session's whole, and the call is joined to it by the x-nemo-relay-request-id Relay sent upstream. Off unless configured. A call is asked of the first entry whose models match it and of no other. deny_globs and max_content_bytes do not apply to what a gateway's manifest contains.",
       "items": {
         "type": "object",
         "additionalProperties": false,

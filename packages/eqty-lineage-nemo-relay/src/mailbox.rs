@@ -945,12 +945,14 @@ async fn record_model_call(
     if matches!(recorded, Ok(true)) {
         state.turn_prompt_attributed = true;
         if let Some(request_id) = request_id {
+            // The name the agent asked for, which is what a `models` filter is written against. The
+            // one that answered can be a dated or deployment name the operator never typed.
             let served = response
                 .as_ref()
                 .and_then(|response| response.model.clone());
             state
                 .recorder
-                .note_provider_request(request_id, served.or(model.map(str::to_string)));
+                .note_provider_request(request_id, model.map(str::to_string).or(served));
         }
     }
 }
@@ -1369,11 +1371,13 @@ fn export(
     let mut provider_manifests = Vec::new();
     for (relay_request_id, model) in wanted {
         let Some(found) = fetched.remove(&relay_request_id) else {
-            if providers
+            if let Some(provider) = providers
                 .iter()
-                .any(|provider| provider.serves(model.as_deref()))
+                .find(|provider| provider.serves(model.as_deref()))
             {
-                state.recorder.note_provider_manifest_missing();
+                state
+                    .recorder
+                    .note_provider_manifest_missing(provider.key().is_err());
             }
             continue;
         };

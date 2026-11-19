@@ -760,9 +760,15 @@ impl Recorder {
         Ok(())
     }
 
-    /// A call whose provider was asked for its manifest and had none to give.
-    pub fn note_provider_manifest_missing(&mut self) {
-        self.count("ProviderManifestMissing");
+    /// A call whose provider gave no manifest. `key_unset` is the one cause that is the host's to
+    /// fix rather than the gateway's: the variable naming the gateway key was not set, so it was
+    /// never asked.
+    pub fn note_provider_manifest_missing(&mut self, key_unset: bool) {
+        self.count(if key_unset {
+            "ProviderKeyUnset"
+        } else {
+            "ProviderManifestMissing"
+        });
     }
 
     /// Record that the agent compacted its context.

@@ -190,24 +190,83 @@ and so is the conversation that read carried.
 A gateway in front of the model, such as LiteLLM with the EQTY plugin, signs a manifest of its own
 for each call: routing, guardrails, attestation evidence. Configured with where that gateway is, this
 plugin fetches each call's manifest at export, merges all of it into the session's, and joins the
-two.
+two. Off unless configured.
+
+### 1. Point the agent at the gateway
+
+Relay sits between the agent and the gateway, so the gateway's address and key are given to Relay
+and not to the agent. Relay injects the key upstream itself, and this plugin reads the same
+variable.
+
+Codex, through an OpenAI-compatible gateway:
+
+```bash
+OPENAI_API_KEY=<gateway key> \
+  nemo-relay --openai-base-url http://localhost:4000/v1 \
+  codex -- -m <a model the gateway serves>
+```
+
+Claude Code, through an Anthropic-compatible gateway:
+
+```bash
+ANTHROPIC_API_KEY=<gateway key> \
+  nemo-relay --anthropic-base-url http://localhost:4000 \
+  claude -- --model <a model the gateway serves>
+```
+
+`NEMO_RELAY_OPENAI_BASE_URL` and `NEMO_RELAY_ANTHROPIC_BASE_URL` set the same addresses from the
+environment. The OpenAI address ends in `/v1`; the Anthropic one does not. Arguments after `--` go
+to the agent, so `-- exec "<prompt>"` and `-- -p "<prompt>"` run one prompt and exit.
+
+Codex sends `prompt_cache_key` and a `reasoning` setting on every request and has no option that
+omits them. A gateway model that rejects either has to drop it on the gateway side.
+
+### 2. Tell the plugin where the gateway's manifests are
+
+In `~/.config/nemo-relay/plugins.toml`, directly under this plugin's `[[plugins.dynamic]]` entry:
 
 ```toml
+[[plugins.dynamic]]
+manifest = "/path/to/relay-plugin.toml"
+
 [[plugins.dynamic.config.provider_manifests]]
 base_url    = "http://localhost:4000"
-api_key_env = "OPENAI_API_KEY"     # the variable Relay takes the agent's key from
+api_key_env = "OPENAI_API_KEY"     # ANTHROPIC_API_KEY for Claude Code
 models      = ["gpt-6-astra-*"]    # omit to ask about every model
 ```
 
-Off unless configured. The gateway key is sent with each lookup, so `models` should name only what
-is served through that gateway: Relay shows a plugin the model and the route, never the upstream
-host.
+| Key | |
+|---|---|
+| `base_url` | Where the gateway's `/integrity` routes are. Required, `http://` or `https://`. |
+| `api_key_env` | The variable Relay took the agent's key from. Names the variable; never holds the key. Omit only for a gateway that serves manifests without one. |
+| `models` | Globs over the model name the agent asked for. The key is sent with each lookup, so name only what is served through this gateway: Relay shows a plugin the model and the route, never the upstream host. |
 
-**The join is by request id, and says so.** Relay shows a plugin no response headers, so the
-gateway's own request id never arrives. What both sides see is the `x-nemo-relay-request-id` Relay
-puts on every upstream request. The gateway indexes its record by it
-(`GET /integrity/logs/by-client-request-id/{id}`), and the record names the manifest
-(`GET /integrity/manifest/{request_id}`).
+Repeat the block for another gateway. A call is asked of the first block whose `models` match it and
+of no other, so order overlapping blocks from most to least specific.
+
+`nemo-relay plugins list` shows `HOST CONFIG present` once the block is read, and
+`nemo-relay plugins validate eqty.lineage` reports a malformed one. `plugins remove` deletes the
+entry together with this block, so it has to be put back after the plugin is re-added.
+
+### 3. Check that it happened
+
+The manifest's coverage node says what became of each call that named its upstream request:
+
+| Counter | Meaning |
+|---|---|
+| `ProviderManifestMerged` | The gateway's manifest was fetched, merged and joined. |
+| `ProviderManifestMissing` | The gateway was asked and gave none: no record, a failed record, a manifest of another version, an unreachable gateway, or the wait ran out. |
+| `ProviderKeyUnset` | The variable `api_key_env` names was not set in Relay's environment, so nothing was sent. |
+
+A session with none of the three had no call that matched a block.
+
+### What is written, and what the join rests on
+
+Relay shows a plugin no response headers, so the gateway's own request id never arrives. What both
+sides see is the `x-nemo-relay-request-id` Relay puts on every upstream request. The gateway indexes
+its record by it (`GET /integrity/logs/by-client-request-id/{id}`), and the record names the
+manifest (`GET /integrity/manifest/{request_id}`). The gateway has to serve the first route:
+`litellm-eqty-plugin` does from the release that captures `EQTY_CLIENT_REQUEST_ID_HEADER`.
 
 The two graphs share no content id. The gateway hashes its own serialization of each body, and
 Relay hands a plugin a re-encoded one whose input is cut down after the first call of a turn. So
@@ -215,13 +274,20 @@ each joined call gets two `provider_link` computations, signed by this plugin an
 `matchedBy: x-nemo-relay-request-id`: one from the session's prompts to the gateway's `Client
 Request`, one from its `Delivered Response` (or `Response Body`) to the session's completions.
 
-Coverage counts `ProviderManifestMerged` and `ProviderManifestMissing`. A call is missing when the
-gateway has no record for it, the record failed, or the wait ran out: the gateway writes its record
-after the response, so a lookup is retried for a bounded time at export. A call that failed at the
-provider has no record to find.
-
 Provider statements are merged as the JSON the gateway served, never decoded and re-encoded, so each
-still hashes to the id its credential signed.
+still hashes to the id its credential signed. Its anchors are carried over with them.
+
+Four limits:
+
+- **`deny_globs` and `max_content_bytes` do not reach provider content.** The gateway's manifest is
+  merged whole, so a prompt this plugin withheld for size is present again inside the gateway's
+  `Client Request`. The byte totals in coverage count this plugin's content only.
+- **The fetch is bounded, and waits on the one worker.** The gateway writes its record after the
+  response, so a miss is retried, for a fixed total per session. Events for other sessions queue
+  behind that wait.
+- **Only answered calls are joined.** A call blocked by a gateway guardrail, or one that failed at
+  the provider, has no completion on this side to join to.
+- **Checkpoints do not carry provider manifests.** Only the final export does.
 
 ## Running it against a live session
 
