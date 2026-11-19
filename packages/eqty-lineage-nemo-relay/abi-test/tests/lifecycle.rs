@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use nemo_relay::api::scope::{
+    EmitMarkEventParams, PopScopeParams, PushScopeParams, ScopeType, event, pop_scope, push_scope,
+};
+use nemo_relay::api::subscriber::flush_subscribers;
 use nemo_relay::plugin::dynamic::{
     DynamicPluginKind, PluginHostActivation, VerifiedDynamicPluginSpec,
 };
@@ -69,6 +73,74 @@ async fn the_built_cdylib_loads_and_registers_its_kind() {
     activation
         .close()
         .expect("callbacks should clear before the library unloads");
+}
+
+/// Events cross the ABI and come out as a manifest. Everything else drives the recorder directly,
+/// so this is the only test that runs the subscriber's trampoline, host-string read and release.
+#[tokio::test]
+async fn events_emitted_by_the_host_are_recorded() {
+    let _guard = HOST_LOCK.lock().await;
+    let library = build_cdylib();
+    let manifest_dir = TempDir::new().expect("manifest directory");
+    let manifest = write_manifest(manifest_dir.path(), library);
+    let manifests = TempDir::new().expect("output directory");
+
+    let (mut activation, report) = PluginHostActivation::initialize_with_verified_specs(
+        PluginConfig::default(),
+        [VerifiedDynamicPluginSpec {
+            plugin_id: PLUGIN_ID.into(),
+            kind: DynamicPluginKind::RustDynamic,
+            manifest_ref: manifest.to_string_lossy().into_owned(),
+            environment_ref: None,
+            config: config(json!({
+                "manifest_dir": manifests.path().to_string_lossy(),
+            })),
+        }],
+    )
+    .await
+    .expect("the native manifest should activate");
+    assert!(
+        report.diagnostics.is_empty(),
+        "activation complained: {report:?}"
+    );
+
+    let session = json!({ "session_id": "abi-test-session", "agent_kind": "codex" });
+    event(
+        EmitMarkEventParams::builder()
+            .name("session.start")
+            .metadata(session.clone())
+            .build(),
+    )
+    .expect("the session mark is emitted");
+    let tool = push_scope(
+        PushScopeParams::builder()
+            .name("Bash")
+            .scope_type(ScopeType::Tool)
+            .metadata(session)
+            .input(json!({ "command": "true" }))
+            .build(),
+    )
+    .expect("the tool scope opens");
+    pop_scope(
+        PopScopeParams::builder()
+            .handle_uuid(&tool.uuid)
+            .output(json!({ "stdout": "" }))
+            .build(),
+    )
+    .expect("the tool scope closes");
+    flush_subscribers().expect("subscribers drain");
+
+    // Closing drops the subscriber state, which is what flushes the session to disk.
+    activation
+        .close()
+        .expect("callbacks should clear before the library unloads");
+
+    let written: Vec<_> = std::fs::read_dir(manifests.path())
+        .expect("the output directory is readable")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(written.len(), 1, "one session, one manifest: {written:?}");
 }
 
 #[tokio::test]

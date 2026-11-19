@@ -213,8 +213,8 @@ impl NativePlugin for EqtyLineagePlugin {
 /// takes the gateway with it, and the manifest is on disk either way. `unannounced` is where a
 /// reader sees it.
 ///
-/// **Not exercised across the ABI.** `tests/regressions.rs` pins what is announced and when, but
-/// `abi-test` never drives events through the subscriber, so no mark happens there.
+/// **Not asserted across the ABI.** `tests/regressions.rs` pins what is announced and when;
+/// `abi-test` drives events through the subscriber but does not observe the mark.
 fn announce(tally: &Tally, runtime: &PluginRuntime, mark: &ManifestMark) {
     let data = json!({
         "cid": mark.cid,

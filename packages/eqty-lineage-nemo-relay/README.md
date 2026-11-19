@@ -52,6 +52,7 @@ into an iroh collection per type, and a mark for it on Relay's own event stream.
 | | |
 |---|---|
 | loads through the C ABI and registers `eqty.lineage` | yes — `abi-test/tests/lifecycle.rs` |
+| records events the host emits across the C ABI | yes — `abi-test/tests/lifecycle.rs` |
 | config validated, all problems reported at once | yes — `tests/config.rs` |
 | classifies a real Codex capture | yes — `tests/classify.rs` |
 | attributes gateway events to a session | yes — `tests/session.rs` |
