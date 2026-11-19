@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use futures::stream::{self, StreamExt};
 use serde_json::Value as Json;
 
 use crate::redaction::glob_match;
@@ -21,7 +22,13 @@ const RETRY_EVERY: Duration = Duration::from_millis(500);
 /// The most time one session's export may spend waiting on gateways. Every session's events queue
 /// behind this wait, and on Codex it happens at gateway shutdown.
 const SESSION_BUDGET: Duration = Duration::from_secs(10);
+/// How long a 404 is retried. The gateway writes its record soon after the response, and a call it
+/// never saw answers 404 for good.
+const NOT_FOUND_BUDGET: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Calls asked about at once. Enough to fit a long session in the budget without flooding the
+/// gateway.
+const CONCURRENT_ASKS: usize = 8;
 /// The manifest version this build writes. A manifest of any other version cannot be merged.
 const MANIFEST_VERSION: &str = "3";
 /// Manifests carry their blobs inline and can be large. This only stops an endless response.
@@ -80,75 +87,83 @@ pub async fn fetch_all(
     calls: Vec<(String, Option<String>)>,
 ) -> HashMap<String, Fetched> {
     let keys: Vec<_> = providers.iter().map(Provider::key).collect();
-    let mut pending: Vec<(String, usize)> = calls
+    let Ok(client) = reqwest::Client::builder().build() else {
+        return HashMap::new();
+    };
+    let deadline = Instant::now() + SESSION_BUDGET;
+    let asks = calls
         .into_iter()
         .filter(|(id, _)| is_safe_id(id))
         .filter_map(|(id, model)| {
             let provider = providers.iter().position(|p| p.serves(model.as_deref()))?;
-            keys[provider].is_ok().then_some((id, provider))
+            let key = keys[provider].as_ref().ok()?.as_deref();
+            Some((id, providers[provider].base_url.trim_end_matches('/'), key))
         })
-        .collect();
-    let mut fetched = HashMap::new();
-    let Ok(client) = reqwest::Client::builder().build() else {
-        return fetched;
-    };
+        .map(|(id, base, key)| {
+            let client = &client;
+            async move {
+                let found = fetch_one(client, base, key, &id, deadline).await;
+                found.map(|found| (id, found))
+            }
+        });
+    stream::iter(asks)
+        .buffer_unordered(CONCURRENT_ASKS)
+        .filter_map(std::future::ready)
+        .collect()
+        .await
+}
 
-    let deadline = Instant::now() + SESSION_BUDGET;
-    // Stop asking a gateway that cannot be reached, or every remaining call waits for a timeout.
-    let mut unreachable = vec![false; providers.len()];
-    while !pending.is_empty() {
-        let mut retry = Vec::new();
-        for (id, provider) in pending {
-            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return fetched;
-            };
-            if unreachable[provider] {
-                continue;
-            }
-            let ask = Ask {
-                client: &client,
-                base: providers[provider].base_url.trim_end_matches('/'),
-                key: keys[provider].as_ref().ok().and_then(Option::as_deref),
-                timeout: REQUEST_TIMEOUT.min(left),
-            };
-            match ask.manifest_for(&id).await {
-                Attempt::Ready(found) => {
-                    fetched.insert(id, *found);
-                }
-                Attempt::NotYet => retry.push((id, provider)),
-                Attempt::Never => {}
-                Attempt::Unreachable => unreachable[provider] = true,
-            }
-        }
-        pending = retry;
-        if !pending.is_empty() {
-            tokio::time::sleep(RETRY_EVERY).await;
+/// Ask about one call until it is answered, refused, or out of time.
+async fn fetch_one(
+    client: &reqwest::Client,
+    base: &str,
+    key: Option<&str>,
+    id: &str,
+    deadline: Instant,
+) -> Option<Fetched> {
+    // A 404 also means "a call this gateway never saw", so it gets less time than "fetching".
+    let not_found_deadline = deadline.min(Instant::now() + NOT_FOUND_BUDGET);
+    loop {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let ask = Ask {
+            client,
+            base,
+            key,
+            timeout: REQUEST_TIMEOUT.min(left),
+        };
+        match ask.manifest_for(id).await {
+            Attempt::Ready(found) => return Some(*found),
+            Attempt::NotYet(Miss::NotFound) if Instant::now() >= not_found_deadline => return None,
+            Attempt::NotYet(_) => tokio::time::sleep(RETRY_EVERY).await,
+            Attempt::Never => return None,
         }
     }
-    fetched
 }
 
 enum Attempt {
     Ready(Box<Fetched>),
-    NotYet,
+    /// Worth asking again. Carries why, so a 404 can be given up on sooner.
+    NotYet(Miss),
     Never,
-    Unreachable,
 }
 
-/// `NotFound` is a 404 and may be retried. `Refused` is any other answer and must not be.
+/// `NotFound` is a 404 and may be retried. `Refused` is any other answer, or no connection at all,
+/// and must not be. `Unreachable` is a timeout or a broken body, which may pass, so it is retried.
+#[derive(Debug)]
 enum Miss {
     NotFound,
     Refused,
     Unreachable,
+    /// The record exists but the gateway is still fetching the response.
+    Pending,
 }
 
 impl From<Miss> for Attempt {
     fn from(miss: Miss) -> Self {
         match miss {
-            // A 404 can mean "not written yet" or "not ours". They look the same, so retry.
-            Miss::NotFound => Attempt::NotYet,
             Miss::Refused => Attempt::Never,
-            Miss::Unreachable => Attempt::Unreachable,
+            // A 404 can mean "not written yet" or "not ours". They look the same, so retry.
+            miss => Attempt::NotYet(miss),
         }
     }
 }
@@ -174,7 +189,7 @@ impl Ask<'_> {
         match record.get("status").and_then(Json::as_str) {
             Some("ready") => {}
             Some("failed") => return Attempt::Never,
-            _ => return Attempt::NotYet,
+            _ => return Attempt::NotYet(Miss::Pending),
         }
         let Some(request_id) = record
             .get("request_id")
@@ -213,7 +228,14 @@ impl Ask<'_> {
         if let Some(key) = self.key {
             request = request.bearer_auth(key);
         }
-        let response = request.send().await.map_err(|_| Miss::Unreachable)?;
+        // A refused connection means the gateway is down, and asking again in 500 ms will not help.
+        let response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                Miss::Refused
+            } else {
+                Miss::Unreachable
+            }
+        })?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(Miss::NotFound);
         }

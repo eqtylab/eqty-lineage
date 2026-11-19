@@ -119,14 +119,26 @@ fn provider_manifests_are_off_by_default_and_refused_whole_when_malformed() {
     for broken in [
         json!([{ "api_key_env": "K" }]),
         json!([{ "base_url": "localhost:4000" }]),
-        json!([{ "base_url": "http://h", "api_key_env": "" }]),
-        json!([{ "base_url": "http://h", "models": "gpt-*" }]),
+        // The key would cross the network in clear.
+        json!([{ "base_url": "http://gateway.internal:4000" }]),
+        json!([{ "base_url": "http://" }]),
+        json!([{ "base_url": "https://h", "api_key_env": "" }]),
+        json!([{ "base_url": "https://h", "models": "gpt-*" }]),
         // A misspelt filter must not widen to every model.
-        json!([{ "base_url": "http://h", "model": ["gpt-*"] }]),
-        json!("http://h"),
+        json!([{ "base_url": "https://h", "model": ["gpt-*"] }]),
+        json!("https://h"),
     ] {
         let (config, codes) = parse(json!({ "provider_manifests": broken }));
         assert_eq!(codes, ["provider_manifests.invalid"], "{broken}");
         assert!(config.provider_manifests.is_empty());
+    }
+
+    for local in [
+        "http://127.0.0.1:4000",
+        "http://[::1]:4000",
+        "https://gateway.internal",
+    ] {
+        let (_, codes) = parse(json!({ "provider_manifests": [{ "base_url": local }] }));
+        assert!(codes.is_empty(), "{local}: {codes:?}");
     }
 }

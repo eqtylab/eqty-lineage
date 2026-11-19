@@ -242,7 +242,7 @@ models      = ["gpt-6-astra-*"]    # leave out to ask about every model
 
 | Key | Required | Meaning |
 |---|---|---|
-| `base_url` | yes | The gateway's address. Must start with `http://` or `https://`. |
+| `base_url` | yes | The gateway's address. Must be `https://`, or `http://` to `localhost`, `127.0.0.1` or `::1`. The gateway key is sent to it. |
 | `api_key_env` | no | The name of the environment variable that holds the gateway key. Use the same variable you gave Relay in step 1. The key itself never goes in this file. Leave this out only if the gateway serves manifests without a key. |
 | `models` | no | Patterns for the model names to ask this gateway about. They are matched against the name the agent asked for. |
 

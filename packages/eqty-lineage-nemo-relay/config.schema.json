@@ -43,7 +43,7 @@
           "base_url": {
             "type": "string",
             "pattern": "^https?://",
-            "description": "Base URL of the gateway's /integrity routes, for example http://localhost:4000."
+            "description": "Base URL of the gateway's /integrity routes, for example http://localhost:4000. Plain http is accepted only for a loopback host, since the gateway key is sent to it."
           },
           "api_key_env": {
             "type": "string",

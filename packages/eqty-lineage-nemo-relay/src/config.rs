@@ -133,9 +133,9 @@ impl Config {
                 _ => diagnostics.push(error(
                     "provider_manifests.invalid",
                     "provider_manifests",
-                    "provider_manifests must be an array of tables, each with an http(s) \
-                     base_url, and optionally api_key_env (a non-empty string) and models (an \
-                     array of strings)",
+                    "provider_manifests must be an array of tables, each with an https base_url \
+                     (http only to localhost), and optionally api_key_env (a non-empty string) \
+                     and models (an array of strings)",
                 )),
             }
         }
@@ -157,7 +157,7 @@ fn provider(entry: &Json) -> Option<Provider> {
         return None;
     }
     let base_url = entry.get("base_url")?.as_str()?;
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+    if !is_safe_base_url(base_url) {
         return None;
     }
     let api_key_env = match entry.get("api_key_env") {
@@ -177,6 +177,23 @@ fn provider(entry: &Json) -> Option<Provider> {
         api_key_env: api_key_env.map(str::to_string),
         models,
     })
+}
+
+/// The gateway key is sent as a bearer token, so plain `http` is allowed only to this machine.
+fn is_safe_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    url.scheme() == "https"
+        || url.scheme() == "http"
+            && (host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
 }
 
 /// `register` refuses on errors alone, never on any diagnostic. That is what lets `deny_globs.empty`
