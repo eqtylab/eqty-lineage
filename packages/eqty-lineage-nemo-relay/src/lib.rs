@@ -30,6 +30,7 @@ mod config;
 mod files;
 mod lineage;
 mod mailbox;
+mod provider;
 mod recorder;
 mod redaction;
 mod session;
@@ -45,6 +46,7 @@ pub use lineage::{AssetRef, LineageSession};
 pub use mailbox::{
     MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, SessionFinished, SignerFactory,
 };
+pub use provider::Provider;
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
 pub use session::SessionRouter;
@@ -170,7 +172,7 @@ impl NativePlugin for EqtyLineagePlugin {
         // borrows the host table for the duration of registration.
         let runtime = ctx.runtime();
         let announced = Arc::clone(&self.tally);
-        let mailbox = Arc::new(Mailbox::start(
+        let mailbox = Arc::new(Mailbox::start_with_providers(
             config.manifest_dir.clone(),
             policy,
             signer,
@@ -181,6 +183,7 @@ impl NativePlugin for EqtyLineagePlugin {
                     .forget(session_id);
             }),
             Box::new(move |mark: &ManifestMark| announce(&announced, &runtime, mark)),
+            config.provider_manifests.clone(),
         ));
         self.mailbox = Some(Arc::clone(&mailbox));
 

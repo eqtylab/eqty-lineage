@@ -1671,8 +1671,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "futures",
  "integrity",
  "nemo-relay-plugin",
+ "reqwest 0.12.28",
  "serde_json",
  "tempfile",
  "tokio",

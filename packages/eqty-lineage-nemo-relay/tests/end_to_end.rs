@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
-    LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy,
+    LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy, Provider,
     SessionFinished, SessionRouter, SignerFactory, classify, decode_event,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
@@ -3629,4 +3629,367 @@ fn a_delegated_turns_work_is_credited_to_the_agent_it_was_delegated_to() {
         blobs.contains("\"TurnDelegatedToAgent\":1"),
         "and coverage must count it:\n{blobs}"
     );
+}
+
+/// A gateway's manifest for one call, signed by a key of its own, and the two nodes a call joins.
+fn provider_manifest() -> (serde_json::Value, String, String) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let signer = Ed25519Signer::create().expect("a provider key");
+        let mut gateway = LineageSession::new(SignerType::ED25519(signer));
+        let asked = gateway
+            .register_content(
+                br#"{"model":"test-model","input":"hi"}"#,
+                serde_json::json!({ "name": "Client Request", "assetType": "Document" }),
+                None,
+            )
+            .await
+            .expect("the client request registers");
+        let answered = gateway
+            .register_content(
+                br#"{"id":"resp_1","output":"hello"}"#,
+                serde_json::json!({ "name": "Delivered Response", "assetType": "Document" }),
+                None,
+            )
+            .await
+            .expect("the delivered response registers");
+        gateway
+            .record_computation(
+                std::slice::from_ref(&asked),
+                std::slice::from_ref(&answered),
+                None,
+            )
+            .await
+            .expect("the inference registers");
+        let manifest = gateway.into_manifest().await.expect("a provider manifest");
+        (
+            serde_json::to_value(&manifest).expect("it serializes"),
+            asked.as_str().to_string(),
+            answered.as_str().to_string(),
+        )
+    })
+}
+
+/// Serve `answer(path, how many times this path was asked before)` and record `path auth` per hit.
+fn gateway(
+    answer: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let base_url = format!("http://{}", listener.local_addr().expect("an address"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let hits = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let path = request.split(' ').nth(1).unwrap_or_default().to_string();
+            let auth = request
+                .lines()
+                .find_map(|line| line.strip_prefix("authorization: "))
+                .unwrap_or("-")
+                .to_string();
+            let before = {
+                let mut hits = hits.lock().expect("the hits lock");
+                let before = hits
+                    .iter()
+                    .filter(|hit: &&String| hit.starts_with(&path))
+                    .count();
+                hits.push(format!("{path} {auth}"));
+                before
+            };
+            let (status, body) = answer(&path, before);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base_url, seen)
+}
+
+/// One answered model call for `test-model`, sent upstream as `relay_request_id`.
+fn call_sent_as(session: &str, relay_request_id: &str) -> Vec<Event> {
+    one_model_call(
+        session,
+        "openai.responses",
+        serde_json::json!([{ "role": "user", "content": "hi" }]),
+        "hello",
+    )
+    .into_iter()
+    .map(|event| {
+        let mut raw = serde_json::to_value(&event).expect("an event serializes");
+        if raw["category"] == "llm" && raw["scope_category"] == "start" {
+            raw["data"] = serde_json::json!({
+                "content": {},
+                "headers": { "x-nemo-relay-request-id": relay_request_id },
+            });
+        }
+        decode_event(&raw.to_string()).expect("and decodes again")
+    })
+    .collect()
+}
+
+/// Replay `events` with `provider` configured, and return the manifest written.
+fn replay_linked(events: &[Event], provider: Provider) -> serde_json::Value {
+    let into = TempDir::new().expect("a temp dir");
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start_with_providers(
+        into.path().to_path_buf(),
+        policy(),
+        signer_factory(),
+        forget_with(&router),
+        ignore_marks(),
+        vec![provider],
+    );
+    for event in events {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
+        }
+    }
+    drop(mailbox);
+    let written = written_json(&into);
+    assert_eq!(written.len(), 1, "one session, one manifest: {written:?}");
+    serde_json::from_slice(&fs::read(&written[0]).expect("it reads")).expect("it is JSON")
+}
+
+fn coverage_of(manifest: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    manifest["blobs"]
+        .as_object()
+        .expect("a blobs map")
+        .values()
+        .filter_map(|blob| {
+            base64::engine::general_purpose::STANDARD
+                .decode(blob.as_str()?)
+                .ok()
+        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .find(|blob| blob.contains("\"EventsDropped\""))
+        .expect("a coverage node")
+}
+
+#[test]
+fn a_provider_manifest_is_merged_whole_and_joined_to_its_call() {
+    let (theirs, asked, answered) = provider_manifest();
+    let served = theirs.to_string();
+    let (base_url, seen) = gateway(move |path, before| match path {
+        // The gateway writes its record after the response, so the first ask can miss.
+        "/integrity/logs/by-client-request-id/relay-request-1" if before == 0 => (404, "{}".into()),
+        "/integrity/logs/by-client-request-id/relay-request-1" => (
+            200,
+            r#"{"status":"ready","request_id":"provider-1"}"#.into(),
+        ),
+        "/integrity/manifest/provider-1" => (200, served.clone()),
+        _ => (500, "{}".into()),
+    });
+
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b1", "relay-request-1"),
+        Provider {
+            base_url,
+            api_key_env: Some("HOME".into()),
+            models: vec!["test-*".into()],
+        },
+    );
+
+    let statements = ours["statements"].as_object().expect("statements");
+    for (id, statement) in theirs["statements"].as_object().expect("their statements") {
+        assert_eq!(
+            statements.get(id),
+            Some(statement),
+            "every provider statement is carried over exactly as it was signed"
+        );
+    }
+    for cid in theirs["blobs"].as_object().expect("their blobs").keys() {
+        assert!(ours["blobs"].get(cid).is_some(), "and every blob: {cid}");
+    }
+
+    let ours_only: Vec<String> = statements
+        .iter()
+        .filter(|(id, _)| theirs["statements"].get(id.as_str()).is_none())
+        .map(|(_, statement)| statement.to_string())
+        .filter(|statement| statement.contains("ComputationRegistration"))
+        .collect();
+    assert!(
+        ours_only.iter().any(|statement| statement.contains(&asked)),
+        "a computation of ours leads to the provider's client request"
+    );
+    assert!(
+        ours_only
+            .iter()
+            .any(|statement| statement.contains(&answered)),
+        "and one leads back from its delivered response"
+    );
+    assert!(coverage_of(&ours).contains("\"ProviderManifestMerged\":1"));
+
+    let key = std::env::var("HOME").expect("HOME is set");
+    let seen = seen.lock().expect("the hits lock");
+    assert!(
+        seen.iter()
+            .all(|hit| hit.ends_with(&format!(" Bearer {key}"))),
+        "the gateway key is read from the named variable: {seen:?}"
+    );
+}
+
+#[test]
+fn a_call_with_no_provider_manifest_says_so() {
+    let (base_url, _seen) = gateway(|_, _| (200, r#"{"status":"failed","request_id":"x"}"#.into()));
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b2", "relay-request-2"),
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\":1"));
+}
+
+#[test]
+fn a_model_no_provider_serves_is_never_asked_about() {
+    let (base_url, seen) = gateway(|_, _| (500, "{}".into()));
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b3", "relay-request-3"),
+        Provider {
+            base_url,
+            api_key_env: Some("HOME".into()),
+            models: vec!["some-other-model".into()],
+        },
+    );
+    assert!(
+        seen.lock().expect("the hits lock").is_empty(),
+        "the key must not leave for a call that did not go through this gateway"
+    );
+    assert!(!coverage_of(&ours).contains("ProviderManifest"));
+}
+
+#[test]
+fn a_gateway_key_that_is_not_set_is_reported_and_nothing_is_sent() {
+    let (base_url, seen) = gateway(|_, _| (500, "{}".into()));
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b4", "relay-request-4"),
+        Provider {
+            base_url,
+            api_key_env: Some("EQTY_LINEAGE_TEST_VARIABLE_THAT_IS_NOT_SET".into()),
+            models: Vec::new(),
+        },
+    );
+    assert!(seen.lock().expect("the hits lock").is_empty());
+    let coverage = coverage_of(&ours);
+    assert!(coverage.contains("\"ProviderKeyUnset\":1"), "{coverage}");
+    assert!(!coverage.contains("ProviderManifestMissing"), "{coverage}");
+}
+
+/// A manifest this build cannot merge must not be counted as merged or joined to.
+#[test]
+fn a_provider_manifest_of_another_version_is_left_out_entirely() {
+    let (mut theirs, asked, _) = provider_manifest();
+    theirs["version"] = serde_json::json!("999");
+    let served = theirs.to_string();
+    let (base_url, _seen) = gateway(move |path, _| match path {
+        "/integrity/manifest/provider-5" => (200, served.clone()),
+        _ => (
+            200,
+            r#"{"status":"ready","request_id":"provider-5"}"#.into(),
+        ),
+    });
+    let ours = replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b5", "relay-request-5"),
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    let coverage = coverage_of(&ours);
+    assert!(
+        coverage.contains("\"ProviderManifestMissing\":1"),
+        "{coverage}"
+    );
+    assert!(!coverage.contains("ProviderManifestMerged"), "{coverage}");
+    assert!(
+        !ours["statements"].to_string().contains(&asked),
+        "nothing of ours may point into a manifest that was not merged"
+    );
+}
+
+/// The record names the manifest, and a name that is a dot segment would be a different route.
+#[test]
+fn a_record_naming_a_dot_segment_is_refused() {
+    let (base_url, seen) = gateway(|_, _| (200, r#"{"status":"ready","request_id":".."}"#.into()));
+    replay_linked(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000b6", "relay-request-6"),
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    let seen = seen.lock().expect("the hits lock");
+    assert_eq!(seen.len(), 1, "only the lookup is made: {seen:?}");
+}
+
+/// The filter is written against the name the agent asked for, whatever the gateway answered as.
+#[test]
+fn the_model_filter_matches_the_name_that_was_asked_for() {
+    let (base_url, seen) = gateway(|_, _| (200, r#"{"status":"failed"}"#.into()));
+    let events: Vec<Event> =
+        call_sent_as("01a040aa-0000-0000-0000-0000000000b7", "relay-request-7")
+            .into_iter()
+            .map(|event| {
+                let mut raw = serde_json::to_value(&event).expect("an event serializes");
+                if raw["category"] == "llm" && raw["scope_category"] == "end" {
+                    raw["category_profile"]["annotated_response"]["model"] =
+                        serde_json::json!("served-under-another-name");
+                }
+                decode_event(&raw.to_string()).expect("and decodes again")
+            })
+            .collect();
+    replay_linked(
+        &events,
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: vec!["test-model".into()],
+        },
+    );
+    assert_eq!(seen.lock().expect("the hits lock").len(), 1);
+}
+
+/// An unreachable gateway costs one failed request, not one per call.
+#[test]
+fn a_gateway_that_refuses_the_connection_is_not_retried() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let base_url = format!("http://{}", closed.local_addr().expect("an address"));
+    drop(closed);
+
+    let session = "01a040aa-0000-0000-0000-0000000000b8";
+    let mut events = call_sent_as(session, "relay-request-8");
+    events.extend(call_sent_as(session, "relay-request-9").into_iter().skip(1));
+    let started = std::time::Instant::now();
+    let ours = replay_linked(
+        &events,
+        Provider {
+            base_url,
+            api_key_env: None,
+            models: Vec::new(),
+        },
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\""));
 }

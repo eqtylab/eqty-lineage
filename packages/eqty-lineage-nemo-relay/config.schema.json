@@ -31,6 +31,34 @@
       "default": 104857600,
       "description": "Content larger than this is recorded by CID and metadata, without storing its bytes. Blobs are inlined into the manifest as base64, so a stored payload costs about 4/3 of its length."
     },
+    "provider_manifests": {
+      "type": "array",
+      "default": [],
+      "description": "Gateways asked, at export, for the manifest they signed for each model call. Each manifest is merged into the session's whole, and the call is joined to it by the x-nemo-relay-request-id Relay sent upstream. Off unless configured. A call is asked of the first entry whose models match it and of no other. deny_globs and max_content_bytes do not apply to what a gateway's manifest contains.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["base_url"],
+        "properties": {
+          "base_url": {
+            "type": "string",
+            "pattern": "^https?://",
+            "description": "Base URL of the gateway's /integrity routes, for example http://localhost:4000. Plain http is accepted only for a loopback host, since the gateway key is sent to it."
+          },
+          "api_key_env": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Environment variable holding the gateway key, read by the Relay process. Use the variable Relay takes the agent's key from (OPENAI_API_KEY for nemo-relay codex), so both present the same key. Omit for a gateway that serves manifests without one."
+          },
+          "models": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "Model name globs this gateway is asked about. Empty means every model. The gateway key is sent with each request, so list only models that are served through it."
+          }
+        }
+      }
+    },
     "executor": {
       "type": "object",
       "description": "Relay's own per-component executor override.",
