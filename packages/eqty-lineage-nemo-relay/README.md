@@ -71,6 +71,31 @@ max_content_bytes = 104857600
 
 `nemo-relay plugins validate eqty.lineage` reports every problem in the configuration at once.
 
+### Signing with a notary
+
+By default each session signs with a software key of its own. To sign with an EQTY notary instead,
+set `EQTY_NOTARY_URL` in the shell Relay is started from:
+
+```bash
+export EQTY_NOTARY_URL=http://localhost:8000
+```
+
+Every statement is then signed by the notary. Each manifest carries the notary's own registration,
+and its computations name the machine the notary runs on (`executedOn`), so a verifier can check
+the hardware behind the key.
+
+- The URL must be `http://<host>:<port>`, with an explicit port and no path. The notary is reached
+  over plain HTTP, so run it on the same host or inside the same trusted environment.
+- If a proxy is set (`HTTP_PROXY` or `ALL_PROXY`), add the notary's host to `NO_PROXY`. Otherwise
+  the plugin's first requests to the notary go through the proxy and may fail.
+- If the notary cannot be reached when Relay starts, gives an error, or takes more than 5 seconds to
+  sign, the plugin prints a warning and signs with a software key until Relay restarts. Nothing is
+  left unsigned: the statement being signed is signed again with the software key. The manifest's
+  coverage shows `NotaryUnavailable`, and `SigningFailed` counts the notary's failed signatures.
+- Every statement is a request to the notary, so a remote notary slows recording down.
+
+On Linux the plugin needs OpenSSL 3 (`libssl.so.3`) installed, whether or not a notary is used.
+
 ## Run
 
 ```bash

@@ -32,9 +32,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// gateway.
 const CONCURRENT_ASKS: usize = 8;
 /// The manifest version this build writes. A manifest of any other version cannot be merged.
-const MANIFEST_VERSION: &str = "3";
+pub(crate) const MANIFEST_VERSION: &str = "3";
 /// Manifests carry their blobs inline and can be large. This only stops an endless response.
-const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 /// One gateway that serves manifests, and which model calls to ask it about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,13 @@ pub async fn fetch_all(
 ) -> HashMap<String, Fetched> {
     let keys: Vec<_> = providers.iter().map(Provider::key).collect();
     // The key must not follow a redirect off the configured origin or down to plain http.
-    let builder = || reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    // rustls named explicitly: the notary signer pulls in native TLS too, and reqwest would
+    // otherwise pick that, with a different root store.
+    let builder = || {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+    };
     // Plain http is only allowed to loopback, which never needs a proxy, and a proxy would see the
     // key in clear. An https gateway keeps the environment's proxy: the key stays inside TLS.
     let (Ok(proxied), Ok(direct)) = (builder().build(), builder().no_proxy().build()) else {
@@ -165,7 +171,7 @@ enum Attempt {
 /// `NotFound` is a 404 and may be retried. `Refused` is any other answer, or no connection at all,
 /// and must not be. `Unreachable` is a timeout or a broken body, which may pass, so it is retried.
 #[derive(Debug)]
-enum Miss {
+pub(crate) enum Miss {
     NotFound,
     Refused,
     Unreachable,
@@ -220,10 +226,7 @@ impl Ask<'_> {
         };
         // Check this before linking. A manifest that cannot be merged must not be counted as
         // merged, and our statements must not point into it.
-        if manifest.get("version").and_then(Json::as_str) != Some(MANIFEST_VERSION)
-            || !manifest.get("statements").is_some_and(Json::is_object)
-            || !manifest.get("blobs").is_some_and(Json::is_object)
-        {
+        if !is_mergeable(&manifest) {
             return Attempt::Never;
         }
         Attempt::Ready(Box::new(Fetched {
@@ -264,7 +267,10 @@ impl Ask<'_> {
 
 /// Read a body of at most `limit` bytes. The limit is checked as the body arrives, so a larger
 /// body is never held in memory.
-async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, Miss> {
+pub(crate) async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, Miss> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
@@ -279,6 +285,13 @@ async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Ve
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Whether `manifest` is one `merge` can take: our version, with statements and blobs.
+pub(crate) fn is_mergeable(manifest: &Json) -> bool {
+    manifest.get("version").and_then(Json::as_str) == Some(MANIFEST_VERSION)
+        && manifest.get("statements").is_some_and(Json::is_object)
+        && manifest.get("blobs").is_some_and(Json::is_object)
 }
 
 /// The bytes of the first asset the manifest names with one of `names`, tried in the order given.

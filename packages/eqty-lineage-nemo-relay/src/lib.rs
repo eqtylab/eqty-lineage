@@ -30,6 +30,7 @@ mod config;
 mod files;
 mod lineage;
 mod mailbox;
+mod notary;
 mod provider;
 mod recorder;
 mod redaction;
@@ -46,6 +47,7 @@ pub use lineage::{AssetRef, LineageSession};
 pub use mailbox::{
     MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, SessionFinished, SignerFactory,
 };
+pub use notary::{NOTARY_URL, session_factory};
 pub use provider::Provider;
 pub use recorder::Recorder;
 pub use redaction::{Disposition, Policy, glob_match};
@@ -57,7 +59,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use nemo_relay_plugin::{
     ConfigDiagnostic, DiagnosticLevel, Event, Json, NativePlugin, PluginContext, PluginRuntime,
     Result, nemo_relay_plugin,
@@ -147,14 +148,11 @@ impl NativePlugin for EqtyLineagePlugin {
         }
 
         let policy = Policy::new(config.deny_globs.clone(), config.max_content_bytes);
-        // A factory rather than one signer: each session gets its own, so nothing signing-related is
-        // shared process-wide. Signer creation can fail, and a session that cannot be signed is not
-        // recorded rather than recorded unsigned.
-        let signer: SignerFactory = Box::new(|| {
-            Ed25519Signer::create()
-                .ok()
-                .map(|signer| LineageSession::new(SignerType::ED25519(signer)))
-        });
+        // A factory rather than one signer: each session gets its own signing state. A notary's
+        // identity is shared by all of them; a software key is made per session. Signer creation
+        // can fail, and a session that cannot be signed is not recorded rather than recorded
+        // unsigned.
+        let signer = notary::session_factory(notary::url_from_env());
         // The subscriber is `Fn`, not `FnMut`, so the router's state lives behind a lock.
         // Relay drives subscribers from its own queue rather than from the agent's critical path, so
         // this is uncontended in practice -- but it must never be held across anything slow.

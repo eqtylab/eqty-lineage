@@ -721,6 +721,11 @@ impl Recorder {
         }
     }
 
+    /// The signer's own registration, for the export to merge into the manifest.
+    pub fn signer_registration(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        self.lineage.signer_registration()
+    }
+
     /// Every recorded call that has an upstream request id, as `(relay request id, model, ended)`.
     pub fn provider_requests(&self) -> Vec<(String, Option<String>, Instant)> {
         self.calls
@@ -1166,12 +1171,38 @@ impl Recorder {
             self.count("MonologueNotSealed");
         }
 
+        let statements = self.lineage.statement_count();
+        let fell_back = self.lineage.signer_fell_back();
+        let bytes = self.bytes.clone();
+        let registered = self.register_coverage(at.clone()).await;
+        if !fell_back && self.lineage.signer_fell_back() {
+            // The node was built before the signer failed, so it says nothing failed. Taken back
+            // and built again from the counts as they are now.
+            self.lineage.take_back(statements);
+            self.bytes = bytes;
+            self.register_coverage(at).await?;
+        } else {
+            registered?;
+        }
+
+        self.lineage.into_manifest().await
+    }
+
+    async fn register_coverage(&mut self, at: Option<String>) -> Result<()> {
         // Stated even when it is zero, unlike every other counter. For the rest, absent means none
         // happened and a reader loses nothing by inferring it. This one answers "is this graph
         // complete?", and a reader who has to know that absence means zero cannot distinguish an
         // intact recording from a manifest written before the counter existed.
         self.stats
             .insert("EventsDropped".to_string(), self.events_dropped);
+        if self.lineage.signer_fell_back() {
+            self.stats.insert("NotaryUnavailable".to_string(), 1);
+        }
+        let signing_failures = self.lineage.signing_failures();
+        if signing_failures > 0 {
+            self.stats
+                .insert("SigningFailed".to_string(), signing_failures);
+        }
 
         let coverage: Value = self
             .stats
@@ -1211,8 +1242,7 @@ impl Recorder {
             at,
         )
         .await?;
-
-        self.lineage.into_manifest().await
+        Ok(())
     }
 }
 
