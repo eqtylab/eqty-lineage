@@ -1703,6 +1703,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "hex",
+ "http 1.4.0",
  "integrity",
  "nemo-relay-plugin",
  "p256 0.13.2",

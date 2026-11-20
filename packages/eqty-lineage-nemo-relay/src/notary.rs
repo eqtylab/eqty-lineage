@@ -1,7 +1,7 @@
 //! Signs with a notary when `EQTY_NOTARY_URL` is set, and otherwise with a key per session.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use integrity::signer::{
@@ -14,8 +14,7 @@ use crate::mailbox::SignerFactory;
 use crate::provider::{MANIFEST_VERSION, MAX_RESPONSE_BYTES, is_mergeable, read_capped};
 
 pub const NOTARY_URL: &str = "EQTY_NOTARY_URL";
-/// Connecting happens while Relay loads the plugin, so a notary that does not answer must not hold
-/// up the agent for long.
+/// For all of connecting. The first session waits on it.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The notary URL from the environment. Unset, empty and blank all mean "no notary".
@@ -26,44 +25,39 @@ pub fn url_from_env() -> Option<String> {
         .filter(|url| !url.is_empty())
 }
 
-/// Every session signs with the notary at `url`, or with a key of its own when there is none.
-///
-/// A notary that cannot be reached is not fatal. Sessions then sign with their own keys and say so
-/// in their coverage. One that fails later is not asked again until Relay restarts: every new
-/// session would otherwise wait on it first.
-///
-/// All sessions share the one notary identity; each still gets its own session state.
+/// Every session signs with the notary at `url`, or with a key of its own when there is none or it
+/// fails. Connected on first use, on the worker, so a dead notary never holds up Relay's startup.
 pub fn session_factory(url: Option<String>) -> SignerFactory {
     let Some(url) = url else {
         return own_key(false);
     };
-    match connect(&url) {
-        Ok(notary) => {
-            let failed = Arc::new(AtomicBool::new(false));
-            let fallback = own_key(true);
-            Box::new(move || {
-                if failed.load(Ordering::Relaxed) {
-                    return fallback();
-                }
-                Some(
-                    LineageSession::new(SignerType::VCompNotarySigner(notary.signer.clone()))
-                        .with_signer_identity(
-                            notary.signer.executed_on.clone(),
-                            notary.signer.operated_by.clone(),
-                            Some(Arc::clone(&notary.registration)),
-                        )
-                        .reporting_failure_to(Arc::clone(&failed)),
-                )
-            })
+    let notary = OnceLock::new();
+    let failed = Arc::new(AtomicBool::new(false));
+    let fallback = own_key(true);
+    Box::new(move || {
+        let notary = notary.get_or_init(|| {
+            connect(&url)
+                .map_err(|reason| {
+                    eprintln!(
+                        "eqty.lineage: warning: cannot use the notary at {url} ({reason}); \
+                         signing with a software key instead"
+                    )
+                })
+                .ok()
+        });
+        match notary {
+            Some(notary) if !failed.load(Ordering::Relaxed) => Some(
+                LineageSession::new(SignerType::VCompNotarySigner(notary.signer.clone()))
+                    .with_signer_identity(
+                        notary.signer.executed_on.clone(),
+                        notary.signer.operated_by.clone(),
+                        Some(Arc::clone(&notary.registration)),
+                    )
+                    .reporting_failure_to(Arc::clone(&failed)),
+            ),
+            _ => fallback(),
         }
-        Err(reason) => {
-            eprintln!(
-                "eqty.lineage: warning: cannot use the notary at {url} ({reason}); \
-                 signing with a software key instead"
-            );
-            own_key(true)
-        }
-    }
+    })
 }
 
 fn own_key(fell_back: bool) -> SignerFactory {
@@ -83,9 +77,6 @@ struct Notary {
 }
 
 fn connect(url: &str) -> Result<Notary, String> {
-    // The notary signer signs over a plain TCP connection to the URL's host and port, at a fixed
-    // path, and assumes port 8000 when none is given. Anything else would pass here and then fail
-    // at the first signature.
     if !is_signable_url(url) {
         return Err(format!(
             "{NOTARY_URL} must be http://<host>:<port>, with an explicit port and no path"
@@ -130,7 +121,8 @@ fn connect(url: &str) -> Result<Notary, String> {
         .map_err(|_| "it did not answer in time".to_string())?
 }
 
-/// Whether the notary signer would sign at `url` itself.
+/// Whether the notary signer would sign at `url` itself: it signs over plain TCP to the host and
+/// port, at a fixed path, and on port 8000 when none is given.
 fn is_signable_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -144,7 +136,15 @@ fn is_signable_url(url: &str) -> bool {
     let has_port = authority
         .rsplit_once(':')
         .is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
-    parsed.scheme() == "http" && has_port && parsed.path() == "/" && parsed.query().is_none()
+    // The signer parses with `http::Uri` and panics on a URL it cannot read, or one with no host.
+    let signable = url
+        .parse::<http::Uri>()
+        .is_ok_and(|uri| uri.host().is_some());
+    signable
+        && parsed.scheme() == "http"
+        && has_port
+        && parsed.path() == "/"
+        && parsed.query().is_none()
 }
 
 /// Check the registration can be merged into a manifest of ours.
@@ -181,6 +181,7 @@ mod tests {
             "http://[::1]",
             "http://notary:8000/notary",
             "http://notary:8000/?a=b",
+            "http://nötary:8000",
             "https://notary:8000",
             "notary:8000",
         ] {

@@ -31,6 +31,8 @@ uuid = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 base64 = "0.22"
 futures = "0.3"
+# Already in the tree through `integrity`: the notary signer parses its URL with it.
+http = "1"
 
 [dev-dependencies]
 # Fixtures are ATOF JSON Lines captured from a real session; the tests deserialize them into `Event`

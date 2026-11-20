@@ -1277,29 +1277,6 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> bool {
 /// The checkpoint carries no coverage node. That is the signal a reader needs: coverage states what
 /// a recording could not see, which is only knowable once it has stopped, so a manifest without one
 /// was written mid-session and may still grow.
-/// `manifest` as written to disk, with `others` merged in, and how many statements that makes.
-///
-/// Converted to JSON only when there is something to merge: a manifest carries its blobs inline,
-/// and the conversion holds a second copy of all of them.
-fn merged_json(
-    manifest: &integrity::lineage::models::manifest::Manifest,
-    others: impl IntoIterator<Item = Json>,
-) -> serde_json::Result<(Vec<u8>, usize)> {
-    let mut others = others.into_iter().peekable();
-    if others.peek().is_none() {
-        return Ok((
-            serde_json::to_vec_pretty(manifest)?,
-            manifest.statements.len(),
-        ));
-    }
-    let mut ours = serde_json::to_value(manifest)?;
-    for theirs in others {
-        provider::merge(&mut ours, theirs);
-    }
-    let statements = ours["statements"].as_object().map_or(0, |all| all.len());
-    Ok((serde_json::to_vec_pretty(&ours)?, statements))
-}
-
 async fn checkpoint(state: &mut SessionState) {
     let count = state.recorder.statement_count();
     if count == state.attempted_at {
@@ -1332,6 +1309,27 @@ async fn checkpoint(state: &mut SessionState) {
         // *export* that must know, because it announces and deletes on the strength of it.
         let _ = write_atomically(&state.path, &json);
     }
+}
+
+/// `manifest` as written to disk, with `others` merged in, and how many statements that makes.
+/// Converted to JSON only when there is something to merge: that holds a second copy of every blob.
+fn merged_json(
+    manifest: &integrity::lineage::models::manifest::Manifest,
+    others: impl IntoIterator<Item = Json>,
+) -> serde_json::Result<(Vec<u8>, usize)> {
+    let mut others = others.into_iter().peekable();
+    if others.peek().is_none() {
+        return Ok((
+            serde_json::to_vec_pretty(manifest)?,
+            manifest.statements.len(),
+        ));
+    }
+    let mut ours = serde_json::to_value(manifest)?;
+    for theirs in others {
+        provider::merge(&mut ours, theirs);
+    }
+    let statements = ours["statements"].as_object().map_or(0, |all| all.len());
+    Ok((serde_json::to_vec_pretty(&ours)?, statements))
 }
 
 /// Bound the loss counts by discarding those for sessions that are not open. Only at the second

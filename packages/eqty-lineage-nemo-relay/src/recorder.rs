@@ -1171,15 +1171,14 @@ impl Recorder {
             self.count("MonologueNotSealed");
         }
 
-        let statements = self.lineage.statement_count();
+        let mark = self.lineage.mark();
         let fell_back = self.lineage.signer_fell_back();
-        let bytes = self.bytes.clone();
+        let (stats, bytes) = (self.stats.clone(), self.bytes.clone());
         let registered = self.register_coverage(at.clone()).await;
         if !fell_back && self.lineage.signer_fell_back() {
-            // The node was built before the signer failed, so it says nothing failed. Taken back
-            // and built again from the counts as they are now.
-            self.lineage.take_back(statements);
-            self.bytes = bytes;
+            // Built before the signer failed, so it says nothing failed: built again.
+            self.lineage.take_back(mark);
+            (self.stats, self.bytes) = (stats, bytes);
             self.register_coverage(at).await?;
         } else {
             registered?;

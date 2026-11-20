@@ -4247,6 +4247,10 @@ fn a_notary_that_stops_signing_mid_session_still_leaves_a_manifest() {
         2,
         "the notary, then the fallback key: {issuers:?}"
     );
+    assert!(
+        ours["statements"].get("urn:cid:notary-identity").is_some(),
+        "the notary signed some of it, so its registration stays"
+    );
     assert_all_signed(&ours);
 }
 
@@ -4284,9 +4288,10 @@ fn a_notary_that_fails_at_the_first_statement_loses_nothing() {
     );
     assert_eq!(
         ours["statements"].as_object().expect("statements").len(),
-        without["statements"].as_object().expect("statements").len() + 1,
-        "and the same statements, plus the notary's registration"
+        without["statements"].as_object().expect("statements").len(),
+        "and the same statements, without the registration of a notary that signed none of them"
     );
+    assert!(ours["statements"].get("urn:cid:notary-identity").is_none());
     assert_all_signed(&ours);
 }
 
@@ -4337,7 +4342,19 @@ fn once_the_notary_fails_no_session_asks_it_again() {
         .block_on(open.register_entity(serde_json::json!({ "name": "agent" }), None))
         .expect("signed with the fallback key");
     assert!(open.signer_fell_back());
+    assert!(first.signer_registration().is_none() && open.signer_registration().is_none());
     let later = sessions().expect("a session");
     assert!(later.signer_fell_back());
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_notary_is_not_contacted_until_a_session_needs_it() {
+    // Accepts connections and never answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let url = format!("http://{}", silent.local_addr().expect("an address"));
+    let started = std::time::Instant::now();
+    let _sessions = session_factory(Some(url));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    drop(silent);
 }

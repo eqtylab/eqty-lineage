@@ -91,9 +91,10 @@ pub struct LineageSession {
     /// Where the signer runs and who operates it, stated on every computation.
     executed_on: Option<String>,
     operated_by: Option<String>,
-    /// The signer's own registration, as a manifest, for whoever writes ours to merge in. A remote
-    /// signer's key is only worth something next to the evidence that says where it lives.
+    /// The signer's own registration, as a manifest, for the writer to merge into ours.
     signer_registration: Option<Arc<Value>>,
+    /// Whether the configured signer has signed anything in this session.
+    signer_used: bool,
     /// Signatures the signer failed to give. Each statement involved is signed again by the
     /// fallback key, so none is left without a credential.
     signing_failures: u64,
@@ -101,8 +102,15 @@ pub struct LineageSession {
     signer_fell_back: bool,
     /// Raised on fallback so that sessions started later skip the failed signer.
     signer_failed: Option<Arc<AtomicBool>>,
-    /// Dedup entries added by the operation in progress, so a retry can take them back.
+    /// Every dedup entry added, in order, so `take_back` can remove those after a `Mark`.
     added: Vec<Added>,
+}
+
+/// A point in the session that `take_back` can return to.
+#[derive(Clone, Copy)]
+pub struct Mark {
+    statements: usize,
+    added: usize,
 }
 
 enum Added {
@@ -110,18 +118,16 @@ enum Added {
     Described((String, String)),
 }
 
-/// Run a session operation, and run it again with the fallback key if the signer failed partway
-/// through. The statements the failed attempt pushed name the old signer, so they are taken back
-/// first, along with the dedup entries that would make the retry skip them.
+/// Run an operation again with the fallback key if the signer failed partway through it. What the
+/// failed attempt added names the old signer, so it is taken back first.
 macro_rules! retried_on_fallback {
     ($session:ident, $attempt:expr) => {{
-        let statements = $session.statements.len();
         $session.follow_shared_failure();
+        let mark = $session.mark();
         let fell_back = $session.signer_fell_back;
-        $session.added.clear();
         match $attempt {
             Err(_) if !fell_back && $session.signer_fell_back => {
-                $session.take_back(statements);
+                $session.take_back(mark);
                 $attempt
             }
             done => done,
@@ -144,6 +150,7 @@ impl LineageSession {
             executed_on: None,
             operated_by: None,
             signer_registration: None,
+            signer_used: false,
             signing_failures: 0,
             signer_fell_back: false,
             signer_failed: None,
@@ -151,11 +158,17 @@ impl LineageSession {
         }
     }
 
-    /// Remove every statement after the first `statements`, with the dedup entries the last
-    /// operation added. For a statement built around a signer that has since been replaced.
-    pub fn take_back(&mut self, statements: usize) {
-        self.statements.truncate(statements);
-        for added in self.added.drain(..) {
+    pub fn mark(&self) -> Mark {
+        Mark {
+            statements: self.statements.len(),
+            added: self.added.len(),
+        }
+    }
+
+    /// Remove every statement and dedup entry added since `mark`.
+    pub fn take_back(&mut self, mark: Mark) {
+        self.statements.truncate(mark.statements);
+        for added in self.added.drain(mark.added..) {
             match added {
                 Added::Content(cid) => self.registered_content.remove(&cid),
                 Added::Described(pair) => self.described.remove(&pair),
@@ -181,9 +194,8 @@ impl LineageSession {
         }
     }
 
-    /// Sign the rest of the session with a key of its own. A remote signer that stops answering
-    /// would otherwise fail every later statement, the coverage node included, and the session
-    /// would write no manifest at all.
+    /// Sign the rest of the session with a key of its own, so a failed signer cannot cost it its
+    /// manifest.
     fn fall_back(&mut self) {
         if self.signer_fell_back || matches!(self.signer, SignerType::ED25519(_)) {
             return;
@@ -199,6 +211,10 @@ impl LineageSession {
         self.did = self.signer.get_did_doc().id;
         self.executed_on = None;
         self.operated_by = None;
+        // Its evidence vouches for its key, which signed nothing here.
+        if !self.signer_used {
+            self.signer_registration = None;
+        }
         self.signer_fell_back = true;
         if let Some(failed) = &self.signer_failed {
             failed.store(true, Ordering::Relaxed);
@@ -517,9 +533,12 @@ impl LineageSession {
                 .await
                 .unwrap_or_else(|_| Err(anyhow!("the signer did not answer in time")))
         };
-        if signed.is_err() {
-            self.signing_failures += 1;
-            self.fall_back();
+        match &signed {
+            Ok(_) => self.signer_used |= !self.signer_fell_back,
+            Err(_) => {
+                self.signing_failures += 1;
+                self.fall_back();
+            }
         }
         signed
     }

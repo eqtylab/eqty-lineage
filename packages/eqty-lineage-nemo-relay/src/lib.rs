@@ -43,7 +43,7 @@ pub use files::{
     EditAttempt, FileMode, FileObserved, Hunk, ReplayRefusal, apply_edit, apply_line_edit,
     file_events_from_patch, file_events_from_result, paths_in_patch,
 };
-pub use lineage::{AssetRef, LineageSession};
+pub use lineage::{AssetRef, LineageSession, Mark};
 pub use mailbox::{
     MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, SessionFinished, SignerFactory,
 };
@@ -148,10 +148,8 @@ impl NativePlugin for EqtyLineagePlugin {
         }
 
         let policy = Policy::new(config.deny_globs.clone(), config.max_content_bytes);
-        // A factory rather than one signer: each session gets its own signing state. A notary's
-        // identity is shared by all of them; a software key is made per session. Signer creation
-        // can fail, and a session that cannot be signed is not recorded rather than recorded
-        // unsigned.
+        // A factory so each session gets its own signing state. A session whose signer cannot be
+        // created is not recorded, rather than recorded unsigned.
         let signer = notary::session_factory(notary::url_from_env());
         // The subscriber is `Fn`, not `FnMut`, so the router's state lives behind a lock.
         // Relay drives subscribers from its own queue rather than from the agent's critical path, so
