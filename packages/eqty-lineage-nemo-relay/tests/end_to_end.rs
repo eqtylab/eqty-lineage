@@ -4395,3 +4395,61 @@ fn a_notary_that_first_fails_while_finishing_leaves_no_registration() {
     assert!(registration.is_none());
     assert!(!manifest.statements.is_empty());
 }
+
+/// Coverage without the counters a notary failure adds, for comparing against a run without one.
+fn coverage_without_notary_counters(manifest: &serde_json::Value) -> serde_json::Value {
+    let mut coverage: serde_json::Value =
+        serde_json::from_str(&coverage_of(manifest)).expect("coverage is JSON");
+    let counts = coverage.as_object_mut().expect("an object");
+    counts.remove("NotaryUnavailable");
+    counts.remove("SigningFailed");
+    coverage
+}
+
+#[test]
+fn a_notary_failing_at_any_signature_leaves_a_whole_and_honest_manifest() {
+    let events = fixture();
+    let (url, asked) = notary_counting(usize::MAX, false);
+    let full = replay_signed(&events, session_factory(Some(url)));
+    let signatures = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        signatures > 30,
+        "enough signatures to fail at: {signatures}"
+    );
+
+    // In parallel: each case is a whole session with its own notary.
+    std::thread::scope(|scope| {
+        for signs in 0..=signatures {
+            let (events, full) = (&events, &full);
+            scope.spawn(move || {
+                let ours = replay_signed(events, session_factory(Some(notary(signs, false))));
+                let at = format!("notary failing after {signs} of {signatures} signatures");
+
+                assert_all_signed(&ours);
+                assert_eq!(
+                    coverage_without_notary_counters(&ours),
+                    coverage_without_notary_counters(full),
+                    "{at}: the same things were recorded"
+                );
+
+                let notary_signed = of_type(&ours, "CredentialRegistration").any(|statement| {
+                    statement["credential"]["issuer"]
+                        .as_str()
+                        .is_some_and(|issuer| issuer.starts_with("did:key:zDn"))
+                });
+                let registration = ours["statements"].get("urn:cid:notary-identity").is_some();
+                assert_eq!(
+                    registration, notary_signed,
+                    "{at}: the registration is there exactly when a notary signature is"
+                );
+
+                let fell_back = coverage_of(&ours).contains("\"NotaryUnavailable\":1");
+                assert_eq!(
+                    fell_back,
+                    signs < signatures,
+                    "{at}: coverage says whether it fell back"
+                );
+            });
+        }
+    });
+}
