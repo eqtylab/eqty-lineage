@@ -1395,14 +1395,7 @@ fn export(
     } else {
         runtime.block_on(provider::fetch_all(providers, wanted.clone()))
     };
-    // Merged like a gateway's manifest, and for the same reason: its statements were signed as
-    // served, so they are carried over without being re-encoded.
-    let mut provider_manifests: Vec<_> = state
-        .recorder
-        .signer_registration()
-        .map(|registration| (*registration).clone())
-        .into_iter()
-        .collect();
+    let mut provider_manifests = Vec::new();
     for (relay_request_id, model, _) in wanted {
         let Some(found) = fetched.remove(&relay_request_id) else {
             if let Some(provider) = providers
@@ -1426,9 +1419,15 @@ fn export(
         }
     }
 
-    let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
+    // Read after finishing, which can still fall back and so drop the registration.
+    let Ok((manifest, registration)) =
+        runtime.block_on(state.recorder.finish_with_signer_registration(None))
+    else {
         return;
     };
+    // Merged like a gateway's manifest, and for the same reason: its statements were signed as
+    // served, so they are carried over without being re-encoded.
+    provider_manifests.extend(registration.map(|registration| (*registration).clone()));
     let Ok((json, statements)) = merged_json(&manifest, provider_manifests) else {
         return;
     };

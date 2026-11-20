@@ -1162,7 +1162,17 @@ impl Recorder {
     /// Coverage goes inside the graph, signed, rather than into a log beside it. A reader who cannot
     /// see the gaps cannot weigh the evidence: "no failed tool calls" and "this capture path cannot
     /// observe tool failure" look identical from outside, and on Codex it is always the second.
-    pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
+    pub async fn finish(self, at: Option<String>) -> Result<Manifest> {
+        self.finish_with_signer_registration(at)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// `finish`, and the signer's registration as it stands once finishing can no longer change it.
+    pub async fn finish_with_signer_registration(
+        mut self,
+        at: Option<String>,
+    ) -> Result<(Manifest, Option<std::sync::Arc<serde_json::Value>>)> {
         // Counted rather than raised. The recording is complete without the collections -- the view
         // keeps every monologue payload in the file whether or not anything indexes them -- and
         // refusing to export a session because its index failed would trade the whole graph for a
@@ -1184,7 +1194,8 @@ impl Recorder {
             registered?;
         }
 
-        self.lineage.into_manifest().await
+        let registration = self.lineage.signer_registration();
+        Ok((self.lineage.into_manifest().await?, registration))
     }
 
     async fn register_coverage(&mut self, at: Option<String>) -> Result<()> {

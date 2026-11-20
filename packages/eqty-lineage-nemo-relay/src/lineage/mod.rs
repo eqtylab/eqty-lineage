@@ -111,6 +111,7 @@ pub struct LineageSession {
 pub struct Mark {
     statements: usize,
     added: usize,
+    signer_used: bool,
 }
 
 enum Added {
@@ -162,12 +163,14 @@ impl LineageSession {
         Mark {
             statements: self.statements.len(),
             added: self.added.len(),
+            signer_used: self.signer_used,
         }
     }
 
     /// Remove every statement and dedup entry added since `mark`.
     pub fn take_back(&mut self, mark: Mark) {
         self.statements.truncate(mark.statements);
+        self.signer_used = mark.signer_used;
         for added in self.added.drain(mark.added..) {
             match added {
                 Added::Content(cid) => self.registered_content.remove(&cid),
@@ -211,10 +214,6 @@ impl LineageSession {
         self.did = self.signer.get_did_doc().id;
         self.executed_on = None;
         self.operated_by = None;
-        // Its evidence vouches for its key, which signed nothing here.
-        if !self.signer_used {
-            self.signer_registration = None;
-        }
         self.signer_fell_back = true;
         if let Some(failed) = &self.signer_failed {
             failed.store(true, Ordering::Relaxed);
@@ -244,8 +243,11 @@ impl LineageSession {
         self
     }
 
+    /// None once the session has fallen back without the signer signing anything that remains:
+    /// its evidence would vouch for a key that signed nothing here.
     pub fn signer_registration(&self) -> Option<Arc<Value>> {
-        self.signer_registration.clone()
+        let unused = self.signer_fell_back && !self.signer_used;
+        self.signer_registration.clone().filter(|_| !unused)
     }
 
     pub fn signing_failures(&self) -> u64 {

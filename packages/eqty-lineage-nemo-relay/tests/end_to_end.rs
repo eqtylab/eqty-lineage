@@ -4358,3 +4358,40 @@ fn the_notary_is_not_contacted_until_a_session_needs_it() {
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     drop(silent);
 }
+
+#[test]
+fn a_notary_signature_that_is_taken_back_does_not_keep_its_registration() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    // The entity is signed by the notary, its metadata is not, and the whole operation is redone
+    // with the fallback key: the notary signed nothing that remains.
+    let mut session = session_factory(Some(notary(1, false)))().expect("a session");
+    runtime
+        .block_on(session.register_entity(serde_json::json!({ "name": "agent" }), None))
+        .expect("signed with the fallback key");
+    assert!(session.signer_fell_back());
+    assert!(session.signer_registration().is_none());
+}
+
+#[test]
+fn a_notary_that_first_fails_while_finishing_leaves_no_registration() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let session = session_factory(Some(notary(0, false)))().expect("a session");
+    assert!(
+        session.signer_registration().is_some(),
+        "held until it is known to be unused"
+    );
+    let (manifest, registration) = runtime
+        .block_on(
+            eqty_lineage_nemo_relay::Recorder::new(session, policy())
+                .finish_with_signer_registration(None),
+        )
+        .expect("it finishes on the fallback key");
+    assert!(registration.is_none());
+    assert!(!manifest.statements.is_empty());
+}
