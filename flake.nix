@@ -23,6 +23,9 @@
             rustc
             rustfmt
             clippy
+            # The notary signer's HTTP client links OpenSSL on Linux.
+            openssl
+            pkg-config
           ];
 
           shellHook = ''

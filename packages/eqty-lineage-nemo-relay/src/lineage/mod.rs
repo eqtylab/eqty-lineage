@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use integrity::blob_store::{BlobStore, InMemoryStore};
@@ -32,7 +33,7 @@ use integrity::lineage::models::statements::{
     ComputationStatement, DataStatement, EntityStatement, MetadataStatement, Statement,
     StatementTrait, VcStatement,
 };
-use integrity::signer::SignerType;
+use integrity::signer::{SignerType, ed25519_signer::Ed25519Signer};
 use integrity::vc;
 use serde_json::Value;
 use uuid::Uuid;
@@ -40,6 +41,8 @@ use uuid::Uuid;
 /// How many blobs `resolve_blobs` fetches at once. Ours are already in memory, so this only bounds
 /// the futures it holds; the value matches what `integrity-py` passes.
 const BLOB_CONCURRENCY: usize = 8;
+/// How long a remote signer gets for one signature before the session falls back to its own key.
+const SIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A handle to something a computation can consume or produce.
 ///
@@ -85,6 +88,52 @@ pub struct LineageSession {
     /// taking, and walking every blob to answer "would walking every blob be expensive?" defeats the
     /// question.
     blob_bytes: usize,
+    /// Where the signer runs and who operates it, stated on every computation.
+    executed_on: Option<String>,
+    operated_by: Option<String>,
+    /// The signer's own registration, as a manifest, for the writer to merge into ours.
+    signer_registration: Option<Arc<Value>>,
+    /// Whether the configured signer has signed anything in this session.
+    signer_used: bool,
+    /// Signatures the signer failed to give. Each statement involved is signed again by the
+    /// fallback key, so none is left without a credential.
+    signing_failures: u64,
+    /// The configured signer could not be used, so this session signs with a key of its own.
+    signer_fell_back: bool,
+    /// Raised on fallback so that sessions started later skip the failed signer.
+    signer_failed: Option<Arc<AtomicBool>>,
+    /// Every dedup entry added, in order, so `take_back` can remove those after a `Mark`.
+    added: Vec<Added>,
+}
+
+/// A point in the session that `take_back` can return to.
+#[derive(Clone, Copy)]
+pub struct Mark {
+    statements: usize,
+    added: usize,
+    signer_used: bool,
+}
+
+enum Added {
+    Content(String),
+    Described((String, String)),
+}
+
+/// Run an operation again with the fallback key if the signer failed partway through it. What the
+/// failed attempt added names the old signer, so it is taken back first.
+macro_rules! retried_on_fallback {
+    ($session:ident, $attempt:expr) => {{
+        $session.follow_shared_failure();
+        let mark = $session.mark();
+        let fell_back = $session.signer_fell_back;
+        match $attempt {
+            Err(_) if !fell_back && $session.signer_fell_back => {
+                $session.take_back(mark);
+                $attempt
+            }
+            done => done,
+        }
+    }};
 }
 
 impl LineageSession {
@@ -99,7 +148,110 @@ impl LineageSession {
             registered_content: HashSet::new(),
             described: HashSet::new(),
             blob_bytes: 0,
+            executed_on: None,
+            operated_by: None,
+            signer_registration: None,
+            signer_used: false,
+            signing_failures: 0,
+            signer_fell_back: false,
+            signer_failed: None,
+            added: Vec::new(),
         }
+    }
+
+    pub fn mark(&self) -> Mark {
+        Mark {
+            statements: self.statements.len(),
+            added: self.added.len(),
+            signer_used: self.signer_used,
+        }
+    }
+
+    /// Remove every statement and dedup entry added since `mark`.
+    pub fn take_back(&mut self, mark: Mark) {
+        self.statements.truncate(mark.statements);
+        self.signer_used = mark.signer_used;
+        for added in self.added.drain(mark.added..) {
+            match added {
+                Added::Content(cid) => self.registered_content.remove(&cid),
+                Added::Described(pair) => self.described.remove(&pair),
+            };
+        }
+    }
+
+    /// Raise `failed` when this session falls back, so the factory can skip the signer after.
+    pub fn reporting_failure_to(mut self, failed: Arc<AtomicBool>) -> Self {
+        self.signer_failed = Some(failed);
+        self
+    }
+
+    /// Fall back now if another session already found the shared signer failed, rather than
+    /// waiting on it again.
+    fn follow_shared_failure(&mut self) {
+        if self
+            .signer_failed
+            .as_ref()
+            .is_some_and(|failed| failed.load(Ordering::Relaxed))
+        {
+            self.fall_back();
+        }
+    }
+
+    /// Sign the rest of the session with a key of its own, so a failed signer cannot cost it its
+    /// manifest.
+    fn fall_back(&mut self) {
+        if self.signer_fell_back || matches!(self.signer, SignerType::ED25519(_)) {
+            return;
+        }
+        let Ok(key) = Ed25519Signer::create() else {
+            return;
+        };
+        eprintln!(
+            "eqty.lineage: warning: the signer {} failed; signing with a software key from now on",
+            self.did
+        );
+        self.signer = SignerType::ED25519(key);
+        self.did = self.signer.get_did_doc().id;
+        self.executed_on = None;
+        self.operated_by = None;
+        self.signer_fell_back = true;
+        if let Some(failed) = &self.signer_failed {
+            failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark this session as signed by a fallback key rather than the configured signer.
+    pub fn fell_back(mut self) -> Self {
+        self.signer_fell_back = true;
+        self
+    }
+
+    pub fn signer_fell_back(&self) -> bool {
+        self.signer_fell_back
+    }
+
+    /// Name where the signer runs and who operates it, and carry its registration.
+    pub fn with_signer_identity(
+        mut self,
+        executed_on: Option<String>,
+        operated_by: Option<String>,
+        registration: Option<Arc<Value>>,
+    ) -> Self {
+        self.executed_on = executed_on;
+        self.operated_by = operated_by;
+        self.signer_registration = registration;
+        self
+    }
+
+    /// None once the session has fallen back without the signer signing anything that remains:
+    /// its evidence would vouch for a key that signed nothing here.
+    pub fn signer_registration(&self) -> Option<Arc<Value>> {
+        let unused = self.signer_fell_back && !self.signer_used;
+        self.signer_registration.clone().filter(|_| !unused)
+    }
+
+    pub fn signing_failures(&self) -> u64 {
+        self.signing_failures
     }
 
     /// Store one blob, keeping the byte total in step.
@@ -137,10 +289,24 @@ impl LineageSession {
         metadata: Value,
         at: Option<String>,
     ) -> Result<AssetRef> {
+        retried_on_fallback!(
+            self,
+            self.register_content_once(content, metadata.clone(), at.clone())
+                .await
+        )
+    }
+
+    async fn register_content_once(
+        &mut self,
+        content: &[u8],
+        metadata: Value,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
         let content_cid = blake3_cid_raw_binary(content)?;
         self.put_blob(content_cid.clone(), content.to_vec());
 
         if self.registered_content.insert(content_cid.clone()) {
+            self.added.push(Added::Content(content_cid.clone()));
             let data = Statement::DataRegistration(
                 DataStatement::create(vec![content_cid.clone()], self.did.clone(), at.clone())
                     .await?,
@@ -171,12 +337,26 @@ impl LineageSession {
         metadata: Value,
         at: Option<String>,
     ) -> Result<AssetRef> {
+        retried_on_fallback!(
+            self,
+            self.register_collection_once(members, metadata.clone(), at.clone())
+                .await
+        )
+    }
+
+    async fn register_collection_once(
+        &mut self,
+        members: &HashMap<String, String>,
+        metadata: Value,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
         let built = compute_iroh_collection_cid(members).await?;
         let collection_cid = built.collection.cid.clone();
         self.put_blob(collection_cid.clone(), built.collection.blob.to_vec());
         self.put_blob(built.meta.cid.clone(), built.meta.blob.to_vec());
 
         if self.registered_content.insert(collection_cid.clone()) {
+            self.added.push(Added::Content(collection_cid.clone()));
             let data = Statement::DataRegistration(
                 DataStatement::create(vec![collection_cid.clone()], self.did.clone(), at.clone())
                     .await?,
@@ -210,6 +390,18 @@ impl LineageSession {
         metadata: Value,
         at: Option<String>,
     ) -> Result<AssetRef> {
+        retried_on_fallback!(
+            self,
+            self.register_entity_once(metadata.clone(), at.clone())
+                .await
+        )
+    }
+
+    async fn register_entity_once(
+        &mut self,
+        metadata: Value,
+        at: Option<String>,
+    ) -> Result<AssetRef> {
         let uuid = Uuid::new_v4().to_string();
         let entity = Statement::EntityRegistration(
             EntityStatement::create(vec![uuid], self.did.clone(), at.clone()).await?,
@@ -236,6 +428,20 @@ impl LineageSession {
         describes: Value,
         at: Option<String>,
     ) -> Result<()> {
+        retried_on_fallback!(
+            self,
+            self.record_computation_described_once(inputs, outputs, describes.clone(), at.clone())
+                .await
+        )
+    }
+
+    async fn record_computation_described_once(
+        &mut self,
+        inputs: &[AssetRef],
+        outputs: &[AssetRef],
+        describes: Value,
+        at: Option<String>,
+    ) -> Result<()> {
         if outputs.is_empty() {
             return Err(anyhow!("a computation with no outputs is not lineage"));
         }
@@ -245,8 +451,8 @@ impl LineageSession {
                 None,
                 inputs.iter().map(|input| input.0.clone()).collect(),
                 outputs.iter().map(|output| output.0.clone()).collect(),
-                self.did.clone(),
-                None,
+                self.operated_by.clone().unwrap_or_else(|| self.did.clone()),
+                self.executed_on.clone(),
                 self.did.clone(),
                 at.clone(),
             )
@@ -268,6 +474,19 @@ impl LineageSession {
         outputs: &[AssetRef],
         at: Option<String>,
     ) -> Result<()> {
+        retried_on_fallback!(
+            self,
+            self.record_computation_once(inputs, outputs, at.clone())
+                .await
+        )
+    }
+
+    async fn record_computation_once(
+        &mut self,
+        inputs: &[AssetRef],
+        outputs: &[AssetRef],
+        at: Option<String>,
+    ) -> Result<()> {
         if outputs.is_empty() {
             return Err(anyhow!("a computation with no outputs is not lineage"));
         }
@@ -277,8 +496,8 @@ impl LineageSession {
                 None,
                 inputs.iter().map(|input| input.0.clone()).collect(),
                 outputs.iter().map(|output| output.0.clone()).collect(),
-                self.did.clone(),
-                None,
+                self.operated_by.clone().unwrap_or_else(|| self.did.clone()),
+                self.executed_on.clone(),
                 self.did.clone(),
                 at.clone(),
             )
@@ -296,12 +515,34 @@ impl LineageSession {
         let subject = statement.get_id();
         self.statements.push(statement);
 
-        let credential = vc::issue_vc(&subject, self.signer.clone()).await?;
+        let credential = self.sign(&subject).await?;
         let credential = serde_json::from_value(serde_json::to_value(credential)?)?;
         self.statements.push(Statement::CredentialRegistration(
             VcStatement::create(credential, self.did.clone(), at).await?,
         ));
         Ok(())
+    }
+
+    /// Issue a credential for `subject`, falling back to a key of our own if the signer fails.
+    async fn sign(&mut self, subject: &str) -> Result<vc::SignedVc> {
+        let signing = vc::issue_vc(subject, self.signer.clone());
+        // A local key cannot hang. A remote signer can accept the connection and never answer,
+        // which would stall every session queued behind this one.
+        let signed = if matches!(self.signer, SignerType::ED25519(_)) {
+            signing.await
+        } else {
+            tokio::time::timeout(SIGN_TIMEOUT, signing)
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("the signer did not answer in time")))
+        };
+        match &signed {
+            Ok(_) => self.signer_used |= !self.signer_fell_back,
+            Err(_) => {
+                self.signing_failures += 1;
+                self.fall_back();
+            }
+        }
+        signed
     }
 
     /// Keep canonical metadata bytes so their CID resolves in the manifest.
@@ -317,9 +558,11 @@ impl LineageSession {
         self.put_blob(metadata_cid.clone(), canonical);
 
         // Same subject, same claim, already stated. Saying it twice adds nothing a reader can use.
-        if !self.described.insert((subject.clone(), metadata_cid)) {
+        let pair = (subject.clone(), metadata_cid);
+        if !self.described.insert(pair.clone()) {
             return Ok(());
         }
+        self.added.push(Added::Described(pair));
 
         let statement = Statement::MetadataRegistration(
             MetadataStatement::create_from_json(subject, metadata, self.did.clone(), at.clone())

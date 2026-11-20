@@ -1297,12 +1297,39 @@ async fn checkpoint(state: &mut SessionState) {
     let Ok(manifest) = state.recorder.snapshot().await else {
         return;
     };
-    if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
+    // The signer's registration goes in here too. After a crash this may be the only copy, and
+    // statements signed by a notary mean little without the evidence behind its key.
+    let registration = state.recorder.signer_registration();
+    let merging = registration
+        .iter()
+        .map(|registration| (**registration).clone());
+    if let Ok((json, _)) = merged_json(&manifest, merging) {
         // The result is deliberately unused here: a checkpoint is superseded by the next one and by
         // the final export, so a failed one costs nothing a later write does not replace. It is the
         // *export* that must know, because it announces and deletes on the strength of it.
         let _ = write_atomically(&state.path, &json);
     }
+}
+
+/// `manifest` as written to disk, with `others` merged in, and how many statements that makes.
+/// Converted to JSON only when there is something to merge: that holds a second copy of every blob.
+fn merged_json(
+    manifest: &integrity::lineage::models::manifest::Manifest,
+    others: impl IntoIterator<Item = Json>,
+) -> serde_json::Result<(Vec<u8>, usize)> {
+    let mut others = others.into_iter().peekable();
+    if others.peek().is_none() {
+        return Ok((
+            serde_json::to_vec_pretty(manifest)?,
+            manifest.statements.len(),
+        ));
+    }
+    let mut ours = serde_json::to_value(manifest)?;
+    for theirs in others {
+        provider::merge(&mut ours, theirs);
+    }
+    let statements = ours["statements"].as_object().map_or(0, |all| all.len());
+    Ok((serde_json::to_vec_pretty(&ours)?, statements))
 }
 
 /// Bound the loss counts by discarding those for sessions that are not open. Only at the second
@@ -1392,24 +1419,16 @@ fn export(
         }
     }
 
-    let Ok(manifest) = runtime.block_on(state.recorder.finish(None)) else {
+    // Read after finishing, which can still fall back and so drop the registration.
+    let Ok((manifest, registration)) =
+        runtime.block_on(state.recorder.finish_with_signer_registration(None))
+    else {
         return;
     };
-    let mut statements = manifest.statements.len();
-    let merged = if provider_manifests.is_empty() {
-        serde_json::to_vec_pretty(&manifest)
-    } else {
-        serde_json::to_value(&manifest).and_then(|mut ours| {
-            for theirs in provider_manifests {
-                provider::merge(&mut ours, theirs);
-            }
-            statements = ours["statements"]
-                .as_object()
-                .map_or(statements, |all| all.len());
-            serde_json::to_vec_pretty(&ours)
-        })
-    };
-    let Ok(json) = merged else {
+    // Merged like a gateway's manifest, and for the same reason: its statements were signed as
+    // served, so they are carried over without being re-encoded.
+    provider_manifests.extend(registration.map(|registration| (*registration).clone()));
+    let Ok((json, statements)) = merged_json(&manifest, provider_manifests) else {
         return;
     };
 

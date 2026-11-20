@@ -721,6 +721,11 @@ impl Recorder {
         }
     }
 
+    /// The signer's own registration, for the export to merge into the manifest.
+    pub fn signer_registration(&self) -> Option<std::sync::Arc<serde_json::Value>> {
+        self.lineage.signer_registration()
+    }
+
     /// Every recorded call that has an upstream request id, as `(relay request id, model, ended)`.
     pub fn provider_requests(&self) -> Vec<(String, Option<String>, Instant)> {
         self.calls
@@ -1157,7 +1162,17 @@ impl Recorder {
     /// Coverage goes inside the graph, signed, rather than into a log beside it. A reader who cannot
     /// see the gaps cannot weigh the evidence: "no failed tool calls" and "this capture path cannot
     /// observe tool failure" look identical from outside, and on Codex it is always the second.
-    pub async fn finish(mut self, at: Option<String>) -> Result<Manifest> {
+    pub async fn finish(self, at: Option<String>) -> Result<Manifest> {
+        self.finish_with_signer_registration(at)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// `finish`, and the signer's registration as it stands once finishing can no longer change it.
+    pub async fn finish_with_signer_registration(
+        mut self,
+        at: Option<String>,
+    ) -> Result<(Manifest, Option<std::sync::Arc<serde_json::Value>>)> {
         // Counted rather than raised. The recording is complete without the collections -- the view
         // keeps every monologue payload in the file whether or not anything indexes them -- and
         // refusing to export a session because its index failed would trade the whole graph for a
@@ -1166,12 +1181,38 @@ impl Recorder {
             self.count("MonologueNotSealed");
         }
 
+        let mark = self.lineage.mark();
+        let fell_back = self.lineage.signer_fell_back();
+        let (stats, bytes) = (self.stats.clone(), self.bytes.clone());
+        let registered = self.register_coverage(at.clone()).await;
+        if !fell_back && self.lineage.signer_fell_back() {
+            // Built before the signer failed, so it says nothing failed: built again.
+            self.lineage.take_back(mark);
+            (self.stats, self.bytes) = (stats, bytes);
+            self.register_coverage(at).await?;
+        } else {
+            registered?;
+        }
+
+        let registration = self.lineage.signer_registration();
+        Ok((self.lineage.into_manifest().await?, registration))
+    }
+
+    async fn register_coverage(&mut self, at: Option<String>) -> Result<()> {
         // Stated even when it is zero, unlike every other counter. For the rest, absent means none
         // happened and a reader loses nothing by inferring it. This one answers "is this graph
         // complete?", and a reader who has to know that absence means zero cannot distinguish an
         // intact recording from a manifest written before the counter existed.
         self.stats
             .insert("EventsDropped".to_string(), self.events_dropped);
+        if self.lineage.signer_fell_back() {
+            self.stats.insert("NotaryUnavailable".to_string(), 1);
+        }
+        let signing_failures = self.lineage.signing_failures();
+        if signing_failures > 0 {
+            self.stats
+                .insert("SigningFailed".to_string(), signing_failures);
+        }
 
         let coverage: Value = self
             .stats
@@ -1211,8 +1252,7 @@ impl Recorder {
             at,
         )
         .await?;
-
-        self.lineage.into_manifest().await
+        Ok(())
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use eqty_lineage_nemo_relay::{
     LineageSession, MANIFEST_MARK, Mailbox, ManifestAnnounced, ManifestMark, Policy, Provider,
-    SessionFinished, SessionRouter, SignerFactory, classify, decode_event,
+    SessionFinished, SessionRouter, SignerFactory, classify, decode_event, session_factory,
 };
 use integrity::cid::blake3::blake3_cid_raw_binary;
 use integrity::lineage::models::manifest::Manifest;
@@ -3992,4 +3992,472 @@ fn a_gateway_that_refuses_the_connection_is_not_retried() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
     assert!(coverage_of(&ours).contains("\"ProviderManifestMissing\""));
+}
+
+const NOTARY_EXECUTED_ON: &str = "did:key:z6MkexecutedOnNotaryMachine";
+const NOTARY_OPERATED_BY: &str = "did:key:z6MkoperatedByNotaryOperator";
+
+/// A notary that signs with a P-256 key, and after the first `signs` signatures refuses each one or,
+/// with `then_hang`, accepts the next and never answers.
+fn notary(signs: usize, then_hang: bool) -> String {
+    notary_counting(signs, then_hang).0
+}
+
+/// `notary`, and the number of signature requests it has received.
+fn notary_counting(signs: usize, then_hang: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use base64::Engine as _;
+    use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
+    use std::io::{Read, Write};
+
+    let key = SigningKey::from_bytes((&[7u8; 32]).into()).expect("a P-256 key");
+    let public_key = hex::encode(key.verifying_key().to_encoded_point(true).as_bytes());
+    let evidence = base64::engine::general_purpose::STANDARD.encode(b"hardware evidence");
+    let registration = serde_json::json!({
+        "version": "3",
+        "contexts": {},
+        "statements": { "urn:cid:notary-identity": { "@id": "urn:cid:notary-identity" } },
+        "blobs": { "notary-evidence": evidence },
+    })
+    .to_string();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let url = format!("http://{}", listener.local_addr().expect("an address"));
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&asked);
+    std::thread::spawn(move || {
+        let mut signed = 0;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body_at = loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(at + 4);
+                }
+            };
+            let Some(body_at) = body_at else { continue };
+            let head = String::from_utf8_lossy(&request[..body_at]).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|length| length.trim().parse().ok())
+                .unwrap_or(0);
+            while request.len() < body_at + length {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+            }
+            let path = head.split(' ').nth(1).unwrap_or_default().to_string();
+            if path == "/v1/sign" {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let (status, body) = match path.as_str() {
+                "/v1/public_key" => (200, format!(r#"{{"public_key":"{public_key}"}}"#)),
+                "/get_dids" => (
+                    200,
+                    format!(
+                        r#"{{"operatedBy":"{NOTARY_OPERATED_BY}","executedOn":"{NOTARY_EXECUTED_ON}"}}"#
+                    ),
+                ),
+                "/v1/did_registration" => (200, registration.clone()),
+                "/v1/sign" if signed < signs => {
+                    signed += 1;
+                    let asked: serde_json::Value =
+                        serde_json::from_slice(&request[body_at..]).expect("a JSON body");
+                    let data = hex::decode(asked["data"].as_str().expect("data")).expect("hex");
+                    let signature: Signature = key.sign(&data);
+                    (
+                        200,
+                        format!(r#"{{"signature":"{}"}}"#, hex::encode(signature.to_bytes())),
+                    )
+                }
+                "/v1/sign" if then_hang => {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    continue;
+                }
+                _ => (500, "{}".to_string()),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (url, asked)
+}
+
+/// Every statement of ours has a credential naming it. The notary's own registration is its own.
+fn assert_all_signed(manifest: &serde_json::Value) {
+    let signed: std::collections::HashSet<_> = of_type(manifest, "CredentialRegistration")
+        .map(|statement| statement["credential"]["credentialSubject"]["id"].clone())
+        .collect();
+    for (id, statement) in manifest["statements"].as_object().expect("statements") {
+        if statement["@type"] != "CredentialRegistration" && id != "urn:cid:notary-identity" {
+            assert!(
+                signed.contains(&serde_json::json!(id)),
+                "unsigned: {statement}"
+            );
+        }
+    }
+}
+
+/// Replay `events` with sessions signed by `signer`, and return the manifest written.
+fn replay_signed(events: &[Event], signer: SignerFactory) -> serde_json::Value {
+    let into = TempDir::new().expect("a temp dir");
+    let router = Arc::new(Mutex::new(SessionRouter::new()));
+    let mailbox = Mailbox::start(
+        into.path().to_path_buf(),
+        policy(),
+        signer,
+        forget_with(&router),
+        ignore_marks(),
+    );
+    for event in events {
+        let Some(session_id) = router.lock().expect("the router lock").attribute(event) else {
+            continue;
+        };
+        if let Some(lineage) = classify(event) {
+            mailbox.send(&session_id, event.timestamp().to_rfc3339(), lineage);
+        }
+    }
+    drop(mailbox);
+    let written = written_json(&into);
+    assert_eq!(written.len(), 1, "one session, one manifest: {written:?}");
+    serde_json::from_slice(&fs::read(&written[0]).expect("it reads")).expect("it is JSON")
+}
+
+fn of_type<'a>(
+    manifest: &'a serde_json::Value,
+    kind: &'a str,
+) -> impl Iterator<Item = &'a serde_json::Value> {
+    manifest["statements"]
+        .as_object()
+        .expect("statements")
+        .values()
+        .filter(move |statement| statement["@type"] == kind)
+}
+
+#[test]
+fn without_a_notary_each_session_signs_with_a_key_of_its_own() {
+    let ours = replay_signed(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000c1", "relay-request-c1"),
+        session_factory(None),
+    );
+    let issuers: std::collections::HashSet<_> = of_type(&ours, "CredentialRegistration")
+        .map(|statement| statement["credential"]["issuer"].clone())
+        .collect();
+    assert_eq!(issuers.len(), 1);
+    assert!(
+        issuers
+            .iter()
+            .all(|did| did.as_str().unwrap().starts_with("did:key:z6Mk"))
+    );
+    assert!(!coverage_of(&ours).contains("NotaryUnavailable"));
+}
+
+#[test]
+fn a_notary_signs_every_statement_and_its_registration_is_carried() {
+    let ours = replay_signed(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000c2", "relay-request-c2"),
+        session_factory(Some(notary(usize::MAX, false))),
+    );
+
+    let credentials: Vec<_> = of_type(&ours, "CredentialRegistration").collect();
+    assert!(!credentials.is_empty());
+    for statement in &credentials {
+        let issuer = statement["credential"]["issuer"]
+            .as_str()
+            .expect("an issuer");
+        assert!(
+            issuer.starts_with("did:key:zDn"),
+            "a P-256 notary DID: {issuer}"
+        );
+        assert_eq!(statement["registeredBy"], issuer);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let credential = credentials[0]["credential"].to_string();
+    runtime
+        .block_on(integrity::vc::verify_vc(&credential, None))
+        .expect("the notary's signature verifies");
+
+    for computation in of_type(&ours, "ComputationRegistration") {
+        assert_eq!(computation["executedOn"], NOTARY_EXECUTED_ON);
+        assert_eq!(computation["operatedBy"], NOTARY_OPERATED_BY);
+    }
+    assert!(ours["statements"].get("urn:cid:notary-identity").is_some());
+    assert!(ours["blobs"].get("notary-evidence").is_some());
+    assert!(!coverage_of(&ours).contains("NotaryUnavailable"));
+}
+
+#[test]
+fn a_notary_that_cannot_be_reached_falls_back_to_a_key_and_says_so() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let url = format!("http://{}", closed.local_addr().expect("an address"));
+    drop(closed);
+
+    for url in [
+        url,
+        "https://notary.example:8000".to_string(),
+        // The signer would sign on port 8000 and at its own fixed path, not at these.
+        "http://127.0.0.1".to_string(),
+        "http://127.0.0.1:8000/notary".to_string(),
+    ] {
+        let ours = replay_signed(
+            &call_sent_as("01a040aa-0000-0000-0000-0000000000c3", "relay-request-c3"),
+            session_factory(Some(url)),
+        );
+        assert!(coverage_of(&ours).contains("\"NotaryUnavailable\":1"));
+        assert!(of_type(&ours, "CredentialRegistration").all(|s| {
+            s["credential"]["issuer"]
+                .as_str()
+                .unwrap()
+                .starts_with("did:key:z6Mk")
+        }));
+    }
+}
+
+#[test]
+fn a_notary_that_stops_signing_mid_session_still_leaves_a_manifest() {
+    let ours = replay_signed(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000c4", "relay-request-c4"),
+        session_factory(Some(notary(2, false))),
+    );
+    let coverage = coverage_of(&ours);
+    assert!(coverage.contains("\"NotaryUnavailable\":1"), "{coverage}");
+    assert!(coverage.contains("\"SigningFailed\":1"), "{coverage}");
+    let issuers: std::collections::HashSet<_> = of_type(&ours, "CredentialRegistration")
+        .map(|statement| {
+            statement["credential"]["issuer"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        issuers.len(),
+        2,
+        "the notary, then the fallback key: {issuers:?}"
+    );
+    assert!(
+        ours["statements"].get("urn:cid:notary-identity").is_some(),
+        "the notary signed some of it, so its registration stays"
+    );
+    assert_all_signed(&ours);
+}
+
+#[test]
+fn a_notary_that_hangs_mid_session_is_given_up_on() {
+    let started = std::time::Instant::now();
+    let ours = replay_signed(
+        &call_sent_as("01a040aa-0000-0000-0000-0000000000c5", "relay-request-c5"),
+        session_factory(Some(notary(2, true))),
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "far short of the 60 s the notary holds the signature"
+    );
+    let coverage = coverage_of(&ours);
+    assert!(coverage.contains("\"NotaryUnavailable\":1"), "{coverage}");
+    assert!(coverage.contains("\"SigningFailed\":1"), "{coverage}");
+}
+
+#[test]
+fn a_notary_that_fails_at_the_first_statement_loses_nothing() {
+    let events = call_sent_as("01a040aa-0000-0000-0000-0000000000c6", "relay-request-c6");
+    let counts = |manifest: &serde_json::Value| -> serde_json::Value {
+        let mut coverage: serde_json::Value =
+            serde_json::from_str(&coverage_of(manifest)).expect("coverage is JSON");
+        let coverage = coverage.as_object_mut().expect("an object");
+        coverage.remove("NotaryUnavailable");
+        coverage.remove("SigningFailed");
+        serde_json::Value::Object(coverage.clone())
+    };
+    let without = replay_signed(&events, session_factory(None));
+    let ours = replay_signed(&events, session_factory(Some(notary(0, false))));
+    assert!(coverage_of(&ours).contains("\"NotaryUnavailable\":1"));
+    assert_eq!(
+        counts(&ours),
+        counts(&without),
+        "the same things were recorded"
+    );
+    assert_eq!(
+        ours["statements"].as_object().expect("statements").len(),
+        without["statements"].as_object().expect("statements").len(),
+        "and the same statements, without the registration of a notary that signed none of them"
+    );
+    assert!(ours["statements"].get("urn:cid:notary-identity").is_none());
+    assert_all_signed(&ours);
+}
+
+#[test]
+fn a_notary_that_fails_at_the_coverage_node_is_reported_in_it() {
+    let events = call_sent_as("01a040aa-0000-0000-0000-0000000000c7", "relay-request-c7");
+    let full = replay_signed(&events, session_factory(Some(notary(usize::MAX, false))));
+    // Each of our statements is signed once, and the coverage node's data and metadata come last.
+    // The notary signs everything before them and nothing after.
+    let before_coverage = full["statements"]
+        .as_object()
+        .expect("statements")
+        .iter()
+        .filter(|(id, statement)| {
+            statement["@type"] != "CredentialRegistration" && *id != "urn:cid:notary-identity"
+        })
+        .count()
+        - 2;
+
+    let ours = replay_signed(
+        &events,
+        session_factory(Some(notary(before_coverage, false))),
+    );
+    let coverage = coverage_of(&ours);
+    assert!(coverage.contains("\"NotaryUnavailable\":1"), "{coverage}");
+    assert!(coverage.contains("\"SigningFailed\":1"), "{coverage}");
+    assert_all_signed(&ours);
+}
+
+#[test]
+fn once_the_notary_fails_no_session_asks_it_again() {
+    let (url, asked) = notary_counting(0, false);
+    let sessions = session_factory(Some(url));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+
+    // Both open before the notary fails.
+    let mut first = sessions().expect("a session");
+    let mut open = sessions().expect("a session");
+    runtime
+        .block_on(first.register_entity(serde_json::json!({ "name": "agent" }), None))
+        .expect("signed with the fallback key");
+    assert!(first.signer_fell_back());
+
+    runtime
+        .block_on(open.register_entity(serde_json::json!({ "name": "agent" }), None))
+        .expect("signed with the fallback key");
+    assert!(open.signer_fell_back());
+    assert!(first.signer_registration().is_none() && open.signer_registration().is_none());
+    let later = sessions().expect("a session");
+    assert!(later.signer_fell_back());
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_notary_is_not_contacted_until_a_session_needs_it() {
+    // Accepts connections and never answers.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let url = format!("http://{}", silent.local_addr().expect("an address"));
+    let started = std::time::Instant::now();
+    let _sessions = session_factory(Some(url));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    drop(silent);
+}
+
+#[test]
+fn a_notary_signature_that_is_taken_back_does_not_keep_its_registration() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    // The entity is signed by the notary, its metadata is not, and the whole operation is redone
+    // with the fallback key: the notary signed nothing that remains.
+    let mut session = session_factory(Some(notary(1, false)))().expect("a session");
+    runtime
+        .block_on(session.register_entity(serde_json::json!({ "name": "agent" }), None))
+        .expect("signed with the fallback key");
+    assert!(session.signer_fell_back());
+    assert!(session.signer_registration().is_none());
+}
+
+#[test]
+fn a_notary_that_first_fails_while_finishing_leaves_no_registration() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let session = session_factory(Some(notary(0, false)))().expect("a session");
+    assert!(
+        session.signer_registration().is_some(),
+        "held until it is known to be unused"
+    );
+    let (manifest, registration) = runtime
+        .block_on(
+            eqty_lineage_nemo_relay::Recorder::new(session, policy())
+                .finish_with_signer_registration(None),
+        )
+        .expect("it finishes on the fallback key");
+    assert!(registration.is_none());
+    assert!(!manifest.statements.is_empty());
+}
+
+/// Coverage without the counters a notary failure adds, for comparing against a run without one.
+fn coverage_without_notary_counters(manifest: &serde_json::Value) -> serde_json::Value {
+    let mut coverage: serde_json::Value =
+        serde_json::from_str(&coverage_of(manifest)).expect("coverage is JSON");
+    let counts = coverage.as_object_mut().expect("an object");
+    counts.remove("NotaryUnavailable");
+    counts.remove("SigningFailed");
+    coverage
+}
+
+#[test]
+fn a_notary_failing_at_any_signature_leaves_a_whole_and_honest_manifest() {
+    let events = fixture();
+    let (url, asked) = notary_counting(usize::MAX, false);
+    let full = replay_signed(&events, session_factory(Some(url)));
+    let signatures = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        signatures > 30,
+        "enough signatures to fail at: {signatures}"
+    );
+
+    // In batches of the machine's cores: each case is a whole session with its own notary, and
+    // more at once would slow the timing tests running beside this one.
+    let cores = std::thread::available_parallelism().map_or(2, usize::from);
+    let positions: Vec<usize> = (0..=signatures).collect();
+    for batch in positions.chunks(cores) {
+        std::thread::scope(|scope| {
+            for &signs in batch {
+                let (events, full) = (&events, &full);
+                scope.spawn(move || {
+                    let ours = replay_signed(events, session_factory(Some(notary(signs, false))));
+                    let at = format!("notary failing after {signs} of {signatures} signatures");
+
+                    assert_all_signed(&ours);
+                    assert_eq!(
+                        coverage_without_notary_counters(&ours),
+                        coverage_without_notary_counters(full),
+                        "{at}: the same things were recorded"
+                    );
+
+                    let notary_signed = of_type(&ours, "CredentialRegistration").any(|statement| {
+                        statement["credential"]["issuer"]
+                            .as_str()
+                            .is_some_and(|issuer| issuer.starts_with("did:key:zDn"))
+                    });
+                    let registration = ours["statements"].get("urn:cid:notary-identity").is_some();
+                    assert_eq!(
+                        registration, notary_signed,
+                        "{at}: the registration is there exactly when a notary signature is"
+                    );
+
+                    let fell_back = coverage_of(&ours).contains("\"NotaryUnavailable\":1");
+                    assert_eq!(
+                        fell_back,
+                        signs < signatures,
+                        "{at}: coverage says whether it fell back"
+                    );
+                });
+            }
+        });
+    }
 }
