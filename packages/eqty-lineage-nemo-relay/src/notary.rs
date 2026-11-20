@@ -116,9 +116,12 @@ fn connect(url: &str) -> Result<Notary, String> {
             registration: Arc::new(as_manifest(registration)?),
         })
     };
-    runtime
-        .block_on(async { tokio::time::timeout(CONNECT_TIMEOUT, connecting).await })
-        .map_err(|_| "it did not answer in time".to_string())?
+    let connected =
+        runtime.block_on(async { tokio::time::timeout(CONNECT_TIMEOUT, connecting).await });
+    // Dropping a runtime waits for its blocking tasks, and a DNS lookup that has not given up is
+    // one of them. Shut down without waiting, so the timeout is the whole wait.
+    runtime.shutdown_background();
+    connected.map_err(|_| "it did not answer in time".to_string())?
 }
 
 /// Whether the notary signer would sign at `url` itself: it signs over plain TCP to the host and
