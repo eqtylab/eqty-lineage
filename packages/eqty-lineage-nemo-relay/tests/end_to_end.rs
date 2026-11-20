@@ -4261,7 +4261,10 @@ fn a_notary_that_hangs_mid_session_is_given_up_on() {
         &call_sent_as("01a040aa-0000-0000-0000-0000000000c5", "relay-request-c5"),
         session_factory(Some(notary(2, true))),
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "far short of the 60 s the notary holds the signature"
+    );
     let coverage = coverage_of(&ours);
     assert!(coverage.contains("\"NotaryUnavailable\":1"), "{coverage}");
     assert!(coverage.contains("\"SigningFailed\":1"), "{coverage}");
@@ -4417,39 +4420,44 @@ fn a_notary_failing_at_any_signature_leaves_a_whole_and_honest_manifest() {
         "enough signatures to fail at: {signatures}"
     );
 
-    // In parallel: each case is a whole session with its own notary.
-    std::thread::scope(|scope| {
-        for signs in 0..=signatures {
-            let (events, full) = (&events, &full);
-            scope.spawn(move || {
-                let ours = replay_signed(events, session_factory(Some(notary(signs, false))));
-                let at = format!("notary failing after {signs} of {signatures} signatures");
+    // In batches of the machine's cores: each case is a whole session with its own notary, and
+    // more at once would slow the timing tests running beside this one.
+    let cores = std::thread::available_parallelism().map_or(2, usize::from);
+    let positions: Vec<usize> = (0..=signatures).collect();
+    for batch in positions.chunks(cores) {
+        std::thread::scope(|scope| {
+            for &signs in batch {
+                let (events, full) = (&events, &full);
+                scope.spawn(move || {
+                    let ours = replay_signed(events, session_factory(Some(notary(signs, false))));
+                    let at = format!("notary failing after {signs} of {signatures} signatures");
 
-                assert_all_signed(&ours);
-                assert_eq!(
-                    coverage_without_notary_counters(&ours),
-                    coverage_without_notary_counters(full),
-                    "{at}: the same things were recorded"
-                );
+                    assert_all_signed(&ours);
+                    assert_eq!(
+                        coverage_without_notary_counters(&ours),
+                        coverage_without_notary_counters(full),
+                        "{at}: the same things were recorded"
+                    );
 
-                let notary_signed = of_type(&ours, "CredentialRegistration").any(|statement| {
-                    statement["credential"]["issuer"]
-                        .as_str()
-                        .is_some_and(|issuer| issuer.starts_with("did:key:zDn"))
+                    let notary_signed = of_type(&ours, "CredentialRegistration").any(|statement| {
+                        statement["credential"]["issuer"]
+                            .as_str()
+                            .is_some_and(|issuer| issuer.starts_with("did:key:zDn"))
+                    });
+                    let registration = ours["statements"].get("urn:cid:notary-identity").is_some();
+                    assert_eq!(
+                        registration, notary_signed,
+                        "{at}: the registration is there exactly when a notary signature is"
+                    );
+
+                    let fell_back = coverage_of(&ours).contains("\"NotaryUnavailable\":1");
+                    assert_eq!(
+                        fell_back,
+                        signs < signatures,
+                        "{at}: coverage says whether it fell back"
+                    );
                 });
-                let registration = ours["statements"].get("urn:cid:notary-identity").is_some();
-                assert_eq!(
-                    registration, notary_signed,
-                    "{at}: the registration is there exactly when a notary signature is"
-                );
-
-                let fell_back = coverage_of(&ours).contains("\"NotaryUnavailable\":1");
-                assert_eq!(
-                    fell_back,
-                    signs < signatures,
-                    "{at}: coverage says whether it fell back"
-                );
-            });
-        }
-    });
+            }
+        });
+    }
 }
