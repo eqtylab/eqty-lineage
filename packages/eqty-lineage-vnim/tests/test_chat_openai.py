@@ -361,3 +361,30 @@ def test_request_body_cid_is_over_the_bytes_the_sdk_put_on_the_wire(sdk, monkeyp
     _installed_transport(model)._on_request(b"{}")
 
     assert model._last_request_cid.get() == metadata["eqty_openai_request_cid"]
+
+
+def test_a_plain_json_response_is_recorded_once_the_transport_hands_it_over_whole():
+    """A non-streamed response has no SSE terminal event: it is complete when the iterator is exhausted.
+
+    A transport that fails partway still records nothing, so a truncated body is never attested.
+    """
+    from eqty_lineage.vnim.chat_models.vnim import _ResponseBodyCapturingStream
+
+    body = b'{"id":"chatcmpl-1","choices":[{"message":{"content":"hi"}}]}'
+    recorded = []
+    stream = _ResponseBodyCapturingStream(httpx.ByteStream(body), recorded.append)
+    assert b"".join(stream) == body
+    stream.close()
+    assert recorded == [body]
+
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield body[:10]
+            raise httpx.ReadError("connection lost")
+
+    recorded.clear()
+    broken = _ResponseBodyCapturingStream(Broken(), recorded.append)
+    with pytest.raises(httpx.ReadError):
+        b"".join(broken)
+    broken.close()
+    assert recorded == []
