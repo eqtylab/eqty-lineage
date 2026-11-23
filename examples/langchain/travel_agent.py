@@ -118,7 +118,8 @@ def build_graph(model=None, checkpointer=None):
     if model is None:
         model = ChatOpenAI(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            max_tokens=2048,
+            # Sent raw: ChatOpenAI renames max_tokens to max_completion_tokens, which NIM/vLLM reject.
+            extra_body={"max_tokens": 2048},
         ).bind_tools(TOOLS)
 
     def agent(state: AgentState) -> dict:
